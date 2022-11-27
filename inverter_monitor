@@ -11,7 +11,6 @@ import libscrc
 import os
 import re
 import requests
-import schedule
 import simplejson as json
 import threading
 import time
@@ -50,8 +49,11 @@ builtins.SENTRY_EXTRAS = []
 AWS_REGION = os.environ['AWS_DEFAULT_REGION']
 class CredsConfig:
     sentry_dsn: f'opitem:"Sentry" opfield:{app_name}.dsn' = None # type: ignore
+    cronitor_token: f'opitem:"cronitor" opfield:.password' = None # type: ignore
     influxdb_org: f'opitem:"InfluxDB" opfield:automation.org' = None # type: ignore
     influxdb_token: f'opitem:"InfluxDB" opfield:automation.token' = None # type: ignore
+    aws_akid: f'opitem:"AWS" opfield:{AWS_REGION}.akid' = None # type: ignore
+    aws_sak: f'opitem:"AWS" opfield:{AWS_REGION}.sak' = None # type: ignore
 # instantiate class
 builtins.creds_config = CredsConfig()
 
