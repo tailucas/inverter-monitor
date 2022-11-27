@@ -272,9 +272,9 @@ if __name__ == "__main__":
     event_processor = EventProcessor()
     logger_reader = LoggerReader(
         field_mappings=field_mappings,
-        logger_sn=app_config.get('inverter', 'logger_sn'),
+        logger_sn=app_config.getint('inverter', 'logger_sn'),
         logger_ip=app_config.get('inverter', 'logger_address'),
-        logger_port=app_config.get('inverter', 'logger_port'))
+        logger_port=app_config.getint('inverter', 'logger_port'))
     nanny = threading.Thread(
         name='nanny',
         target=thread_nanny,
