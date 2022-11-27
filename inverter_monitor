@@ -191,8 +191,13 @@ class LoggerReader(AppThread, Closable):
                                     response = round(response * ratio-100, 2)
                                 else:
                                     response = round(response * ratio, 2)
-                                key = f'{title}({unit})'
-                                output[key] = str(response)
+                                if len(unit) > 0:
+                                    key = f'{title} {unit}'
+                                else:
+                                    key = f'{title}'
+                                # sanitize string
+                                key = key.replace(' ','_').replace('-','_').replace('º','c').replace('%','pct').lower()
+                                output[key] = response
                                 if hexpos == '0x00BA':
                                     totalpower += response * ratio
                                 if hexpos == '0x00BB':
