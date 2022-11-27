@@ -12,6 +12,7 @@ import os
 import re
 import requests
 import simplejson as json
+import socket
 import threading
 import time
 import zmq
@@ -89,8 +90,6 @@ SAMPLE_INTERVAL_SECONDS = 60
 ERROR_RETRY_INTERVAL_SECONDS = 60/6
 ERROR_RETRY_ATTEMPTS = 5
 
-FIELD_MAPPINGS = None
-
 
 def twosComplement_hex(hexval):
     bits = 16
@@ -102,11 +101,107 @@ def twosComplement_hex(hexval):
 
 class LoggerReader(AppThread, Closable):
 
-    def __init__(self):
+    def __init__(self, field_mappings, logger_sn, logger_ip, logger_port):
         AppThread.__init__(self, name=self.__class__.__name__)
         Closable.__init__(self)
 
         self.processor = self.get_socket(zmq.PUSH)
+
+        self.field_mappings = field_mappings
+        self.logger_sn = logger_sn
+        self.logger_ip = logger_ip
+        self.logger_port = logger_port
+
+    def send_logger_message(self):
+        output = {}
+
+        clientSocket = None
+        pini = 59
+        pfin = 112
+        chunks = 0
+        while chunks < 2:
+            start = binascii.unhexlify('A5') #start
+            length = binascii.unhexlify('1700') # datalength
+            controlcode = binascii.unhexlify('1045') #controlCode
+            serial = binascii.unhexlify('0000') # serial
+            datafield = binascii.unhexlify('020000000000000000000000000000') #com.igen.localmode.dy.instruction.send.SendDataField
+            pos_ini = str(hex(pini)[2:4].zfill(4))
+            pos_fin = str(hex(pfin-pini+1)[2:4].zfill(4))
+            businessfield = binascii.unhexlify('0103' + pos_ini + pos_fin) # sin CRC16MODBUS
+            crc = binascii.unhexlify(str(hex(libscrc.modbus(businessfield))[4:6])+str(hex(libscrc.modbus(businessfield))[2:4])) # CRC16modbus
+            checksum = binascii.unhexlify('00') #checksum F2
+            endCode = binascii.unhexlify('15')
+
+            inverter_sn2 = bytearray.fromhex(hex(self.logger_sn)[8:10] + hex(self.logger_sn)[6:8] + hex(self.logger_sn)[4:6] + hex(self.logger_sn)[2:4])
+            frame = bytearray(start + length + controlcode + serial + inverter_sn2 + datafield + businessfield + crc + checksum + endCode)
+
+            checksum = 0
+            frame_bytes = bytearray(frame)
+            for i in range(1, len(frame_bytes) - 2, 1):
+                checksum += frame_bytes[i] & 255
+            frame_bytes[len(frame_bytes) - 2] = int((checksum & 255))
+
+            # OPEN SOCKET
+
+            for res in socket.getaddrinfo(self.logger_ip, self.logger_port, socket.AF_INET, socket.SOCK_STREAM):
+                family, socktype, proto, canonname, sockadress = res
+                try:
+                    clientSocket = socket.socket(family,socktype,proto)
+                    clientSocket.settimeout(10)
+                    clientSocket.connect(sockadress)
+                except socket.error as msg:
+                    log.warning(f'{msg}')
+                    break
+
+            # SEND DATA
+            clientSocket.sendall(frame_bytes)
+
+            ok = False
+            while not ok:
+                try:
+                    data = clientSocket.recv(1024)
+                    clientSocket.close()
+                    ok = True
+                    try:
+                        data
+                    except Exception as e:
+                        log.warning(f'{e}')
+                        return None
+                except socket.timeout as msg:
+                    log.warning(f'{msg}')
+                    return None
+
+            # PARSE RESPONSE (start position 56, end position 60)
+            totalpower = 0
+            i = pfin - pini
+            a = 0
+            while a <= i:
+                p1 = 56+(a*4)
+                p2 = 60+(a*4)
+                response = twosComplement_hex(str(''.join(hex(ord(chr(x)))[2:].zfill(2) for x in bytearray(data))+'  '+re.sub('[^\x20-\x7f]', '', ''))[p1:p2])
+                hexpos = str("0x") + str(hex(a+pini)[2:].zfill(4)).upper()
+                for parameter in self.field_mappings:
+                    for item in parameter["items"]:
+                        title = item["titleEN"]
+                        ratio = item["ratio"]
+                        unit = item["unit"]
+                        for register in item["registers"]:
+                            if register == hexpos and chunks != -1:
+                                if title.find("Temperature") != -1:
+                                    response = round(response * ratio-100, 2)
+                                else:
+                                    response = round(response * ratio, 2)
+                                key = f'{title}({unit})'
+                                output[key] = str(response)
+                                if hexpos == '0x00BA':
+                                    totalpower += response * ratio
+                                if hexpos == '0x00BB':
+                                    totalpower += response * ratio
+                a+=1
+            pini=150
+            pfin=195
+            chunks+=1
+        return output
 
     # noinspection PyBroadException
     def run(self):
@@ -115,6 +210,8 @@ class LoggerReader(AppThread, Closable):
             while not threads.shutting_down:
                 operation_start_time = time.time()
                 self.processor.send_pyobj({"foo": "bar"})
+                logger_output = self.send_logger_message()
+                log.info(f'{logger_output}')
                 operation_end_time = time.time()
                 # stop for the remainder of the sampling interval
                 threads.interruptable_sleep.wait(SAMPLE_INTERVAL_SECONDS - (operation_end_time-operation_start_time))
@@ -161,18 +258,23 @@ class EventProcessor(AppThread, Closable):
 if __name__ == "__main__":
     log.setLevel(logging.INFO)
     # load basic configuration
+    field_mappings = None
     field_mappings_file = ''.join([os.path.join(APP_PATH, 'config', 'field_mappings.txt')]) # type: ignore
     with open(field_mappings_file) as mappings_file:
         try:
-            FIELD_MAPPINGS = json.loads(mappings_file.read())
-            log.info(f'Loaded {len(FIELD_MAPPINGS)} field mappings from {field_mappings_file}')
+            field_mappings = json.loads(mappings_file.read())
+            log.info(f'Loaded {len(field_mappings)} field mappings from {field_mappings_file}')
         except JSONDecodeError as e:
             log.exception(f'Error loading {field_mappings_file}.')
             raise e
     # ensure proper signal handling; must be main thread
     signal_handler = SignalHandler()
     event_processor = EventProcessor()
-    logger_reader = LoggerReader()
+    logger_reader = LoggerReader(
+        field_mappings=field_mappings,
+        logger_sn=app_config.get('inverter', 'logger_sn'),
+        logger_ip=app_config.get('inverter', 'logger_address'),
+        logger_port=app_config.get('inverter', 'logger_port'))
     nanny = threading.Thread(
         name='nanny',
         target=thread_nanny,
