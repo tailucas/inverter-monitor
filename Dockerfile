@@ -47,9 +47,6 @@ COPY requirements.txt .
 COPY pylib/requirements.txt ./pylib/requirements.txt
 COPY app_setup.sh .
 RUN /opt/app/app_setup.sh
-# ngrok
-COPY ngrok_setup.sh .
-RUN /opt/app/ngrok_setup.sh
 
 COPY config ./config
 COPY entrypoint.sh .
