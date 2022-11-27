@@ -251,6 +251,7 @@ class EventProcessor(AppThread, Closable):
     # noinspection PyBroadException
     def run(self):
         # influx DB
+        log.info(f'Connecting to InfluxDB at {self.influxdb_url} using bucket {self.influxdb_bucket}.')
         self.influxdb = InfluxDBClient(
             url=self.influxdb_url,
             token=creds.influxdb_token,
@@ -264,7 +265,7 @@ class EventProcessor(AppThread, Closable):
                 if isinstance(event, dict):
                     for key, value in event.items():
                         self._influxdb_write(key, value)
-                    log.info(f'Wrote {len(event)} points to InfluxDB.')
+                    log.debug(f'Wrote {len(event)} points.')
 
 
 if __name__ == "__main__":
