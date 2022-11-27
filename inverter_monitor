@@ -262,7 +262,9 @@ class EventProcessor(AppThread, Closable):
                 event = self.socket.recv_pyobj()
                 log.debug(event)
                 if isinstance(event, dict):
-                    log.info(event)
+                    for key, value in event.items():
+                        self._influxdb_write(key, value)
+                    log.info(f'Wrote {len(event)} points to InfluxDB.')
 
 
 if __name__ == "__main__":
