@@ -112,7 +112,7 @@ class LoggerReader(AppThread, Closable):
         self.logger_ip = logger_ip
         self.logger_port = logger_port
 
-    def send_logger_message(self):
+    def get_logger_data(self):
         output = {}
 
         clientSocket = None
@@ -151,7 +151,7 @@ class LoggerReader(AppThread, Closable):
                     clientSocket.connect(sockadress)
                 except socket.error as msg:
                     log.warning(f'{msg}')
-                    break
+                    return None
 
             # SEND DATA
             clientSocket.sendall(frame_bytes)
@@ -209,9 +209,14 @@ class LoggerReader(AppThread, Closable):
         with exception_handler(closable=self):
             while not threads.shutting_down:
                 operation_start_time = time.time()
-                self.processor.send_pyobj({"foo": "bar"})
-                logger_output = self.send_logger_message()
-                log.info(f'{logger_output}')
+                tries = 1
+                logger_data = None
+                while tries < ERROR_RETRY_ATTEMPTS:
+                    tries += 1
+                    logger_data = self.get_logger_data()
+                    if logger_data and len(logger_data) > 0:
+                        break
+                self.processor.send_pyobj(logger_data)
                 operation_end_time = time.time()
                 # stop for the remainder of the sampling interval
                 threads.interruptable_sleep.wait(SAMPLE_INTERVAL_SECONDS - (operation_end_time-operation_start_time))
