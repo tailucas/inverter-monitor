@@ -5,6 +5,7 @@ boto3
 botoflow
 blinker
 influxdb-client
+libscrc
 msgpack
 onepasswordconnectsdk
 paho-mqtt
@@ -12,9 +13,8 @@ pathtools
 pylru
 python-dateutil
 python-magic
-python-telegram-bot
 pytz
 pyzmq
 requests
-sentry-sdk[flask]
+sentry-sdk
 simplejson
