@@ -162,12 +162,13 @@ if __name__ == "__main__":
     log.setLevel(logging.INFO)
     # load basic configuration
     field_mappings_file = ''.join([os.path.join(APP_PATH, 'config', 'field_mappings.txt')]) # type: ignore
-    try:
-        FIELD_MAPPINGS = json.loads(field_mappings_file)
-        log.info(f'Loaded {len(FIELD_MAPPINGS)} field mappings from {field_mappings_file}')
-    except JSONDecodeError as e:
-        log.exception(f'Unstructured message in file {field_mappings_file}.')
-        raise e
+    with open(field_mappings_file) as mappings_file:
+        try:
+            FIELD_MAPPINGS = json.loads(mappings_file.read())
+            log.info(f'Loaded {len(FIELD_MAPPINGS)} field mappings from {field_mappings_file}')
+        except JSONDecodeError as e:
+            log.exception(f'Error loading {field_mappings_file}.')
+            raise e
     # ensure proper signal handling; must be main thread
     signal_handler = SignalHandler()
     event_processor = EventProcessor()
