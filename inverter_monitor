@@ -261,32 +261,27 @@ class EventProcessor(AppThread, Closable):
         self.influxdb_ro = self.influxdb.query_api()
         with exception_handler(closable=self, and_raise=False, shutdown_on_error=True):
             prev_event = None
-            event_count = 0
             while not threads.shutting_down:
                 event = self.socket.recv_pyobj()
                 log.debug(event)
                 if isinstance(event, dict):
-                    event_count += 1
+                    output = event
                     if prev_event is not None:
                         prev_battery_soc = prev_event['battery_soc_pct']
                         # prevent getting stuck on a bad initial value
-                        if prev_battery_soc > 0 and event_count > 2:
+                        if prev_battery_soc > 0:
                             battery_soc = event['battery_soc_pct']
                             soc_variance_pct = int(abs(((prev_battery_soc-battery_soc) / prev_battery_soc)) * 100)
                             log.debug(f'battery_soc_pct changed by {soc_variance_pct}% from {prev_battery_soc} to {battery_soc}.')
                             if soc_variance_pct >= IMPLAUSIBLE_CHANGE_PERCENTAGE:
                                 log.warning(f'battery_soc_pct changed by more than {IMPLAUSIBLE_CHANGE_PERCENTAGE}% from {prev_battery_soc} to {battery_soc}. Treating this output as implausible: {str(event)}')
                                 output = prev_event
-                        else:
-                            output = event
-                            prev_event = event
-                    else:
-                        output = event
-                        prev_event = event
                     # now output chosen event
                     for key, value in output.items():
                         self._influxdb_write(key, value)
                     log.debug(f'Wrote {len(output)} points.')
+                    # always keep tracking the latest
+                    prev_event = event
 
 
 if __name__ == "__main__":
