@@ -273,6 +273,7 @@ class EventProcessor(AppThread, Closable):
                         if prev_battery_soc > 0 and event_count > 2:
                             battery_soc = event['battery_soc_pct']
                             soc_variance_pct = int(abs(((prev_battery_soc-battery_soc) / prev_battery_soc)) * 100)
+                            log.debug(f'battery_soc_pct changed by {soc_variance_pct}% from {prev_battery_soc} to {battery_soc}.')
                             if soc_variance_pct >= IMPLAUSIBLE_CHANGE_PERCENTAGE:
                                 log.warning(f'battery_soc_pct changed by more than {IMPLAUSIBLE_CHANGE_PERCENTAGE}% from {prev_battery_soc} to {battery_soc}. Treating this output as implausible: {str(event)}')
                                 output = prev_event
