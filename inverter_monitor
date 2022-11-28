@@ -285,7 +285,7 @@ class EventProcessor(AppThread, Closable):
                     # now output chosen event
                     for key, value in output.items():
                         self._influxdb_write(key, value)
-                    log.debug(f'Wrote {len(event)} points.')
+                    log.debug(f'Wrote {len(output)} points.')
 
 
 if __name__ == "__main__":
