@@ -267,7 +267,7 @@ class EventProcessor(AppThread, Closable):
                 log.debug(event)
                 if isinstance(event, dict):
                     event_count += 1
-                    if prev_event:
+                    if prev_event is not None:
                         prev_battery_soc = prev_event['battery_soc_pct']
                         # prevent getting stuck on a bad initial value
                         if prev_battery_soc > 0 and event_count > 2:
