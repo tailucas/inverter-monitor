@@ -213,6 +213,7 @@ class LoggerReader(AppThread, Closable):
     def run(self):
         self.processor.connect(URL_WORKER_APP)
         with exception_handler(closable=self):
+            prev_battery_soc = None
             while not threads.shutting_down:
                 operation_start_time = time.time()
                 tries = 1
@@ -220,9 +221,29 @@ class LoggerReader(AppThread, Closable):
                 while tries < ERROR_RETRY_ATTEMPTS:
                     tries += 1
                     logger_data = self.get_logger_data()
-                    if logger_data and len(logger_data) > 0:
-                        break
-                self.processor.send_pyobj(logger_data)
+                    if isinstance(logger_data, dict):
+                        if 'battery_soc_pct' in logger_data.keys():
+                            battery_soc = logger_data['battery_soc_pct']
+                            if prev_battery_soc is None:
+                                prev_battery_soc = battery_soc
+                                # dict is good enough
+                                break
+                            soc_variance_pct = int(abs(((prev_battery_soc-battery_soc) / prev_battery_soc)) * 100)
+                            log.debug(f'battery_soc_pct changed by {soc_variance_pct}% from {prev_battery_soc} to {battery_soc}.')
+                            if soc_variance_pct >= IMPLAUSIBLE_CHANGE_PERCENTAGE:
+                                log.warning(f'battery_soc_pct changed by more than {IMPLAUSIBLE_CHANGE_PERCENTAGE}% from {prev_battery_soc} to {battery_soc}. Treating this output as implausible: {str(logger_data)}')
+                            else:
+                                # accept the new value as good
+                                prev_battery_soc = battery_soc
+                                # control field change is plausible
+                                break
+                    log.warning(f'Waiting {ERROR_RETRY_INTERVAL_SECONDS} before trying again.')
+                    threads.interruptable_sleep.wait(ERROR_RETRY_INTERVAL_SECONDS)
+                if logger_data is not None and len(logger_data) > 0:
+                    log.debug(f'Sending {len(logger_data)} fields for publication.')
+                    self.processor.send_pyobj(logger_data)
+                else:
+                    log.error(f'Unable to fetch any valid data after {tries} tries (of {ERROR_RETRY_ATTEMPTS}).')
                 operation_end_time = time.time()
                 # stop for the remainder of the sampling interval
                 threads.interruptable_sleep.wait(SAMPLE_INTERVAL_SECONDS - (operation_end_time-operation_start_time))
@@ -260,28 +281,13 @@ class EventProcessor(AppThread, Closable):
         self.influxdb_rw = self.influxdb.write_api(write_options=ASYNCHRONOUS)
         self.influxdb_ro = self.influxdb.query_api()
         with exception_handler(closable=self, and_raise=False, shutdown_on_error=True):
-            prev_event = None
             while not threads.shutting_down:
                 event = self.socket.recv_pyobj()
                 log.debug(event)
                 if isinstance(event, dict):
-                    output = event
-                    if prev_event is not None:
-                        prev_battery_soc = prev_event['battery_soc_pct']
-                        # prevent getting stuck on a bad initial value
-                        if prev_battery_soc > 0:
-                            battery_soc = event['battery_soc_pct']
-                            soc_variance_pct = int(abs(((prev_battery_soc-battery_soc) / prev_battery_soc)) * 100)
-                            log.debug(f'battery_soc_pct changed by {soc_variance_pct}% from {prev_battery_soc} to {battery_soc}.')
-                            if soc_variance_pct >= IMPLAUSIBLE_CHANGE_PERCENTAGE:
-                                log.warning(f'battery_soc_pct changed by more than {IMPLAUSIBLE_CHANGE_PERCENTAGE}% from {prev_battery_soc} to {battery_soc}. Treating this output as implausible: {str(event)}')
-                                output = prev_event
-                    # now output chosen event
-                    for key, value in output.items():
+                    for key, value in event.items():
                         self._influxdb_write(key, value)
-                    log.debug(f'Wrote {len(output)} points.')
-                    # always keep tracking the latest
-                    prev_event = event
+                    log.debug(f'Wrote {len(event)} points.')
 
 
 if __name__ == "__main__":
