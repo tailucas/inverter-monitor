@@ -48,11 +48,13 @@ app_name = Path(__file__).stem
 builtins.APP_NAME = app_name
 builtins.SENTRY_EXTRAS = []
 AWS_REGION = os.environ['AWS_DEFAULT_REGION']
+influx_creds_section='automation'
 class CredsConfig:
     sentry_dsn: f'opitem:"Sentry" opfield:{app_name}.dsn' = None # type: ignore
     cronitor_token: f'opitem:"cronitor" opfield:.password' = None # type: ignore
-    influxdb_org: f'opitem:"InfluxDB" opfield:automation.org' = None # type: ignore
-    influxdb_token: f'opitem:"InfluxDB" opfield:automation.token' = None # type: ignore
+    influxdb_org: f'opitem:"InfluxDB" opfield:{influx_creds_section}.org' = None # type: ignore
+    influxdb_token: f'opitem:"InfluxDB" opfield:{influx_creds_section}.token' = None # type: ignore
+    influxdb_url: f'opitem:"InfluxDB" opfield:{influx_creds_section}.url' = None # type: ignore
     aws_akid: f'opitem:"AWS" opfield:{AWS_REGION}.akid' = None # type: ignore
     aws_sak: f'opitem:"AWS" opfield:{AWS_REGION}.sak' = None # type: ignore
 # instantiate class
@@ -255,7 +257,6 @@ class EventProcessor(AppThread, Closable):
         AppThread.__init__(self, name=self.__class__.__name__)
         Closable.__init__(self, connect_url=URL_WORKER_APP)
 
-        self.influxdb_url = app_config.get('influxdb', 'url')
         self.influxdb_bucket = app_config.get('influxdb', 'bucket')
 
         self.influxdb = None
@@ -273,9 +274,9 @@ class EventProcessor(AppThread, Closable):
     # noinspection PyBroadException
     def run(self):
         # influx DB
-        log.info(f'Connecting to InfluxDB at {self.influxdb_url} using bucket {self.influxdb_bucket}.')
+        log.info(f'Connecting to InfluxDB at {creds.influxdb_url} using bucket {self.influxdb_bucket}.')
         self.influxdb = InfluxDBClient(
-            url=self.influxdb_url,
+            url=creds.influxdb_url,
             token=creds.influxdb_token,
             org=creds.influxdb_org)
         self.influxdb_rw = self.influxdb.write_api(write_options=ASYNCHRONOUS)
