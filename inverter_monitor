@@ -181,7 +181,11 @@ class LoggerReader(AppThread, Closable):
             while a <= i:
                 p1 = 56+(a*4)
                 p2 = 60+(a*4)
-                response = twosComplement_hex(str(''.join(hex(ord(chr(x)))[2:].zfill(2) for x in bytearray(data))+'  '+re.sub('[^\x20-\x7f]', '', ''))[p1:p2])
+                try:
+                    response = twosComplement_hex(str(''.join(hex(ord(chr(x)))[2:].zfill(2) for x in bytearray(data))+'  '+re.sub('[^\x20-\x7f]', '', ''))[p1:p2])
+                except ValueError:
+                    log.warning(f'Discarding {len(data)} byte response.', exc_info=True)
+                    return None
                 hexpos = str("0x") + str(hex(a+pini)[2:].zfill(4)).upper()
                 for parameter in self.field_mappings:
                     for item in parameter["items"]:
