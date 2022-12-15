@@ -6,7 +6,7 @@ services:
       driver: syslog
     tmpfs:
     - /tmp
-    hostname: inverter-monitor
+    hostname: __DOCKER_HOSTNAME__
     volumes:
       - ./data:/data
       - /dev/log:/dev/log

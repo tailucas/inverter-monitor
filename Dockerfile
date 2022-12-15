@@ -1,57 +1,14 @@
-FROM debian:buster
-ENV INITSYSTEM on
-ENV container docker
-
-LABEL Description="inverter_monitor" Vendor="tglucas" Version="1.0"
-
-ENV DEBIAN_FRONTEND noninteractive
-ENV DEBCONF_NONINTERACTIVE_SEEN true
-
-RUN apt-get clean && apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    ca-certificates \
-    curl \
-    dbus \
-    html-xml-utils \
-    htop \
-    jq \
-    less \
-    lsof \
-    libffi-dev \
-    # for rust build of Python cryptography
-    libssl-dev \
-    patch \
-    procps \
-    python3-certifi \
-    python3-dbus \
-    python3 \
-    python3-dev \
-    python3-pip \
-    python3-setuptools \
-    python3-venv \
-    python3-wheel \
-    rsyslog \
-    strace \
-    sqlite3 \
-    tree \
-    unzip \
-    vim \
-    wget
-
-# python3 default
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
-
-# setup
-WORKDIR /opt/app
+FROM tailucas/base-app:20221215
+# override dependencies
 COPY requirements.txt .
-COPY pylib/requirements.txt ./pylib/requirements.txt
-COPY app_setup.sh .
+# apply override
 RUN /opt/app/app_setup.sh
-
-COPY config ./config
-COPY entrypoint.sh .
-COPY pylib ./pylib
-COPY pylib/pylib ./lib
+# override configuration
+COPY config/app.conf ./config/app.conf
+COPY config/field_mappings.txt ./config/field_mappings.txt
+# remove base_app
+RUN rm -f /opt/app/base_app
+# add the project application
 COPY inverter_monitor .
 
 # ssh, http, zmq, ngrok

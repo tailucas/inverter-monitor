@@ -48,15 +48,19 @@ app_name = Path(__file__).stem
 builtins.APP_NAME = app_name
 builtins.SENTRY_EXTRAS = []
 AWS_REGION = os.environ['AWS_DEFAULT_REGION']
-influx_creds_section='local'
+influx_creds_section = 'local'
+
+
 class CredsConfig:
-    sentry_dsn: f'opitem:"Sentry" opfield:{app_name}.dsn' = None # type: ignore
-    cronitor_token: f'opitem:"cronitor" opfield:.password' = None # type: ignore
-    influxdb_org: f'opitem:"InfluxDB" opfield:{influx_creds_section}.org' = None # type: ignore
-    influxdb_token: f'opitem:"InfluxDB" opfield:{influx_creds_section}.token' = None # type: ignore
-    influxdb_url: f'opitem:"InfluxDB" opfield:{influx_creds_section}.url' = None # type: ignore
-    aws_akid: f'opitem:"AWS" opfield:{AWS_REGION}.akid' = None # type: ignore
-    aws_sak: f'opitem:"AWS" opfield:{AWS_REGION}.sak' = None # type: ignore
+    sentry_dsn: f'opitem:"Sentry" opfield:{app_name}.dsn' = None  # type: ignore
+    cronitor_token: f'opitem:"cronitor" opfield:.password' = None  # type: ignore
+    influxdb_org: f'opitem:"InfluxDB" opfield:{influx_creds_section}.org' = None  # type: ignore
+    influxdb_token: f'opitem:"InfluxDB" opfield:{influx_creds_section}.token' = None  # type: ignore
+    influxdb_url: f'opitem:"InfluxDB" opfield:{influx_creds_section}.url' = None  # type: ignore
+    aws_akid: f'opitem:"AWS" opfield:{AWS_REGION}.akid' = None  # type: ignore
+    aws_sak: f'opitem:"AWS" opfield:{AWS_REGION}.sak' = None  # type: ignore
+
+
 # instantiate class
 builtins.creds_config = CredsConfig()
 
@@ -94,7 +98,7 @@ ERROR_RETRY_ATTEMPTS = 5
 IMPLAUSIBLE_CHANGE_PERCENTAGE = 10
 
 
-def twosComplement_hex(hexval):
+def twos_complement_hex(hexval):
     bits = 16
     val = int(hexval, bits)
     if val & (1 << (bits-1)):
@@ -182,7 +186,7 @@ class LoggerReader(AppThread, Closable):
                 p1 = 56+(a*4)
                 p2 = 60+(a*4)
                 try:
-                    response = twosComplement_hex(str(''.join(hex(ord(chr(x)))[2:].zfill(2) for x in bytearray(data))+'  '+re.sub('[^\x20-\x7f]', '', ''))[p1:p2])
+                    response = twos_complement_hex(str(''.join(hex(ord(chr(x)))[2:].zfill(2) for x in bytearray(data))+'  '+re.sub('[^\x20-\x7f]', '', ''))[p1:p2])
                 except ValueError:
                     log.warning(f'Discarding {len(data)} byte response.', exc_info=True)
                     return None
@@ -299,7 +303,7 @@ if __name__ == "__main__":
     log.setLevel(logging.INFO)
     # load basic configuration
     field_mappings = None
-    field_mappings_file = ''.join([os.path.join(APP_PATH, 'config', 'field_mappings.txt')]) # type: ignore
+    field_mappings_file = ''.join([os.path.join(APP_PATH, 'config', 'field_mappings.txt')])  # type: ignore
     with open(field_mappings_file) as mappings_file:
         try:
             field_mappings = json.loads(mappings_file.read())
@@ -318,8 +322,8 @@ if __name__ == "__main__":
     nanny = threading.Thread(
         name='nanny',
         target=thread_nanny,
-        args=(signal_handler,))
-    nanny.setDaemon(True)
+        args=(signal_handler,),
+        daemon=True)
     # startup completed
     # back to INFO logging
     log.setLevel(logging.INFO)
