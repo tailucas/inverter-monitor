@@ -1,45 +1,19 @@
 #!/usr/bin/env python
-import logging
 import logging.handlers
 
 import binascii
 import builtins
-import boto3
-import copy
-import json
 import libscrc
-import os
 import re
-import requests
 import simplejson as json
 import socket
 import threading
 import time
 import zmq
 
-from base64 import b64decode, b64encode
-from collections import OrderedDict
-from botocore.exceptions import EndpointConnectionError as bcece, \
-    ConnectionClosedError as bccce, \
-    ConnectionError as bce
-from boto3.dynamodb.conditions import Attr
-from bs4 import BeautifulSoup
-from configparser import ConfigParser
-from datetime import datetime, timedelta
-from dateutil import tz
-from decimal import Decimal
-from io import BytesIO
-from msgpack.exceptions import UnpackException
-from onepasswordconnectsdk.client import Client as CredsClient
-from operator import itemgetter
 from pathlib import Path
-from pylru import lrucache
-from requests.exceptions import ConnectionError
-from sentry_sdk import capture_exception, last_event_id
-from sentry_sdk.integrations.logging import ignore_logger
 from simplejson.scanner import JSONDecodeError
-from socket import gaierror
-from zmq.error import ZMQError, ContextTerminated, Again
+from zmq.error import ContextTerminated
 
 import os.path
 
@@ -66,27 +40,17 @@ builtins.creds_config = CredsConfig()
 
 from lib import app_config, \
     creds, \
-    device_name, \
     device_name_base, \
-    log, \
-    log_handler
+    log
 
-from lib.datetime import is_list, \
-    make_timestamp, \
-    make_unix_timestamp, \
-    parse_datetime, \
-    ISO_DATE_FORMAT
-from lib.aws.metrics import post_count_metric
-from lib.leader import Leader
-from lib.process import SignalHandler, exec_cmd_log
-from lib.rabbit import MQConnection, ZMQListener
+from lib.process import SignalHandler
 from lib import threads
-from lib.threads import thread_nanny, die
-from lib.app import AppThread, ZmqRelay
+from lib.threads import thread_nanny
+from lib.app import AppThread
 from lib.zmq import zmq_term, Closable
 from lib.handler import exception_handler
 
-from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import ASYNCHRONOUS
 
 
@@ -122,21 +86,21 @@ class LoggerReader(AppThread, Closable):
     def get_logger_data(self):
         output = {}
 
-        clientSocket = None
+        client_socket = None
         pini = 59
         pfin = 112
         chunks = 0
         while chunks < 2:
-            start = binascii.unhexlify('A5') #start
-            length = binascii.unhexlify('1700') # datalength
-            controlcode = binascii.unhexlify('1045') #controlCode
-            serial = binascii.unhexlify('0000') # serial
-            datafield = binascii.unhexlify('020000000000000000000000000000') #com.igen.localmode.dy.instruction.send.SendDataField
+            start = binascii.unhexlify('A5')  # start
+            length = binascii.unhexlify('1700')  # datalength
+            controlcode = binascii.unhexlify('1045')  # controlCode
+            serial = binascii.unhexlify('0000')  # serial
+            datafield = binascii.unhexlify('020000000000000000000000000000')  # com.igen.localmode.dy.instruction.send.SendDataField
             pos_ini = str(hex(pini)[2:4].zfill(4))
             pos_fin = str(hex(pfin-pini+1)[2:4].zfill(4))
-            businessfield = binascii.unhexlify('0103' + pos_ini + pos_fin) # sin CRC16MODBUS
-            crc = binascii.unhexlify(str(hex(libscrc.modbus(businessfield))[4:6])+str(hex(libscrc.modbus(businessfield))[2:4])) # CRC16modbus
-            checksum = binascii.unhexlify('00') #checksum F2
+            businessfield = binascii.unhexlify('0103' + pos_ini + pos_fin)  # sin CRC16MODBUS
+            crc = binascii.unhexlify(str(hex(libscrc.modbus(businessfield))[4:6])+str(hex(libscrc.modbus(businessfield))[2:4]))  # CRC16modbus
+            checksum = binascii.unhexlify('00')  # checksum F2
             endCode = binascii.unhexlify('15')
 
             inverter_sn2 = bytearray.fromhex(hex(self.logger_sn)[8:10] + hex(self.logger_sn)[6:8] + hex(self.logger_sn)[4:6] + hex(self.logger_sn)[2:4])
@@ -153,30 +117,30 @@ class LoggerReader(AppThread, Closable):
             for res in socket.getaddrinfo(self.logger_ip, self.logger_port, socket.AF_INET, socket.SOCK_STREAM):
                 family, socktype, proto, canonname, sockadress = res
                 try:
-                    clientSocket = socket.socket(family,socktype,proto)
-                    clientSocket.settimeout(10)
-                    clientSocket.connect(sockadress)
+                    client_socket = socket.socket(family,socktype,proto)
+                    client_socket.settimeout(10)
+                    client_socket.connect(sockadress)
                 except socket.error as msg:
                     log.warning(f'{msg}')
                     return None
 
             # SEND DATA
-            clientSocket.sendall(frame_bytes)
+            client_socket.sendall(frame_bytes)
 
-            ok = False
-            while not ok:
-                try:
-                    data = clientSocket.recv(1024)
-                    clientSocket.close()
-                    ok = True
-                    try:
-                        data
-                    except Exception as e:
-                        log.warning(f'{e}')
-                        return None
-                except socket.timeout as msg:
-                    log.warning(f'{msg}')
+            # RECEIVE RESPONSE
+            try:
+                data = client_socket.recv(1024)
+                if data is None:
+                    log.warning(f'No response data.')
                     return None
+            except socket.timeout as msg:
+                log.warning(f'{msg}')
+                return None
+            finally:
+                try:
+                    client_socket.close()
+                except socket.error as msg:
+                    log.warning(f'{msg}')
 
             # PARSE RESPONSE (start position 56, end position 60)
             totalpower = 0
