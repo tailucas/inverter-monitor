@@ -56,9 +56,9 @@ from influxdb_client.client.write_api import ASYNCHRONOUS
 
 URL_WORKER_APP = 'inproc://app-worker'
 
-SAMPLE_INTERVAL_SECONDS = 60
-ERROR_RETRY_INTERVAL_SECONDS = 60/6
-ERROR_RETRY_ATTEMPTS = 5
+DEFAULT_SAMPLE_INTERVAL_SECONDS = 60
+ERROR_RETRY_INTERVAL_SECONDS = 5
+ERROR_RETRY_ATTEMPTS = 11
 IMPLAUSIBLE_CHANGE_PERCENTAGE = 10
 
 
@@ -72,7 +72,7 @@ def twos_complement_hex(hexval):
 
 class LoggerReader(AppThread, Closable):
 
-    def __init__(self, field_mappings, logger_sn, logger_ip, logger_port):
+    def __init__(self, field_mappings, logger_sn, logger_ip, logger_port, sample_interval_secs=DEFAULT_SAMPLE_INTERVAL_SECONDS):
         AppThread.__init__(self, name=self.__class__.__name__)
         Closable.__init__(self)
 
@@ -82,6 +82,7 @@ class LoggerReader(AppThread, Closable):
         self.logger_sn = logger_sn
         self.logger_ip = logger_ip
         self.logger_port = logger_port
+        self.sample_interval_secs = sample_interval_secs
 
     def get_logger_data(self):
         output = {}
@@ -220,7 +221,13 @@ class LoggerReader(AppThread, Closable):
                     log.error(f'Unable to fetch any valid data after {tries} tries (of {ERROR_RETRY_ATTEMPTS}).')
                 operation_end_time = time.time()
                 # stop for the remainder of the sampling interval
-                threads.interruptable_sleep.wait(SAMPLE_INTERVAL_SECONDS - (operation_end_time-operation_start_time))
+                operation_time = operation_end_time-operation_start_time
+                sample_delay = self.sample_interval_secs - operation_time
+                if sample_delay < 0:
+                    log.warning(f'Sample interval of {self.sample_interval_secs}s is too short, implying wait of {sample_delay}s. Resetting delay to last operation duration {operation_time}s.')
+                    # don't use 0: never spin
+                    sample_delay = operation_time
+                threads.interruptable_sleep.wait(sample_delay)
 
 
 class EventProcessor(AppThread, Closable):
@@ -282,7 +289,8 @@ if __name__ == "__main__":
         field_mappings=field_mappings,
         logger_sn=app_config.getint('inverter', 'logger_sn'),
         logger_ip=app_config.get('inverter', 'logger_address'),
-        logger_port=app_config.getint('inverter', 'logger_port'))
+        logger_port=app_config.getint('inverter', 'logger_port'),
+        sample_interval_secs=app_config.getint('inverter', 'logger_sample_interval_seconds'))
     nanny = threading.Thread(
         name='nanny',
         target=thread_nanny,
