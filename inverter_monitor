@@ -189,7 +189,7 @@ class LoggerReader(AppThread, Closable):
                 operation_start_time = time.time()
                 tries = 1
                 logger_data = None
-                while time.time() - operation_time < DEFAULT_SAMPLE_INTERVAL_SECONDS/2:
+                while time.time() - operation_start_time < DEFAULT_SAMPLE_INTERVAL_SECONDS/2:
                     tries += 1
                     logger_data = self.get_logger_data()
                     if isinstance(logger_data, dict):
@@ -215,9 +215,8 @@ class LoggerReader(AppThread, Closable):
                     self.processor.send_pyobj(logger_data)
                 else:
                     log.error(f'Unable to fetch any valid data after {tries} tries (within {DEFAULT_SAMPLE_INTERVAL_SECONDS}s).')
-                operation_end_time = time.time()
                 # stop for the remainder of the sampling interval
-                operation_time = operation_end_time-operation_start_time
+                operation_time = time.time() - operation_start_time
                 sample_delay = self.sample_interval_secs - operation_time
                 if sample_delay < 0:
                     normalized_sample_delay = min(operation_time, self.sample_interval_secs)
