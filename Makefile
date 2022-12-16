@@ -34,6 +34,9 @@ build:
 run:
 	docker-compose up
 
+rund:
+	docker-compose up -d
+
 connect:
 	./connect_to_app.sh $(DOCKER_APP)
 
