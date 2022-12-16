@@ -55,7 +55,6 @@ URL_WORKER_APP = 'inproc://app-worker'
 
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 60
 ERROR_RETRY_INTERVAL_SECONDS = 5
-ERROR_RETRY_ATTEMPTS = 11
 IMPLAUSIBLE_CHANGE_PERCENTAGE = 10
 
 
@@ -190,7 +189,7 @@ class LoggerReader(AppThread, Closable):
                 operation_start_time = time.time()
                 tries = 1
                 logger_data = None
-                while tries < ERROR_RETRY_ATTEMPTS:
+                while time.time() - operation_time < DEFAULT_SAMPLE_INTERVAL_SECONDS/2:
                     tries += 1
                     logger_data = self.get_logger_data()
                     if isinstance(logger_data, dict):
@@ -209,21 +208,23 @@ class LoggerReader(AppThread, Closable):
                                 prev_battery_soc = battery_soc
                                 # control field change is plausible
                                 break
-                    log.warning(f'Waiting {ERROR_RETRY_INTERVAL_SECONDS} before trying again.')
+                    log.warning(f'Waiting {ERROR_RETRY_INTERVAL_SECONDS}s after {tries} unsuccessful tries.')
                     threads.interruptable_sleep.wait(ERROR_RETRY_INTERVAL_SECONDS)
                 if logger_data is not None and len(logger_data) > 0:
                     log.debug(f'Sending {len(logger_data)} fields for publication.')
                     self.processor.send_pyobj(logger_data)
                 else:
-                    log.error(f'Unable to fetch any valid data after {tries} tries (of {ERROR_RETRY_ATTEMPTS}).')
+                    log.error(f'Unable to fetch any valid data after {tries} tries (within {DEFAULT_SAMPLE_INTERVAL_SECONDS}s).')
                 operation_end_time = time.time()
                 # stop for the remainder of the sampling interval
                 operation_time = operation_end_time-operation_start_time
                 sample_delay = self.sample_interval_secs - operation_time
                 if sample_delay < 0:
-                    log.warning(f'Sample interval of {self.sample_interval_secs}s is too short, implying wait of {sample_delay}s. Resetting delay to last operation duration {operation_time}s.')
+                    normalized_sample_delay = min(operation_time, self.sample_interval_secs)
+                    log.warning(f'Sample interval of {self.sample_interval_secs}s is too short, implying wait of {sample_delay:.2f}s. Resetting delay to last operation duration {normalized_sample_delay:.2f}s.')
                     # don't use 0: never spin
-                    sample_delay = operation_time
+                    sample_delay = normalized_sample_delay
+                log.debug(f'Waiting {sample_delay:.2f}s until the next sample.')
                 threads.interruptable_sleep.wait(sample_delay)
 
 
