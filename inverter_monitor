@@ -21,7 +21,6 @@ import os.path
 app_name = Path(__file__).stem
 builtins.APP_NAME = app_name
 builtins.SENTRY_EXTRAS = []
-AWS_REGION = os.environ['AWS_DEFAULT_REGION']
 influx_creds_section = 'local'
 
 
@@ -31,8 +30,6 @@ class CredsConfig:
     influxdb_org: f'opitem:"InfluxDB" opfield:{influx_creds_section}.org' = None  # type: ignore
     influxdb_token: f'opitem:"InfluxDB" opfield:{influx_creds_section}.token' = None  # type: ignore
     influxdb_url: f'opitem:"InfluxDB" opfield:{influx_creds_section}.url' = None  # type: ignore
-    aws_akid: f'opitem:"AWS" opfield:{AWS_REGION}.akid' = None  # type: ignore
-    aws_sak: f'opitem:"AWS" opfield:{AWS_REGION}.sak' = None  # type: ignore
 
 
 # instantiate class
