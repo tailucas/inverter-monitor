@@ -1,5 +1,6 @@
 APP := inverter_monitor
 DOCKER_APP := inverter-monitor
+USER_ID := 999
 GROUP_ID := $(shell getent group docker | cut -f3 -d ':')
 
 all: help
@@ -8,9 +9,9 @@ help:
 	@echo "Depends on 1Password Connect Server: https://developer.1password.com/docs/connect/get-started"
 
 user:
-	id -u app || useradd -r -g $(GROUP_ID) app
+	id $(USER_ID) || sudo useradd -r -u $(USER_ID) -g $(GROUP_ID) app && sudo usermod -a -G $(GROUP_ID) -u $(USER_ID) app
 	mkdir -p ./data/
-	sudo chown app:$(GROUP_ID) ./data/
+	sudo chown $(USER_ID):$(GROUP_ID) ./data/
 	sudo chmod 755 ./data/
 	sudo chmod g+s ./data/
 
