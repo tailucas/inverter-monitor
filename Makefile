@@ -9,7 +9,7 @@ help:
 	@echo "Depends on 1Password Connect Server: https://developer.1password.com/docs/connect/get-started"
 
 user:
-	id $(USER_ID) || sudo useradd -r -u $(USER_ID) -g $(GROUP_ID) app && sudo usermod -a -G $(GROUP_ID) -u $(USER_ID) app
+	id $(USER_ID) || (sudo useradd -r -u $(USER_ID) -g $(GROUP_ID) app && sudo usermod -a -G $(GROUP_ID) -u $(USER_ID) app)
 	mkdir -p ./data/
 	sudo chown $(USER_ID):$(GROUP_ID) ./data/
 	sudo chmod 755 ./data/
