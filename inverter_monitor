@@ -220,7 +220,7 @@ class LoggerReader(AppThread, Closable):
                 sample_delay = self.sample_interval_secs - operation_time
                 if sample_delay < 0:
                     normalized_sample_delay = min(operation_time, self.sample_interval_secs)
-                    log.warning(f'Sample interval of {self.sample_interval_secs}s is too short, implying wait of {sample_delay:.2f}s. Resetting delay to last operation duration {normalized_sample_delay:.2f}s.')
+                    log.warning(f'Sample interval of {self.sample_interval_secs}s is too short, implying wait of {sample_delay:.2f}s. Resetting delay to {normalized_sample_delay:.2f}s.')
                     # don't use 0: never spin
                     sample_delay = normalized_sample_delay
                 log.debug(f'Waiting {sample_delay:.2f}s until the next sample.')
