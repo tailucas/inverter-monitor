@@ -1,4 +1,4 @@
-FROM tailucas/base-app:20221215
+FROM tailucas/base-app:20221216
 # override dependencies
 COPY requirements.txt .
 # apply override
