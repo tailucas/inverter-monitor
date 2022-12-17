@@ -5,6 +5,7 @@ import binascii
 import builtins
 import libscrc
 import re
+import requests
 import simplejson as json
 import socket
 import threading
@@ -30,6 +31,7 @@ class CredsConfig:
     influxdb_org: f'opitem:"InfluxDB" opfield:{influx_creds_section}.org' = None  # type: ignore
     influxdb_token: f'opitem:"InfluxDB" opfield:{influx_creds_section}.token' = None  # type: ignore
     influxdb_url: f'opitem:"InfluxDB" opfield:{influx_creds_section}.url' = None  # type: ignore
+    weather_api_key: f'opitem:"OpenWeather" opfield:.api_key' = None  # type: ignore
 
 
 # instantiate class
@@ -46,6 +48,9 @@ from lib.threads import thread_nanny
 from lib.app import AppThread
 from lib.zmq import zmq_term, Closable
 from lib.handler import exception_handler
+
+from requests.adapters import ConnectionError
+from requests.exceptions import RequestException
 
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import ASYNCHRONOUS
@@ -227,6 +232,50 @@ class LoggerReader(AppThread, Closable):
                 threads.interruptable_sleep.wait(sample_delay)
 
 
+class WeatherReader(AppThread, Closable):
+
+    def __init__(self):
+        AppThread.__init__(self, name=self.__class__.__name__)
+        Closable.__init__(self)
+
+        self.processor = self.get_socket(zmq.PUSH)
+
+        self.api_key = creds.weather_api_key
+        self.lat, self.lon = tuple(app_config.get('weather', 'coord_lat_lon').split(','))
+
+    def get_weather_data(self):
+        output = {}
+        try:
+            r = requests.get('https://api.openweathermap.org/data/2.5/weather', params={
+                'lat': self.lat,
+                'lon': self.lon,
+                'appid': self.api_key,
+            })
+            try:
+                output = json.loads(r.content)
+                log.debug(f'Loaded {len(output)} weather fields.')
+            except JSONDecodeError:
+                log.exception(f'JSON parse error of {r.content}')
+                return None
+        except (OSError, ConnectionError, RequestException):
+            log.exception('Problem getting weather data.')
+            return None
+        return output
+
+    # noinspection PyBroadException
+    def run(self):
+        log.info(f'Fetching weather data using coordinates [{self.lat},{self.lon}].')
+        self.processor.connect(URL_WORKER_APP)
+        with exception_handler(closable=self):
+            while not threads.shutting_down:
+                weather_data = self.get_weather_data()
+                if weather_data is not None and len(weather_data) > 0:
+                    # log.debug(f'Sending {len(weather_data)} fields for publication: {weather_data}')
+                    log.info(f'Sending {len(weather_data)} fields for publication: {weather_data}')
+                    # self.processor.send_pyobj(weather_data)
+                threads.interruptable_sleep.wait(DEFAULT_SAMPLE_INTERVAL_SECONDS)
+
+
 class EventProcessor(AppThread, Closable):
 
     def __init__(self):
@@ -288,6 +337,7 @@ if __name__ == "__main__":
         logger_ip=app_config.get('inverter', 'logger_address'),
         logger_port=app_config.getint('inverter', 'logger_port'),
         sample_interval_secs=app_config.getint('inverter', 'logger_sample_interval_seconds'))
+    weather_reader = WeatherReader()
     nanny = threading.Thread(
         name='nanny',
         target=thread_nanny,
@@ -300,6 +350,7 @@ if __name__ == "__main__":
         log.info('Starting application threads...')
         event_processor.start()
         logger_reader.start()
+        weather_reader.start()
         # start thread nanny
         nanny.start()
         log.info('Startup complete.')
