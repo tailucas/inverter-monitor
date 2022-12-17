@@ -31,7 +31,7 @@ class CredsConfig:
     influxdb_org: f'opitem:"InfluxDB" opfield:{influx_creds_section}.org' = None  # type: ignore
     influxdb_token: f'opitem:"InfluxDB" opfield:{influx_creds_section}.token' = None  # type: ignore
     influxdb_url: f'opitem:"InfluxDB" opfield:{influx_creds_section}.url' = None  # type: ignore
-    weather_api_key: f'opitem:"OpenWeather" opfield:.api_key' = None  # type: ignore
+    weather_api_key: f'opitem:"OpenWeather" opfield:.password' = None  # type: ignore
 
 
 # instantiate class
