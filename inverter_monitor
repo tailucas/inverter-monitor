@@ -217,7 +217,7 @@ class LoggerReader(AppThread, Closable):
                     threads.interruptable_sleep.wait(ERROR_RETRY_INTERVAL_SECONDS)
                 if logger_data is not None and len(logger_data) > 0:
                     log.debug(f'Sending {len(logger_data)} fields for publication.')
-                    self.processor.send_pyobj(logger_data)
+                    self.processor.send_pyobj({'inverter': logger_data})
                 else:
                     log.error(f'Unable to fetch any valid data after {tries} tries (within {DEFAULT_SAMPLE_INTERVAL_SECONDS}s).')
                 # stop for the remainder of the sampling interval
@@ -244,7 +244,7 @@ class WeatherReader(AppThread, Closable):
         self.lat, self.lon = tuple(app_config.get('weather', 'coord_lat_lon').split(','))
 
     def get_weather_data(self):
-        output = {}
+        output = None
         try:
             r = requests.get('https://api.openweathermap.org/data/2.5/weather', params={
                 'lat': self.lat,
@@ -268,11 +268,25 @@ class WeatherReader(AppThread, Closable):
         self.processor.connect(URL_WORKER_APP)
         with exception_handler(closable=self):
             while not threads.shutting_down:
-                weather_data = self.get_weather_data()
-                if weather_data is not None and len(weather_data) > 0:
-                    # log.debug(f'Sending {len(weather_data)} fields for publication: {weather_data}')
-                    log.info(f'Sending {len(weather_data)} fields for publication: {weather_data}')
-                    # self.processor.send_pyobj(weather_data)
+                wd = self.get_weather_data()
+                log.debug(f'Received weather data: {wd}')
+                if wd is not None and len(wd) > 0:
+                    weather = dict()
+                    weather['cloudiness_pct'] = wd['clouds']['all']
+                    date_value = int(wd['dt'])
+                    sunrise = int(wd['sys']['sunrise'])
+                    sunset = int(wd['sys']['sunset'])
+                    sun_output = 0
+                    # calculate theoretical sun output
+                    if date_value > sunrise and date_value < sunset:
+                        # normalize and divide
+                        midday_secs = (sunset - sunrise) / 2
+                        secs_from_dark = min(date_value - sunrise, sunset - date_value)
+                        sun_output = (secs_from_dark / midday_secs) * 100
+                    country = wd['sys']['country']
+                    weather['midday_pct'] = sun_output
+                    log.debug(f'{country}: Sending {len(weather)} fields for publication: {weather}')
+                    self.processor.send_pyobj({'weather': weather})
                 threads.interruptable_sleep.wait(DEFAULT_SAMPLE_INTERVAL_SECONDS)
 
 
@@ -288,11 +302,11 @@ class EventProcessor(AppThread, Closable):
         self.influxdb_rw = None
         self.influxdb_ro = None
 
-    def _influxdb_write(self, field_name, field_value):
+    def _influxdb_write(self, point_name, field_name, field_value):
         try:
             self.influxdb_rw.write(
                 bucket=self.influxdb_bucket,
-                record=Point("inverter").tag("application", app_name).tag("device", device_name_base).field(field_name, field_value))
+                record=Point(point_name).tag("application", app_name).tag("device", device_name_base).field(field_name, field_value))
         except Exception:
             log.warning(f'Unable to post to InfluxDB.', exc_info=True)
 
@@ -311,9 +325,11 @@ class EventProcessor(AppThread, Closable):
                 event = self.socket.recv_pyobj()
                 log.debug(event)
                 if isinstance(event, dict):
-                    for key, value in event.items():
-                        self._influxdb_write(key, value)
-                    log.debug(f'Wrote {len(event)} points.')
+                    for point_name in list(event):
+                        point_items = event[point_name]
+                        for key, value in point_items.items():
+                            self._influxdb_write(point_name, key, value)
+                        log.debug(f'Wrote {len(point_items)} {point_name} points.')
 
 
 if __name__ == "__main__":
