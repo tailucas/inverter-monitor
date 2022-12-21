@@ -12,9 +12,12 @@ import threading
 import time
 import zmq
 
+import paho.mqtt.client as mqtt
+from paho.mqtt.client import MQTT_ERR_SUCCESS, MQTT_ERR_NO_CONN
+
 from pathlib import Path
 from simplejson.scanner import JSONDecodeError
-from zmq.error import ContextTerminated
+from zmq.error import ZMQError, ContextTerminated
 
 import os.path
 
@@ -57,6 +60,8 @@ from influxdb_client.client.write_api import ASYNCHRONOUS
 
 
 URL_WORKER_APP = 'inproc://app-worker'
+URL_WORKER_MQTT_PUBLISH = 'inproc://mqtt-publish'
+
 
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 60
 ERROR_RETRY_INTERVAL_SECONDS = 5
@@ -290,6 +295,86 @@ class WeatherReader(AppThread, Closable):
                 threads.interruptable_sleep.wait(DEFAULT_SAMPLE_INTERVAL_SECONDS)
 
 
+class MqttSubscriber(AppThread, Closable):
+
+    def __init__(self, mqtt_server_address, mqtt_topic_prefix):
+        AppThread.__init__(self, name=self.__class__.__name__)
+        Closable.__init__(self, connect_url=URL_WORKER_MQTT_PUBLISH)
+
+        self.processor = self.get_socket(zmq.PUSH)
+
+        self._mqtt_client = None
+        self._mqtt_server_address = mqtt_server_address
+        self._mqtt_subscribe_topic_prefix = mqtt_topic_prefix
+
+        self._disconnected = False
+
+        self._topic_state = dict()
+
+    def close(self):
+        Closable.close(self)
+        try:
+            self._mqtt_client.disconnect()
+        except Exception:
+            log.warning('Ignoring error closing MQTT socket.', exc_info=True)
+
+    def on_connect(self, client, userdata, flags, rc):
+        subscription_topic = f'{self._mqtt_subscribe_topic_prefix}/#'
+        log.info(f'Subscribing to topic [{subscription_topic}]...')
+        self._mqtt_client.subscribe(subscription_topic)
+
+    def on_disconnect(self, client, userdata, rc):
+        log.info('MQTT client has disconnected.')
+        self._disconnected = True
+
+    def on_message(self, client, userdata, msg):
+        topic = msg.topic
+        payload = msg.payload
+        log.debug(f'{topic} received {len(payload)} bytes.')
+        msg_data = None
+        try:
+            log.debug(f'{topic} received: {payload}')
+            msg_data = json.loads(payload)
+        except JSONDecodeError:
+            log.exception(f'Unstructured message: {payload}')
+            return
+        except ContextTerminated:
+            self.close()
+        if 'switches' in msg_data.keys():
+            new_state = msg_data['switches']
+            old_state = list()
+            if topic in self._topic_state:
+                old_state = self._topic_state[topic]
+            if new_state != old_state:
+                for ids, s in enumerate(new_state):
+                    log.info(f'Switch {ids+1} is now in state [{s}]')
+            # state capture
+            self._topic_state[topic] = new_state
+
+    # noinspection PyBroadException
+    def run(self):
+        self.processor.connect(URL_WORKER_APP)
+        log.info(f'Connecting to MQTT server {self._mqtt_server_address}...')
+        self._mqtt_client = mqtt.Client()
+        self._mqtt_client.on_connect = self.on_connect
+        self._mqtt_client.on_disconnect = self.on_disconnect
+        self._mqtt_client.on_message = self.on_message
+        self._mqtt_client.connect(self._mqtt_server_address)
+        with exception_handler(closable=self, and_raise=False, shutdown_on_error=True):
+            while not threads.shutting_down:
+                rc = self._mqtt_client.loop()
+                if rc == MQTT_ERR_NO_CONN or self._disconnected:
+                    raise ResourceWarning(f'No connection to MQTT broker at {self._mqtt_server_address} (disconnected? {self._disconnected})')
+                # check for messages to publish
+                try:
+                    mqtt_pub_topic, message_data = self.socket.recv_pyobj(flags=zmq.NOBLOCK)
+                    log.debug(f'Publishing {len(message_data)} bytes to topic {mqtt_pub_topic}...')
+                    self._mqtt_client.publish(topic=mqtt_pub_topic, payload=message_data)
+                except ZMQError:
+                    # ignore, no data
+                    pass
+
+
 class EventProcessor(AppThread, Closable):
 
     def __init__(self):
@@ -302,6 +387,8 @@ class EventProcessor(AppThread, Closable):
         self.influxdb_rw = None
         self.influxdb_ro = None
 
+        self._mqtt_socket = self.get_socket(zmq.PUSH)
+
     def _influxdb_write(self, point_name, field_name, field_value):
         try:
             self.influxdb_rw.write(
@@ -312,6 +399,7 @@ class EventProcessor(AppThread, Closable):
 
     # noinspection PyBroadException
     def run(self):
+        self._mqtt_socket.connect(URL_WORKER_MQTT_PUBLISH)
         # influx DB
         log.info(f'Connecting to InfluxDB at {creds.influxdb_url} using bucket {self.influxdb_bucket}.')
         self.influxdb = InfluxDBClient(
@@ -324,12 +412,25 @@ class EventProcessor(AppThread, Closable):
             while not threads.shutting_down:
                 event = self.socket.recv_pyobj()
                 log.debug(event)
+                # DEBUG
+                switch_state = 1
                 if isinstance(event, dict):
                     for point_name in list(event):
                         point_items = event[point_name]
                         for key, value in point_items.items():
+                            if key == 'grid_voltage_l1_v' and int(value) < 200:
+                                switch_state = 0
+                                log.debug(f'Set switch control state to {switch_state}.')
                             self._influxdb_write(point_name, key, value)
                         log.debug(f'Wrote {len(point_items)} {point_name} points.')
+                log.debug(f'Sending switch control message.')
+                self._mqtt_socket.send_pyobj((
+                    'switches/switch1/control',
+                    json.dumps(
+                        {'switches': [{"switch": 0, "state": switch_state},
+                                      {"switch": 1, "state": switch_state}]}
+                    )
+                ))
 
 
 if __name__ == "__main__":
