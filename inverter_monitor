@@ -390,7 +390,10 @@ class MqttSubscriber(AppThread, Closable):
                             'control',
                             switch_bank
                         ])
-                        message_data = json.dumps({'switches': self._switch_state[switch_bank]})
+                        mqtt_update = list()
+                        for ids, _ in enumerate(self._switch_state[switch_bank]):
+                            mqtt_update.append(switch_state)
+                        message_data = json.dumps({'switches': mqtt_update})
                         log.debug(f'[{mqtt_pub_topic}] Publishing {len(message_data)} bytes: [{message_data}]')
                         self._mqtt_client.publish(topic=mqtt_pub_topic, payload=message_data)
                 except ZMQError:
