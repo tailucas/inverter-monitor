@@ -322,7 +322,7 @@ class MqttSubscriber(AppThread, Closable):
             log.warning('Ignoring error closing MQTT socket.', exc_info=True)
 
     def on_connect(self, client, userdata, flags, rc):
-        subscription_topic = f'{self._mqtt_subscribe_topic_prefix}/#'
+        subscription_topic = f'{self._mqtt_subscribe_topic_prefix}/status/#'
         log.info(f'Subscribing to topic [{subscription_topic}]...')
         self._mqtt_client.subscribe(subscription_topic)
 
@@ -344,13 +344,8 @@ class MqttSubscriber(AppThread, Closable):
         except ContextTerminated:
             self.close()
         if 'switches' in msg_data.keys():
-            switch_bank = topic.split('/')[1]
-            new_state = list()
-            for switch in msg_data['switches']:
-                new_state.append([
-                    switch['switch'],
-                    switch['state']
-                ])
+            switch_bank = topic.split('/')[2]
+            new_state = msg_data['switches']
             old_state = list()
             if switch_bank in self._switch_state:
                 old_state = self._switch_state[switch_bank]
@@ -392,8 +387,8 @@ class MqttSubscriber(AppThread, Closable):
                     for switch_bank in self._switch_state.keys():
                         mqtt_pub_topic = '/'.join([
                             f'{self._mqtt_subscribe_topic_prefix}',
-                            switch_bank,
-                            'control'
+                            'control',
+                            switch_bank
                         ])
                         mqtt_update = dict()
                         mqtt_update['switches'] = list()
