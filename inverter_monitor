@@ -13,7 +13,7 @@ import time
 import zmq
 
 import paho.mqtt.client as mqtt
-from paho.mqtt.client import MQTT_ERR_SUCCESS, MQTT_ERR_NO_CONN
+from paho.mqtt.client import MQTT_ERR_NO_CONN
 
 from pathlib import Path
 from simplejson.scanner import JSONDecodeError
@@ -135,6 +135,7 @@ class LoggerReader(AppThread, Closable):
             client_socket.sendall(frame_bytes)
 
             # RECEIVE RESPONSE
+            data = None
             try:
                 data = client_socket.recv(1024)
                 if data is None:
@@ -436,25 +437,28 @@ class EventProcessor(AppThread, Closable):
 if __name__ == "__main__":
     log.setLevel(logging.INFO)
     # load basic configuration
-    field_mappings = None
-    field_mappings_file = ''.join([os.path.join(APP_PATH, 'config', 'field_mappings.txt')])  # type: ignore
-    with open(field_mappings_file) as mappings_file:
+    mappings = None
+    mappings_file = ''.join([os.path.join(APP_PATH, 'config', 'field_mappings.txt')])  # type: ignore
+    with open(mappings_file) as mapping_file:
         try:
-            field_mappings = json.loads(mappings_file.read())
-            log.info(f'Loaded {len(field_mappings)} field mappings from {field_mappings_file}')
+            mappings = json.loads(mapping_file.read())
+            log.info(f'Loaded {len(mappings)} field mappings from {mappings_file}')
         except JSONDecodeError as e:
-            log.exception(f'Error loading {field_mappings_file}.')
+            log.exception(f'Error loading {mappings_file}.')
             raise e
     # ensure proper signal handling; must be main thread
     signal_handler = SignalHandler()
     event_processor = EventProcessor()
     logger_reader = LoggerReader(
-        field_mappings=field_mappings,
+        field_mappings=mappings,
         logger_sn=app_config.getint('inverter', 'logger_sn'),
         logger_ip=app_config.get('inverter', 'logger_address'),
         logger_port=app_config.getint('inverter', 'logger_port'),
         sample_interval_secs=app_config.getint('inverter', 'logger_sample_interval_seconds'))
     weather_reader = WeatherReader()
+    mqtt_subscriber = MqttSubscriber(
+        mqtt_server_address=app_config.get('mqtt', 'server_address'),
+        mqtt_topic_prefix=app_config.get('mqtt', 'topic_prefix'))
     nanny = threading.Thread(
         name='nanny',
         target=thread_nanny,
@@ -468,6 +472,7 @@ if __name__ == "__main__":
         event_processor.start()
         logger_reader.start()
         weather_reader.start()
+        mqtt_subscriber.start()
         # start thread nanny
         nanny.start()
         log.info('Startup complete.')
