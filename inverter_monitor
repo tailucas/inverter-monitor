@@ -195,6 +195,7 @@ class LoggerReader(AppThread, Closable):
     # noinspection PyBroadException
     def run(self):
         self.processor.connect(URL_WORKER_APP)
+        log.info(f'Using inverter logger {self.logger_sn} at address {self.logger_ip}:{self.logger_port}.')
         with exception_handler(closable=self):
             prev_battery_soc = None
             while not threads.shutting_down:
