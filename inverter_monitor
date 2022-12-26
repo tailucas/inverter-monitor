@@ -15,6 +15,7 @@ import zmq
 import paho.mqtt.client as mqtt
 from paho.mqtt.client import MQTT_ERR_NO_CONN
 
+from collections import deque
 from pathlib import Path
 from simplejson.scanner import JSONDecodeError
 from zmq.error import ZMQError, ContextTerminated
@@ -289,6 +290,7 @@ class WeatherReader(AppThread, Closable):
                         midday_secs = (sunset - sunrise) / 2
                         secs_from_dark = min(date_value - sunrise, sunset - date_value)
                         sun_output = (secs_from_dark / midday_secs) * 100
+                        log.debug(f'Derived {sun_output}% sun output from {sunrise=},{date_value=},{sunset=},{midday_secs=},{secs_from_dark=}')
                     country = wd['sys']['country']
                     weather['midday_pct'] = sun_output
                     log.debug(f'{country}: Sending {len(weather)} fields for publication: {weather}')
@@ -312,7 +314,7 @@ class MqttSubscriber(AppThread, Closable):
 
         self._switch_state = dict()
 
-        self._prev_power_state = None
+        self._power_generation_history = deque(maxlen=5)
 
     def close(self):
         Closable.close(self)
@@ -355,6 +357,28 @@ class MqttSubscriber(AppThread, Closable):
             # state capture
             self._switch_state[switch_bank] = new_state
 
+    def set_switch_state(self, switch_state=1):
+        # update switches
+        for switch_bank in self._switch_state.keys():
+            mqtt_pub_topic = '/'.join([
+                f'{self._mqtt_subscribe_topic_prefix}',
+                'control',
+                switch_bank
+            ])
+            mqtt_update = list()
+            for ids, _ in enumerate(self._switch_state[switch_bank]):
+                mqtt_update.append(switch_state)
+            message_data = json.dumps({'switches': mqtt_update})
+            log.debug(f'[{mqtt_pub_topic}] Publishing {len(message_data)} bytes: [{message_data}]')
+            self._mqtt_client.publish(topic=mqtt_pub_topic, payload=message_data)
+
+    def get_power_generation_avg(self, value):
+        self._power_generation_history.append(value)
+        total = 0
+        for sample in self._power_generation_history:
+            total += sample
+        return total / len(self._power_generation_history)
+
     # noinspection PyBroadException
     def run(self):
         self.processor.connect(URL_WORKER_APP)
@@ -369,36 +393,29 @@ class MqttSubscriber(AppThread, Closable):
                 rc = self._mqtt_client.loop()
                 if rc == MQTT_ERR_NO_CONN or self._disconnected:
                     raise ResourceWarning(f'No connection to MQTT broker at {self._mqtt_server_address} (disconnected? {self._disconnected})')
+                inverter_data = None
                 # check for messages to publish
                 try:
                     inverter_data = self.socket.recv_pyobj(flags=zmq.NOBLOCK)
-                    if not isinstance(inverter_data, dict):
-                        continue
-                    switch_state = 1
-                    if 'battery_power_w' in inverter_data:
-                        battery_power_w = int(inverter_data['battery_power_w'])
-                        if battery_power_w >= 0:
-                            switch_state = 0
-                    # check for change
-                    if switch_state != self._prev_power_state:
-                        log.info(f'Inverter battery power is now {battery_power_w}w, updating switch banks to [{switch_state}].')
-                    self._prev_power_state = switch_state
-                    # update switches
-                    for switch_bank in self._switch_state.keys():
-                        mqtt_pub_topic = '/'.join([
-                            f'{self._mqtt_subscribe_topic_prefix}',
-                            'control',
-                            switch_bank
-                        ])
-                        mqtt_update = list()
-                        for ids, _ in enumerate(self._switch_state[switch_bank]):
-                            mqtt_update.append(switch_state)
-                        message_data = json.dumps({'switches': mqtt_update})
-                        log.debug(f'[{mqtt_pub_topic}] Publishing {len(message_data)} bytes: [{message_data}]')
-                        self._mqtt_client.publish(topic=mqtt_pub_topic, payload=message_data)
                 except ZMQError:
                     # ignore, no data
-                    pass
+                    continue
+                if not isinstance(inverter_data, dict):
+                    continue
+                # check for required fields
+                if not all(field in inverter_data.keys() for field in ['alert', 'battery_power_w', 'pv1_power_w', 'pv2_power_w']):
+                    continue
+                switch_state = 1
+                if int(inverter_data['alert']) == 1:
+                    # do not load shed during an alert condition
+                    self.set_switch_state()
+                    continue
+                power_generation_w_avg = self.get_power_generation_avg(value=float(inverter_data['pv1_power_w']) + float(inverter_data['pv2_power_w']) - float(inverter_data['battery_power_w']))
+                if power_generation_w_avg < 0:
+                    switch_state = 0
+                log.debug(f'Power generation average is now {power_generation_w_avg:.2f}w, updating switch banks to [{switch_state}].')
+                # update switches
+                self.set_switch_state(switch_state=switch_state)
 
 
 class EventProcessor(AppThread, Closable):
@@ -438,8 +455,6 @@ class EventProcessor(AppThread, Closable):
             while not threads.shutting_down:
                 event = self.socket.recv_pyobj()
                 log.debug(event)
-                # DEBUG
-                switch_state = 1
                 if isinstance(event, dict):
                     for point_name in list(event):
                         point_items = event[point_name]
