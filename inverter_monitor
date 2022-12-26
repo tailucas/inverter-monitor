@@ -290,7 +290,7 @@ class WeatherReader(AppThread, Closable):
                         midday_secs = (sunset - sunrise) / 2
                         secs_from_dark = min(date_value - sunrise, sunset - date_value)
                         sun_output = (secs_from_dark / midday_secs) * 100
-                        log.debug(f'Derived {sun_output}% sun output from {sunrise=},{date_value=},{sunset=},{midday_secs=},{secs_from_dark=}')
+                        log.debug(f"Derived {sun_output}% sun output from {sunrise=},{date_value=},{sunset=},{midday_secs=},{secs_from_dark=}")
                     country = wd['sys']['country']
                     weather['midday_pct'] = sun_output
                     log.debug(f'{country}: Sending {len(weather)} fields for publication: {weather}')
