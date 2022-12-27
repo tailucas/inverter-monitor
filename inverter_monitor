@@ -192,7 +192,7 @@ class LoggerReader(AppThread, Closable):
             pini=150
             pfin=195
             chunks+=1
-        log.debug(f'Fetched {len(output)} bytes after {chunks} chunks.')
+        log.debug(f'Fetched {len(output)} fields after {chunks} chunks.')
         return output
 
     # noinspection PyBroadException
