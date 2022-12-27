@@ -121,11 +121,11 @@ class LoggerReader(AppThread, Closable):
             frame_bytes[len(frame_bytes) - 2] = int((checksum & 255))
 
             # OPEN SOCKET
-
+            log.debug(f'Opening stream socket to logger {self.logger_sn} @ {self.logger_ip}:{self.logger_port}...')
             for res in socket.getaddrinfo(self.logger_ip, self.logger_port, socket.AF_INET, socket.SOCK_STREAM):
                 family, socktype, proto, canonname, sockadress = res
                 try:
-                    client_socket = socket.socket(family,socktype,proto)
+                    client_socket = socket.socket(family, socktype, proto)
                     client_socket.settimeout(10)
                     client_socket.connect(sockadress)
                 except socket.error as msg:
@@ -133,6 +133,7 @@ class LoggerReader(AppThread, Closable):
                     return None
 
             # SEND DATA
+            log.debug(f'Sending {len(frame_bytes)} bytes data frame for chunk {chunks}.')
             client_socket.sendall(frame_bytes)
 
             # RECEIVE RESPONSE
@@ -151,6 +152,7 @@ class LoggerReader(AppThread, Closable):
                 except socket.error as msg:
                     log.warning(f'{msg}')
 
+            log.debug(f'Received {len(data)} bytes for chunk {chunks}.')
             # PARSE RESPONSE (start position 56, end position 60)
             totalpower = 0
             i = pfin - pini
@@ -190,6 +192,7 @@ class LoggerReader(AppThread, Closable):
             pini=150
             pfin=195
             chunks+=1
+        log.debug(f'Fetched {len(output)} bytes after {chunks} chunks.')
         return output
 
     # noinspection PyBroadException
@@ -416,7 +419,7 @@ class MqttSubscriber(AppThread, Closable):
                 power_generation_w_avg = self.get_power_generation_avg(value=float(inverter_data['pv1_power_w']) + float(inverter_data['pv2_power_w']) - float(inverter_data['battery_power_w']))
                 if power_generation_w_avg < 0:
                     switch_state = 0
-                log.debug(f'Power generation "balance" is now {power_generation_w_avg:.2f}w, updating switch banks to [{switch_state}].')
+                log.debug(f'Power surplus is now {power_generation_w_avg:.2f}w, updating switch banks to [{switch_state}].')
                 # update switches
                 self.set_switch_state(switch_state=switch_state)
 
