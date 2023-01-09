@@ -5,3 +5,4 @@ docker-compose.template2
 .vscode/
 data/
 venv/
+*.code-workspace
