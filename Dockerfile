@@ -1,8 +1,12 @@
-FROM tailucas/base-app:20221226
+FROM tailucas/base-app:20230102
+# for system/site packages
+USER root
 # override dependencies
 COPY requirements.txt .
 # apply override
 RUN /opt/app/app_setup.sh
+# switch to user
+USER app
 # override configuration
 COPY config/app.conf ./config/app.conf
 COPY config/field_mappings.txt ./config/field_mappings.txt
