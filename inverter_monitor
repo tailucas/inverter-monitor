@@ -416,10 +416,13 @@ class MqttSubscriber(AppThread, Closable):
                     # do not load shed during an alert condition
                     self.set_switch_state()
                     continue
-                power_generation_w_avg = self.get_power_generation_avg(value=float(inverter_data['pv1_power_w']) + float(inverter_data['pv2_power_w']) - float(inverter_data['battery_power_w']))
+                pv1_power_w = float(inverter_data['pv1_power_w'])
+                pv2_power_w = float(inverter_data['pv2_power_w'])
+                battery_power_w = float(inverter_data['battery_power_w'])
+                power_generation_w_avg = self.get_power_generation_avg(value=pv1_power_w + pv2_power_w - battery_power_w)
                 if power_generation_w_avg < 0:
                     switch_state = 0
-                log.debug(f'Power surplus is now {power_generation_w_avg:.2f}w, updating switch banks to [{switch_state}].')
+                log.debug(f'Power surplus is now {power_generation_w_avg:.2f}w ({pv1_power_w=:.2f}, {pv2_power_w=:.2f}, {battery_power_w=:.2f}), updating switch banks to [{switch_state}].')
                 # update switches
                 self.set_switch_state(switch_state=switch_state)
 
