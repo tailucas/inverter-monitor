@@ -225,7 +225,7 @@ class LoggerReader(AppThread, Closable):
                                 break
                             soc_delta_pct = int(battery_soc-prev_battery_soc)
                             prev_battery_soc_last_set = now - prev_battery_soc_set
-                            log.debug(f'battery_soc_pct changed by {soc_delta_pct}% from {prev_battery_soc} (set {prev_battery_soc_last_set}s ago) to {battery_soc}.')
+                            log.debug(f'battery_soc_pct changed by {soc_delta_pct}% from {prev_battery_soc} (set {prev_battery_soc_last_set:.2f}s ago) to {battery_soc}.')
                             # check for an implausible negative change within some time bound
                             if abs(soc_delta_pct) >= IMPLAUSIBLE_CHANGE_PERCENTAGE and prev_battery_soc_last_set < DEFAULT_SAMPLE_INTERVAL_SECONDS*2:
                                 log.warning(f'battery_soc_pct changed by more than {IMPLAUSIBLE_CHANGE_PERCENTAGE}% from {prev_battery_soc} to {battery_soc}. Treating this output as implausible: {str(logger_data)}')
