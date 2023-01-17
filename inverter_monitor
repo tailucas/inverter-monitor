@@ -449,7 +449,7 @@ class MqttSubscriber(AppThread, Closable):
                     switch_stats['battery_ration'] = 1
                 # log the supporting data
                 log_msg = (
-                    f'Power surplus is {power_generation_w_avg:.2f}w ({pv1_power_w=:.2f}w, {pv2_power_w=:.2f}w, {battery_power_w=:.2f}w). '
+                    f'Power surplus average is {power_generation_w_avg:.2f}w ({pv1_power_w=:.2f}w, {pv2_power_w=:.2f}w, {battery_power_w=:.2f}w). '
                     f'Battery discharge {battery_power_w}w with remaining charge of {battery_soc_pct}% and supporting grid voltage of {grid_voltage}v. '
                     f'Updating switch banks to [{switch_state}].'
                 )
