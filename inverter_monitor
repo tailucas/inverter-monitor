@@ -217,8 +217,13 @@ class LoggerReader(AppThread, Closable):
                     if isinstance(logger_data, dict):
                         if 'battery_soc_pct' in logger_data.keys():
                             battery_soc = logger_data['battery_soc_pct']
-                            # no previous or too low to effectively tell the difference
-                            if prev_battery_soc is None or battery_soc < IMPLAUSIBLE_CHANGE_PERCENTAGE:
+                            battery_voltage = logger_data['battery_voltage_v']
+                            # implausible battery state
+                            if battery_soc == 0 and battery_voltage == 0:
+                                log.warning(f'{battery_soc=}% and {battery_voltage=}v. Treating this output as implausible: {str(logger_data)}')
+                                continue
+                            # no previous to compare
+                            if prev_battery_soc is None:
                                 prev_battery_soc = battery_soc
                                 prev_battery_soc_set = now
                                 # current dict is good enough, break the try loop
