@@ -322,7 +322,7 @@ class WeatherReader(AppThread, Closable):
 
 class MqttSubscriber(AppThread, Closable):
 
-    def __init__(self, mqtt_server_address, mqtt_topic_prefix):
+    def __init__(self, mqtt_server_address, mqtt_topic_prefix, mqtt_switch_devices):
         AppThread.__init__(self, name=self.__class__.__name__)
         Closable.__init__(self, connect_url=URL_WORKER_MQTT_PUBLISH)
 
@@ -331,6 +331,7 @@ class MqttSubscriber(AppThread, Closable):
         self._mqtt_client = None
         self._mqtt_server_address = mqtt_server_address
         self._mqtt_subscribe_topic_prefix = mqtt_topic_prefix
+        self._mqtt_switch_devices = mqtt_switch_devices
 
         self._disconnected = False
 
@@ -346,7 +347,7 @@ class MqttSubscriber(AppThread, Closable):
             log.warning('Ignoring error closing MQTT socket.', exc_info=True)
 
     def on_connect(self, client, userdata, flags, rc):
-        subscription_topic = f'{self._mqtt_subscribe_topic_prefix}/status/#'
+        subscription_topic = f'{self._mqtt_subscribe_topic_prefix}/state/#'
         log.info(f'Subscribing to topic [{subscription_topic}]...')
         self._mqtt_client.subscribe(subscription_topic)
 
@@ -380,8 +381,10 @@ class MqttSubscriber(AppThread, Closable):
             self._switch_state[switch_bank] = new_state
 
     def set_switch_state(self, switch_state=1):
-        # update switches
         for switch_bank in self._switch_state.keys():
+            if switch_bank not in self._mqtt_switch_devices:
+                log.warning(f'Not changing state for {switch_bank} due to missing configuration.')
+                continue
             mqtt_pub_topic = '/'.join([
                 f'{self._mqtt_subscribe_topic_prefix}',
                 'control',
@@ -390,7 +393,7 @@ class MqttSubscriber(AppThread, Closable):
             mqtt_update = list()
             for ids, _ in enumerate(self._switch_state[switch_bank]):
                 mqtt_update.append(switch_state)
-            message_data = json.dumps({'switches': mqtt_update})
+            message_data = json.dumps({'state': mqtt_update})
             log.debug(f'[{mqtt_pub_topic}] Publishing {len(message_data)} bytes: [{message_data}]')
             self._mqtt_client.publish(topic=mqtt_pub_topic, payload=message_data)
 
@@ -541,7 +544,8 @@ if __name__ == "__main__":
     weather_reader = WeatherReader()
     mqtt_subscriber = MqttSubscriber(
         mqtt_server_address=app_config.get('mqtt', 'server_address'),
-        mqtt_topic_prefix=app_config.get('mqtt', 'topic_prefix'))
+        mqtt_topic_prefix=app_config.get('mqtt', 'topic_prefix'),
+        mqtt_switch_devices=app_config.get('mqtt', 'switch_device_csv').split(','))
     nanny = threading.Thread(
         name='nanny',
         target=thread_nanny,
