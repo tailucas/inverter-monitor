@@ -67,7 +67,8 @@ URL_WORKER_MQTT_PUBLISH = 'inproc://mqtt-publish'
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 60
 ERROR_RETRY_INTERVAL_SECONDS = 5
 IMPLAUSIBLE_CHANGE_PERCENTAGE = 5
-BATTERY_LOW_PCT = 20
+BATTERY_LOW_PCT = 33
+BATTERY_CRITICAL_PCT = 25
 # idle small home ~ 300W
 BATTERY_MAJOR_DRAW_W = 500
 
@@ -444,14 +445,16 @@ class MqttSubscriber(AppThread, Closable):
                 pv2_power_w = float(inverter_data['pv2_power_w'])
                 battery_power_w = float(inverter_data['battery_power_w'])
                 power_generation_w_avg = self.get_power_generation_avg(value=pv1_power_w + pv2_power_w - battery_power_w)
-                if power_generation_w_avg < 0:
+                # disable switch if battery is critically low without adequate surplus (i.e. not charging from solar)
+                battery_soc_pct = inverter_data['battery_soc_pct']
+                if battery_soc_pct < BATTERY_CRITICAL_PCT and power_generation_w_avg < 0:
                     switch_state = 0
                     switch_stats['surplus_ration'] = 1
                 # check 2: determine battery state of charge and whether there is any grid fallback
                 grid_voltage_l1_v = float(inverter_data['grid_voltage_l1_v'])
                 grid_voltage_l2_v = float(inverter_data['grid_voltage_l2_v'])
                 grid_voltage = max(grid_voltage_l1_v, grid_voltage_l2_v)
-                battery_soc_pct = inverter_data['battery_soc_pct']
+                # more conservative rationing if there is no grid backup (draw assumes no surplus)
                 if battery_soc_pct < BATTERY_LOW_PCT and grid_voltage < 90 and battery_power_w >= BATTERY_MAJOR_DRAW_W:
                     switch_state = 0
                     switch_stats['battery_ration'] = 1
