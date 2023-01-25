@@ -474,6 +474,8 @@ class MqttSubscriber(AppThread, Closable):
                 # post stats
                 switch_stats['switch_state'] = switch_state
                 self.processor.send_pyobj({'switches': switch_stats})
+                # for other interested consumers
+                self._mqtt_client.publish(topic='inverter/state', payload=json.dumps(inverter_data))
 
 
 class EventProcessor(AppThread, Closable):
