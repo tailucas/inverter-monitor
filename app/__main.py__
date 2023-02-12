@@ -23,14 +23,13 @@ from zmq.error import ZMQError, ContextTerminated
 import os.path
 
 # setup builtins used by pylib init
-app_name = Path(__file__).stem
-builtins.APP_NAME = app_name
+from . import APP_NAME
 builtins.SENTRY_EXTRAS = []
 influx_creds_section = 'local'
 
 
 class CredsConfig:
-    sentry_dsn: f'opitem:"Sentry" opfield:{app_name}.dsn' = None  # type: ignore
+    sentry_dsn: f'opitem:"Sentry" opfield:{APP_NAME}.dsn' = None  # type: ignore
     cronitor_token: f'opitem:"cronitor" opfield:.password' = None  # type: ignore
     influxdb_org: f'opitem:"InfluxDB" opfield:{influx_creds_section}.org' = None  # type: ignore
     influxdb_token: f'opitem:"InfluxDB" opfield:{influx_creds_section}.token' = None  # type: ignore
@@ -41,17 +40,17 @@ class CredsConfig:
 # instantiate class
 builtins.creds_config = CredsConfig()
 
-from lib import app_config, \
+from pylib import app_config, \
     creds, \
     device_name_base, \
     log
 
-from lib.process import SignalHandler
-from lib import threads
-from lib.threads import thread_nanny, bye
-from lib.app import AppThread
-from lib.zmq import zmq_term, Closable
-from lib.handler import exception_handler
+from pylib.process import SignalHandler
+from pylib import threads
+from pylib.threads import thread_nanny, bye
+from pylib.app import AppThread
+from pylib.zmq import zmq_term, Closable
+from pylib.handler import exception_handler
 
 from requests.adapters import ConnectionError
 from requests.exceptions import RequestException
@@ -525,7 +524,7 @@ class EventProcessor(AppThread, Closable):
                             self._mqtt_socket.send_pyobj(point_items)
 
 
-if __name__ == "__main__":
+def main():
     log.setLevel(logging.INFO)
     # load basic configuration
     mappings = None
@@ -560,7 +559,7 @@ if __name__ == "__main__":
     # back to INFO logging
     log.setLevel(logging.INFO)
     try:
-        log.info('Starting application threads...')
+        log.info(f'Starting {APP_NAME} threads...')
         event_processor.start()
         logger_reader.start()
         weather_reader.start()
@@ -578,3 +577,7 @@ if __name__ == "__main__":
     finally:
         zmq_term()
     bye()
+
+
+if __name__ == "__main__":
+    main()

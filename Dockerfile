@@ -1,4 +1,4 @@
-FROM tailucas/base-app:20230125
+FROM tailucas/base-app:20230212_3
 # for system/site packages
 USER root
 # system setup
@@ -8,18 +8,16 @@ RUN apk update \
     && apk --no-cache add \
         gcc \
         musl-dev
-# override dependencies
-COPY requirements.txt .
 # apply override
-ENV PYTHON_ADD_WHEEL 1
 RUN /opt/app/app_setup.sh
 # switch to user
 USER app
 # override configuration
 COPY config/app.conf ./config/app.conf
 COPY config/field_mappings.txt ./config/field_mappings.txt
-# remove base_app
-RUN rm -f /opt/app/base_app
+COPY poetry.lock pyproject.toml ./
+RUN /opt/app/python_setup.sh
 # add the project application
-COPY inverter_monitor .
+COPY app/__main.py__ ./app/
+# apply override
 CMD ["/opt/app/entrypoint.sh"]

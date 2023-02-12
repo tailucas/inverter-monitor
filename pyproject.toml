@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "app"
+version = "0.1.0"
+description = ""
+authors = ["Tai Lucas <tglucas@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.scripts]
+app = "app.__main__:main"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+influxdb-client = "^1.36.0"
+libscrc = "^1.8.1"
+paho-mqtt = "^1.6.1"
+requests = "^2.28.2"
+pylib = {path = "pylib"}
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
