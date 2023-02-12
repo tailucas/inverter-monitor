@@ -8,6 +8,8 @@ RUN apk update \
     && apk --no-cache add \
         gcc \
         musl-dev
+# cron jobs
+RUN rm -f ./config/cron/base_job
 # apply override
 RUN /opt/app/app_setup.sh
 # switch to user
@@ -18,6 +20,6 @@ COPY config/field_mappings.txt ./config/field_mappings.txt
 COPY poetry.lock pyproject.toml ./
 RUN /opt/app/python_setup.sh
 # add the project application
-COPY app/__main.py__ ./app/
+COPY app/__main__.py ./app/
 # apply override
 CMD ["/opt/app/entrypoint.sh"]

@@ -495,7 +495,7 @@ class EventProcessor(AppThread, Closable):
         try:
             self.influxdb_rw.write(
                 bucket=self.influxdb_bucket,
-                record=Point(point_name).tag("application", app_name).tag("device", device_name_base).field(field_name, field_value))
+                record=Point(point_name).tag("application", APP_NAME).tag("device", device_name_base).field(field_name, field_value))
         except Exception:
             log.warning(f'Unable to post to InfluxDB.', exc_info=True)
 
