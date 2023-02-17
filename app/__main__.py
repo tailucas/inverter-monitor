@@ -47,7 +47,7 @@ from pylib import app_config, \
 
 from pylib.process import SignalHandler
 from pylib import threads
-from pylib.threads import thread_nanny, bye
+from pylib.threads import thread_nanny, bye, die
 from pylib.app import AppThread
 from pylib.zmq import zmq_term, Closable
 from pylib.handler import exception_handler
@@ -571,9 +571,7 @@ def main():
         threads.interruptable_sleep.wait()
         raise RuntimeWarning("Shutting down...")
     except(KeyboardInterrupt, RuntimeWarning, ContextTerminated) as e:
-        log.warning(str(e))
-        threads.shutting_down = True
-        threads.interruptable_sleep.set()
+        die()
     finally:
         zmq_term()
     bye()
