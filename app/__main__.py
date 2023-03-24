@@ -66,8 +66,9 @@ URL_WORKER_MQTT_PUBLISH = 'inproc://mqtt-publish'
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 60
 ERROR_RETRY_INTERVAL_SECONDS = 5
 IMPLAUSIBLE_CHANGE_PERCENTAGE = 5
-BATTERY_LOW_PCT = 33
-BATTERY_CRITICAL_PCT = 25
+BATTERY_LOW_PCT = 45
+# assuming CFE drop-out at 30%
+BATTERY_CRITICAL_PCT = 40
 # idle small home ~ 300W
 BATTERY_MAJOR_DRAW_W = 500
 
@@ -457,8 +458,17 @@ class MqttSubscriber(AppThread, Closable):
                 if battery_soc_pct < BATTERY_LOW_PCT and grid_voltage < 90 and battery_power_w >= BATTERY_MAJOR_DRAW_W:
                     switch_state = 0
                     switch_stats['battery_ration'] = 1
+                # check 3: determine whether the inverter is no longer pulling from solar or battery (i.e. from grid)
+                inverter_l1_power_w = float(inverter_data['inverter_l1_power_w'])
+                inverter_l2_power_w = float(inverter_data['inverter_l2_power_w'])
+                # can't use min/max because l2 is normally 0
+                inverter_power_w = inverter_l1_power_w + inverter_l2_power_w
+                if inverter_power_w < 0:
+                    switch_state = 0
+                    switch_stats['battery_ration'] = 1
                 # log the supporting data
                 log_msg = (
+                    f'Inverter is delivering {inverter_power_w}w to consumers from backup (solar/battery). '
                     f'Power surplus average is {power_generation_w_avg:.2f}w ({pv1_power_w=:.2f}w, {pv2_power_w=:.2f}w, {battery_power_w=:.2f}w). '
                     f'Battery discharge {battery_power_w}w with remaining charge of {battery_soc_pct}% and supporting grid voltage of {grid_voltage}v. '
                     f'Updating switch banks to [{switch_state}].'
