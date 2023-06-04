@@ -10,11 +10,7 @@
 
 The project interfaces with a [Deye][deye-url] electricity inverter and posts telemetry to both InfluxDB and the chosen MQTT topic. You may find my [companion project][switch-app-url] useful which is designed to react to MQTT messages posted by this project. That project is based on the IoT framework [Mongoose OS][mongoose-os-url]. This application extends my own [boilerplate application][baseapp-url] hosted in [docker hub][baseapp-image-url] and takes its own git submodule dependency on my own [package][pylib-url].
 
-For your convenience, a [sample InfluxDB dashboard][influxdb-dashboard-template] is included to get you started.
-
-![Dashboard Left](/assets/inverter_dashboard_a.png)
-
-![Dashboard Right](/assets/inverter_dashboard_b.png)
+You can find a brief write-up about this project along with a sample InfluxDB dashboard [here](https://tailucas.github.io/update/2023/06/04/inverter-monitoring.html).
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -147,7 +143,6 @@ Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
 [baseapp-image-url]: https://hub.docker.com/repository/docker/tailucas/base-app/general
 [pylib-url]: https://github.com/tailucas/pylib
 [switch-app-url]: https://github.com/tailucas/switch-app
-[influxdb-dashboard-template]: https://github.com/tailucas/inverter-monitor/blob/master/influxdb_dashboard_sample.json
 
 [1p-url]: https://developer.1password.com/docs/connect/
 [1p-shield]: https://img.shields.io/static/v1?style=for-the-badge&message=1Password&color=0094F5&logo=1Password&logoColor=FFFFFF&label=
