@@ -28,6 +28,7 @@ Technologies that help make this package useful:
 [![Python][python-shield]][python-url]
 [![MQTT][mqtt-shield]][mqtt-url]
 [![Sentry][sentry-shield]][sentry-url]
+[![ZeroMQ][zmq-shield]][zmq-url]
 
 Also:
 
@@ -166,3 +167,5 @@ Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
 [python-shield]: https://img.shields.io/static/v1?style=for-the-badge&message=Python&color=3776AB&logo=Python&logoColor=FFFFFF&label=
 [sentry-url]: https://sentry.io/
 [sentry-shield]: https://img.shields.io/static/v1?style=for-the-badge&message=Sentry&color=362D59&logo=Sentry&logoColor=FFFFFF&label=
+[zmq-url]: https://zeromq.org/
+[zmq-shield]: https://img.shields.io/static/v1?style=for-the-badge&message=ZeroMQ&color=DF0000&logo=ZeroMQ&logoColor=FFFFFF&label=
