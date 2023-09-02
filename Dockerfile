@@ -13,6 +13,10 @@ ENV ENCODING=$ENCODING
 RUN sed -i -e "s/# ${LANG} ${ENCODING}/${LANG} ${ENCODING}/" /etc/locale.gen && \
     dpkg-reconfigure --frontend=noninteractive locales && \
     update-locale LANG=${LANG} && locale
+# system setup
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential
 # cron jobs
 RUN rm -f ./config/cron/base_job
 # apply override
