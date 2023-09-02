@@ -198,7 +198,7 @@ class LoggerReader(AppThread):
     # noinspection PyBroadException
     def run(self):
         log.info(f'Using inverter logger {self.logger_sn} at address {self.logger_ip}:{self.logger_port}.')
-        with exception_handler(connect_url=URL_WORKER_APP) as app_socket:
+        with exception_handler(connect_url=URL_WORKER_APP, and_raise=False, shutdown_on_error=True) as app_socket:
             prev_battery_soc = None
             prev_battery_soc_set = time.time()
             while not threads.shutting_down:
@@ -284,7 +284,7 @@ class WeatherReader(AppThread):
     # noinspection PyBroadException
     def run(self):
         log.info(f'Fetching weather data using coordinates [{self.lat},{self.lon}].')
-        with exception_handler(connect_url=URL_WORKER_APP) as app_socket:
+        with exception_handler(connect_url=URL_WORKER_APP, and_raise=False, shutdown_on_error=True) as app_socket:
             while not threads.shutting_down:
                 wd = self.get_weather_data()
                 log.debug(f'Received weather data: {wd}')
@@ -473,6 +473,7 @@ class MqttSubscriber(AppThread, Closable):
                 app_socket.send_pyobj({'switches': switch_stats})
                 # for other interested consumers
                 self._mqtt_client.publish(topic='inverter/state', payload=json.dumps(inverter_data))
+        self.close()
 
 
 class EventProcessor(AppThread, Closable):
@@ -518,6 +519,7 @@ class EventProcessor(AppThread, Closable):
                         log.debug(f'Wrote {len(point_items)} {point_name} points.')
                         if point_name == 'inverter':
                             mqtt_socket.send_pyobj(point_items)
+        self.close()
 
 
 def main():
