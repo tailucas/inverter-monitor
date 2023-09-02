@@ -81,14 +81,10 @@ def twos_complement_hex(hexval):
     return val
 
 
-class LoggerReader(AppThread, Closable):
+class LoggerReader(AppThread):
 
     def __init__(self, field_mappings, logger_sn, logger_ip, logger_port, sample_interval_secs=DEFAULT_SAMPLE_INTERVAL_SECONDS):
         AppThread.__init__(self, name=self.__class__.__name__)
-        Closable.__init__(self)
-
-        self.processor = self.get_socket(zmq.PUSH)
-
         self.field_mappings = field_mappings
         self.logger_sn = logger_sn
         self.logger_ip = logger_ip
@@ -201,9 +197,8 @@ class LoggerReader(AppThread, Closable):
 
     # noinspection PyBroadException
     def run(self):
-        self.processor.connect(URL_WORKER_APP)
         log.info(f'Using inverter logger {self.logger_sn} at address {self.logger_ip}:{self.logger_port}.')
-        with exception_handler(closable=self):
+        with exception_handler(connect_url=URL_WORKER_APP) as app_socket:
             prev_battery_soc = None
             prev_battery_soc_set = time.time()
             while not threads.shutting_down:
@@ -245,7 +240,7 @@ class LoggerReader(AppThread, Closable):
                     threads.interruptable_sleep.wait(ERROR_RETRY_INTERVAL_SECONDS)
                 if logger_data is not None and len(logger_data) > 0:
                     log.debug(f'Sending {len(logger_data)} fields for publication.')
-                    self.processor.send_pyobj({'inverter': logger_data})
+                    app_socket.send_pyobj({'inverter': logger_data})
                 else:
                     log.warning(f'Unable to fetch any valid data after {tries} tries (within {DEFAULT_SAMPLE_INTERVAL_SECONDS}s).')
                 # stop for the remainder of the sampling interval
@@ -260,14 +255,10 @@ class LoggerReader(AppThread, Closable):
                 threads.interruptable_sleep.wait(sample_delay)
 
 
-class WeatherReader(AppThread, Closable):
+class WeatherReader(AppThread):
 
     def __init__(self):
         AppThread.__init__(self, name=self.__class__.__name__)
-        Closable.__init__(self)
-
-        self.processor = self.get_socket(zmq.PUSH)
-
         self.api_key = creds.weather_api_key
         self.lat, self.lon = tuple(app_config.get('weather', 'coord_lat_lon').split(','))
 
@@ -293,8 +284,7 @@ class WeatherReader(AppThread, Closable):
     # noinspection PyBroadException
     def run(self):
         log.info(f'Fetching weather data using coordinates [{self.lat},{self.lon}].')
-        self.processor.connect(URL_WORKER_APP)
-        with exception_handler(closable=self):
+        with exception_handler(connect_url=URL_WORKER_APP) as app_socket:
             while not threads.shutting_down:
                 wd = self.get_weather_data()
                 log.debug(f'Received weather data: {wd}')
@@ -317,7 +307,7 @@ class WeatherReader(AppThread, Closable):
                     country = wd['sys']['country']
                     weather['midday_pct'] = sun_output
                     log.debug(f'{country}: Sending {len(weather)} fields for publication: {weather}')
-                    self.processor.send_pyobj({'weather': weather})
+                    app_socket.send_pyobj({'weather': weather})
                 threads.interruptable_sleep.wait(DEFAULT_SAMPLE_INTERVAL_SECONDS)
 
 
@@ -326,8 +316,6 @@ class MqttSubscriber(AppThread, Closable):
     def __init__(self, mqtt_server_address, mqtt_topic_prefix, mqtt_switch_devices):
         AppThread.__init__(self, name=self.__class__.__name__)
         Closable.__init__(self, connect_url=URL_WORKER_MQTT_PUBLISH)
-
-        self.processor = self.get_socket(zmq.PUSH)
 
         self._mqtt_client = None
         self._mqtt_server_address = mqtt_server_address
@@ -407,14 +395,14 @@ class MqttSubscriber(AppThread, Closable):
 
     # noinspection PyBroadException
     def run(self):
-        self.processor.connect(URL_WORKER_APP)
         log.info(f'Connecting to MQTT server {self._mqtt_server_address}...')
         self._mqtt_client = mqtt.Client()
         self._mqtt_client.on_connect = self.on_connect
         self._mqtt_client.on_disconnect = self.on_disconnect
         self._mqtt_client.on_message = self.on_message
         self._mqtt_client.connect(self._mqtt_server_address)
-        with exception_handler(closable=self, and_raise=False, shutdown_on_error=True):
+        my_socket = self.get_socket()
+        with exception_handler(connect_url=URL_WORKER_APP, and_raise=False, shutdown_on_error=True) as app_socket:
             prev_switch_state = 0
             while not threads.shutting_down:
                 switch_stats = dict()
@@ -424,7 +412,7 @@ class MqttSubscriber(AppThread, Closable):
                 inverter_data = None
                 # check for messages to publish
                 try:
-                    inverter_data = self.socket.recv_pyobj(flags=zmq.NOBLOCK)
+                    inverter_data = my_socket.recv_pyobj(flags=zmq.NOBLOCK)
                 except ZMQError:
                     # ignore, no data
                     continue
@@ -482,7 +470,7 @@ class MqttSubscriber(AppThread, Closable):
                 prev_switch_state = switch_state
                 # post stats
                 switch_stats['switch_state'] = switch_state
-                self.processor.send_pyobj({'switches': switch_stats})
+                app_socket.send_pyobj({'switches': switch_stats})
                 # for other interested consumers
                 self._mqtt_client.publish(topic='inverter/state', payload=json.dumps(inverter_data))
 
@@ -499,8 +487,6 @@ class EventProcessor(AppThread, Closable):
         self.influxdb_rw = None
         self.influxdb_ro = None
 
-        self._mqtt_socket = self.get_socket(zmq.PUSH)
-
     def _influxdb_write(self, point_name, field_name, field_value):
         try:
             self.influxdb_rw.write(
@@ -511,7 +497,6 @@ class EventProcessor(AppThread, Closable):
 
     # noinspection PyBroadException
     def run(self):
-        self._mqtt_socket.connect(URL_WORKER_MQTT_PUBLISH)
         # influx DB
         log.info(f'Connecting to InfluxDB at {creds.influxdb_url} using bucket {self.influxdb_bucket}.')
         self.influxdb = InfluxDBClient(
@@ -520,9 +505,10 @@ class EventProcessor(AppThread, Closable):
             org=creds.influxdb_org)
         self.influxdb_rw = self.influxdb.write_api(write_options=ASYNCHRONOUS)
         self.influxdb_ro = self.influxdb.query_api()
-        with exception_handler(closable=self, and_raise=False, shutdown_on_error=True):
+        my_socket = self.get_socket()
+        with exception_handler(connect_url=URL_WORKER_MQTT_PUBLISH, and_raise=False, shutdown_on_error=True) as mqtt_socket:
             while not threads.shutting_down:
-                event = self.socket.recv_pyobj()
+                event = my_socket.recv_pyobj()
                 log.debug(event)
                 if isinstance(event, dict):
                     for point_name in list(event):
@@ -531,7 +517,7 @@ class EventProcessor(AppThread, Closable):
                             self._influxdb_write(point_name, key, value)
                         log.debug(f'Wrote {len(point_items)} {point_name} points.')
                         if point_name == 'inverter':
-                            self._mqtt_socket.send_pyobj(point_items)
+                            mqtt_socket.send_pyobj(point_items)
 
 
 def main():
