@@ -2,7 +2,10 @@ version: "3.8"
 services:
   app:
     image: "tailucas/inverter-monitor"
-    build: .
+    build:
+      context: .
+      args:
+        FOO: bar
     restart: unless-stopped
     logging:
       driver: syslog

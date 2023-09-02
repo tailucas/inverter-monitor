@@ -1,13 +1,18 @@
-FROM tailucas/base-app:20230217
+FROM tailucas/base-app:20230831
 # for system/site packages
 USER root
-# system setup
-# https://github.com/inter169/systs/blob/master/alpine/crond/README.md
-RUN apk update \
-    && apk upgrade \
-    && apk --no-cache add \
-        gcc \
-        musl-dev
+# generate correct locales
+ARG LANG
+ENV LANG=$LANG
+ARG LANGUAGE
+ENV LANGUAGE=$LANGUAGE
+ARG LC_ALL
+ENV LC_ALL=$LC_ALL
+ARG ENCODING
+ENV ENCODING=$ENCODING
+RUN sed -i -e "s/# ${LANG} ${ENCODING}/${LANG} ${ENCODING}/" /etc/locale.gen && \
+    dpkg-reconfigure --frontend=noninteractive locales && \
+    update-locale LANG=${LANG} && locale
 # cron jobs
 RUN rm -f ./config/cron/base_job
 # apply override

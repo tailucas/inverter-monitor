@@ -40,17 +40,17 @@ class CredsConfig:
 # instantiate class
 builtins.creds_config = CredsConfig()
 
-from pylib import app_config, \
+from tailucas_pylib import app_config, \
     creds, \
     device_name_base, \
     log
 
-from pylib.process import SignalHandler
-from pylib import threads
-from pylib.threads import thread_nanny, bye, die
-from pylib.app import AppThread
-from pylib.zmq import zmq_term, Closable
-from pylib.handler import exception_handler
+from tailucas_pylib.process import SignalHandler
+from tailucas_pylib import threads
+from tailucas_pylib.threads import thread_nanny, bye, die
+from tailucas_pylib.app import AppThread
+from tailucas_pylib.zmq import zmq_term, Closable
+from tailucas_pylib.handler import exception_handler
 
 from requests.adapters import ConnectionError
 from requests.exceptions import RequestException
