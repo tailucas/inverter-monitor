@@ -15,7 +15,7 @@ influxdb-client = "^1.36.0"
 libscrc = "^1.8.1"
 paho-mqtt = "^1.6.1"
 requests = "^2.28.2"
-tailucas-pylib = "^0.0.1"
+tailucas-pylib = "^0.0.2"
 
 
 [build-system]

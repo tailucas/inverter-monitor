@@ -907,13 +907,13 @@ files = [
 
 [[package]]
 name = "tailucas-pylib"
-version = "0.0.1"
+version = "0.0.2"
 description = "Common Python utility modules"
 optional = false
 python-versions = ">=3.10,<4.0"
 files = [
-    {file = "tailucas_pylib-0.0.1-py3-none-any.whl", hash = "sha256:9b723c331df7c7566def0cfa27911fd038dbb610f13f61de3f9b2217ed8380d5"},
-    {file = "tailucas_pylib-0.0.1.tar.gz", hash = "sha256:f301ff7ffbd34f4f6ae03f883000062d871aaa5e72b8d5f8f70c1ff436c738f8"},
+    {file = "tailucas_pylib-0.0.2-py3-none-any.whl", hash = "sha256:fa2a2d9f3050ccda68ce8071209230432c624556eb864ad5bfe6591fd54ccdf2"},
+    {file = "tailucas_pylib-0.0.2.tar.gz", hash = "sha256:db0dcac28ba9090e973432b15edeedd1e037b1f8f07925226d2b949e8853eb08"},
 ]
 
 [package.dependencies]
@@ -974,4 +974,4 @@ test = ["pytest (>=6.0.0)", "setuptools (>=65)"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.10"
-content-hash = "fcaf42bd7e559296496d77418da6cb35158c26099f582bba700bcd6e21b79be6"
+content-hash = "fc04507dae9f2f948c099f81f598db9f09830b336bb50c3b2f03bb2dcdc1da78"
