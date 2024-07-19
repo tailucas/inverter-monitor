@@ -6,3 +6,4 @@ docker-compose.template2
 data/
 venv/
 *.code-workspace
+.env
