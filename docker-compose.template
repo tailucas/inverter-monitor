@@ -3,9 +3,11 @@ services:
     env_file:
       - .env
     image: "${DOCKER_IMAGE}"
+    network_mode: "host"
     restart: unless-stopped
     stop_grace_period: 45s
     build:
+      network: host
       context: .
       args:
         ENCODING: "${ENCODING}"
