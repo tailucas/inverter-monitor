@@ -14,6 +14,8 @@ RUN localedef -i ${LANGUAGE} -c -f ${ENCODING} -A /usr/share/locale/locale.alias
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential
+# cron jobs
+RUN rm -f ./config/cron/base_job
 # apply override
 RUN /opt/app/app_setup.sh
 # override application
