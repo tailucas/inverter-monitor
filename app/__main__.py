@@ -58,10 +58,13 @@ from requests.exceptions import RequestException
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import ASYNCHRONOUS
 
+from prometheus_client import start_http_server, Gauge
+
 
 URL_WORKER_APP = 'inproc://app-worker'
 URL_WORKER_MQTT_PUBLISH = 'inproc://mqtt-publish'
 
+METRIC_PORT = 8000
 
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 60
 ERROR_RETRY_INTERVAL_SECONDS = 5
@@ -507,6 +510,7 @@ class EventProcessor(AppThread, Closable):
         self.influxdb_rw = self.influxdb.write_api(write_options=ASYNCHRONOUS)
         self.influxdb_ro = self.influxdb.query_api()
         my_socket = self.get_socket()
+        gauges = {}
         with exception_handler(connect_url=URL_WORKER_MQTT_PUBLISH, and_raise=False, shutdown_on_error=True) as mqtt_socket:
             while not threads.shutting_down:
                 event = my_socket.recv_pyobj()
@@ -516,6 +520,9 @@ class EventProcessor(AppThread, Closable):
                         point_items = event[point_name]
                         for key, value in point_items.items():
                             self._influxdb_write(point_name, key, value)
+                            if key not in gauges:
+                                gauges[key] = Gauge(key, f'{point_name} {key}')
+                            gauges[key].set(value)
                         log.debug(f'Wrote {len(point_items)} {point_name} points.')
                         if point_name == 'inverter':
                             mqtt_socket.send_pyobj(point_items)
@@ -557,6 +564,8 @@ def main():
     # back to INFO logging
     log.setLevel(logging.INFO)
     try:
+        log.info(f'Starting metric server on port {METRIC_PORT}...')
+        start_http_server(METRIC_PORT)
         log.info(f'Starting {APP_NAME} threads...')
         event_processor.start()
         logger_reader.start()
