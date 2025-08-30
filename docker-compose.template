@@ -23,7 +23,7 @@ services:
     - /tmp
     hostname: ${DEVICE_NAME}
     ports:
-      - "8000:8000"
+      - "10000:8000"
     volumes:
       - ./data:/data
       - /dev/log:/dev/log
