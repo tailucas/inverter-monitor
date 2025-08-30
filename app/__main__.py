@@ -521,7 +521,10 @@ class EventProcessor(AppThread, Closable):
                         for key, value in point_items.items():
                             self._influxdb_write(point_name, key, value)
                             if key not in gauges:
-                                gauges[key] = Gauge(key, f'{point_name} {key}')
+                                gauge_name = key
+                                if not gauge_name.startswith(point_name):
+                                    gauge_name = f'{point_name}_{key}'
+                                gauges[key] = Gauge(gauge_name, f'{point_name} {key}')
                             gauges[key].set(value)
                         log.debug(f'Wrote {len(point_items)} {point_name} points.')
                         if point_name == 'inverter':
