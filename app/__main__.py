@@ -18,6 +18,7 @@ from paho.mqtt.client import MQTT_ERR_NO_CONN
 from collections import deque
 from pathlib import Path
 from simplejson.scanner import JSONDecodeError
+from UnleashClient import UnleashClient
 from zmq.error import ZMQError, ContextTerminated
 
 import os.path
@@ -35,6 +36,9 @@ class CredsConfig:
     influxdb_token: f'opitem:"InfluxDB" opfield:{influx_creds_section}.token' = None  # type: ignore
     influxdb_url: f'opitem:"InfluxDB" opfield:{influx_creds_section}.url' = None  # type: ignore
     weather_api_key: f'opitem:"OpenWeather" opfield:.password' = None  # type: ignore
+    unleash_token: f'opitem:"Unleash" opfield:.password' = None # type: ignore
+    unleash_url: f'opitem:"Unleash" opfield:default.url' = None # type: ignore
+    unleash_app: f'opitem:"Unleash" opfield:default.app_name' = None # type: ignore
 
 
 # instantiate class
@@ -59,6 +63,14 @@ from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import ASYNCHRONOUS
 
 from prometheus_client import start_http_server, Gauge
+
+
+# feature flags configuration
+features = UnleashClient(
+    url=creds.unleash_url,
+    app_name=creds.unleash_app,
+    custom_headers={'Authorization': creds.unleash_token})
+features.initialize_client()
 
 
 URL_WORKER_APP = 'inproc://app-worker'
@@ -492,23 +504,27 @@ class EventProcessor(AppThread, Closable):
         self.influxdb_ro = None
 
     def _influxdb_write(self, point_name, field_name, field_value):
-        try:
-            self.influxdb_rw.write(
-                bucket=self.influxdb_bucket,
-                record=Point(point_name).tag("application", APP_NAME).tag("device", device_name_base).field(field_name, field_value))
-        except Exception:
-            log.warning(f'Unable to post to InfluxDB.', exc_info=True)
+        if features.is_enabled("local-influxdb"):
+            try:
+                self.influxdb_rw.write(
+                    bucket=self.influxdb_bucket,
+                    record=Point(point_name).tag("application", APP_NAME).tag("device", device_name_base).field(field_name, field_value))
+            except Exception:
+                log.warning(f'Unable to post to InfluxDB.', exc_info=True)
+        else:
+            log.debug(f'Not writing {point_name}.{field_name}={field_value} InfluxDB due to feature flag "local-influxdb" being disabled.')
 
     # noinspection PyBroadException
     def run(self):
         # influx DB
         log.info(f'Connecting to InfluxDB at {creds.influxdb_url} using bucket {self.influxdb_bucket}.')
-        self.influxdb = InfluxDBClient(
-            url=creds.influxdb_url,
-            token=creds.influxdb_token,
-            org=creds.influxdb_org)
-        self.influxdb_rw = self.influxdb.write_api(write_options=ASYNCHRONOUS)
-        self.influxdb_ro = self.influxdb.query_api()
+        if features.is_enabled("local-influxdb"):
+            self.influxdb = InfluxDBClient(
+                url=creds.influxdb_url,
+                token=creds.influxdb_token,
+                org=creds.influxdb_org)
+            self.influxdb_rw = self.influxdb.write_api(write_options=ASYNCHRONOUS)
+            self.influxdb_ro = self.influxdb.query_api()
         my_socket = self.get_socket()
         gauges = {}
         with exception_handler(connect_url=URL_WORKER_MQTT_PUBLISH, and_raise=False, shutdown_on_error=True) as mqtt_socket:
