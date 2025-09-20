@@ -9,8 +9,6 @@ vars:
   USER_ID: 999
   GROUP_ID: 999
 
-dotenv: ['.env']
-
 tasks:
   default:
     cmds:
@@ -23,32 +21,27 @@ tasks:
       - sudo chmod 755 ./data/
       - sudo chmod g+rws ./data/
       - sudo rm -f ./data/app-std* ./data/cron-std* ./data/supervisor.sock
-  create-dot-env:
-    desc: Dump container environment to local file.
+  python:
+    desc: Create and initialize Python virtual environment.
     preconditions:
-      - poetry -V
-      - python -V
-      - python3 -V
-      - test -f cred_tool
-      - test -n "$(docker ps | grep op-connect-api)"
+      - uv -V
     cmds:
-      - rm -f .env
-      - echo 'DOCKER_IMAGE="{{.PROJECT_NAME}}"' >> .env
-      - poetry run python ./cred_tool ENV.{{.PROJECT_NAME}} {{.PROJECT_NAME}} build | jq -r '. | to_entries[] | [.key,.value] | @tsv' | tr '\t' '=' | sed 's/=\(.*\)/="\1"/' >> .env
-  docker:
-    deps: [create-dot-env]
-    desc: Generate a usable docker-compose.yml for Docker build.
-    preconditions:
-      - poetry -V
-      - python -V
-      - python3 -V
-      - test -f yaml_interpol
-      - test -f docker-compose.template
-    cmds:
-      - rm -f docker-compose.yml
-      - cp docker-compose.template docker-compose.yml
+      - uv python install
+      - uv sync
     generates:
-      - docker-compose.yml
+      - .venv
+  create-dot-env:
+    deps: [python]
+    desc: Write project .env
+    cmds:
+      - ./dot_env_setup.sh {{.PROJECT_NAME}}
+    preconditions:
+      - uv -V
+      - jq -V
+      - tr --version
+      - sed --version
+    generates:
+      - .env
   push:
     deps: [build]
     desc: Push built image to Docker Hub
@@ -57,16 +50,12 @@ tasks:
     cmds:
       - docker compose push
   build:
-    deps: [docker]
+    deps: [create-dot-env, python]
     desc: Clean up volume directory and build container image.
     preconditions:
-      - docker compose -v
-    env:
-      D_LANG: "{{.LANG}}"
-      D_LANGUAGE: "{{.LANGUAGE}}"
-      D_LC_ALL: "{{.LC_ALL}}"
+      - docker -v
     cmds:
-      - docker compose build --progress plain
+      - docker compose --env-file .env build --progress plain
   run:
     deps: [build, datadir]
     desc: Run docker container
@@ -87,5 +76,3 @@ tasks:
       - test -d ./data/
     cmds:
       - docker compose up -d
-  connect:
-    cmd: ./connect_to_app.sh {{.DOCKER_APP}}

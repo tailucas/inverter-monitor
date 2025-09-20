@@ -1,27 +1,33 @@
-[tool.poetry]
+[project]
 name = "app"
 version = "0.1.0"
-description = ""
-authors = ["Tai Lucas <tglucas@gmail.com>"]
-license = "MIT"
+description = "Inverter Monitor"
 readme = "README.md"
-
-[tool.poetry.scripts]
-app = "app.__main__:main"
-
-[tool.poetry.dependencies]
-python = "^3.11"
-influxdb-client = "^1.36.0"
-libscrc = "^1.8.1"
-paho-mqtt = "^1.6.1"
-requests = "^2.28.2"
-tailucas-pylib = "^0.4.2"
-sentry-sdk = "^2.10.0"
-onepasswordconnectsdk = "^1.5.1"
-prometheus-client = "^0.22.1"
-unleashclient = "^6.3.0"
-
+license-files = ["LICENSE"]
+authors = [
+    { name = "Tai Lucas", email = "tglucas@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "influxdb-client>=1.49.0",
+    "libscrc>=1.8.1",
+    "paho-mqtt>=2.1.0",
+    "prometheus-client>=0.23.1",
+    "requests>=2.32.5",
+    "sentry-sdk>=2.38.0",
+    "tailucas-pylib>=0.5.6",
+]
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["uv_build>=0.8.14,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "app"
+module-root = ""
+
+[project.scripts]
+aws_configure = "tailucas_pylib.tools.aws_configure:main"
+config_interpol = "tailucas_pylib.tools.config_interpol:main"
+cred_tool = "tailucas_pylib.tools.cred_tool:main"
+yaml_interpol = "tailucas_pylib.tools.yaml_interpol:main"

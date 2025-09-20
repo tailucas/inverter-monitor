@@ -3,13 +3,11 @@ FROM tailucas/base-app:latest
 USER root
 # generate correct locales
 ARG LANG
-ENV LANG ${LANG}
 ARG LANGUAGE
-ENV LANGUAGE ${LANGUAGE}
-ARG LC_ALL
-ENV LC_ALL ${LC_ALL}
-ARG ENCODING
-RUN localedef -i ${LANGUAGE} -c -f ${ENCODING} -A /usr/share/locale/locale.alias ${LANG}
+RUN locale-gen ${LANGUAGE} \
+    && locale-gen ${LANG} \
+    && update-locale \
+    && locale -a
 # system setup
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

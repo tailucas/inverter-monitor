@@ -12,48 +12,39 @@ import threading
 import time
 import zmq
 
+import sentry_sdk
+from sentry_sdk import capture_exception
+from sentry_sdk.integrations.asyncio import AsyncioIntegration
+from sentry_sdk.integrations.flask import FlaskIntegration
+from sentry_sdk.integrations.logging import ignore_logger
+from sentry_sdk.integrations.threading import ThreadingIntegration
+from sentry_sdk.integrations.sys_exit import SysExitIntegration
+
+
 import paho.mqtt.client as mqtt
 from paho.mqtt.client import MQTT_ERR_NO_CONN
 
 from collections import deque
 from pathlib import Path
 from simplejson.scanner import JSONDecodeError
-from UnleashClient import UnleashClient
 from zmq.error import ZMQError, ContextTerminated
 
 import os.path
 
-# setup builtins used by pylib init
-from . import APP_NAME
-builtins.SENTRY_EXTRAS = []
-influx_creds_section = 'local'
-
-
-class CredsConfig:
-    sentry_dsn: f'opitem:"Sentry" opfield:{APP_NAME}.dsn' = None  # type: ignore
-    cronitor_token: f'opitem:"cronitor" opfield:.password' = None  # type: ignore
-    influxdb_org: f'opitem:"InfluxDB" opfield:{influx_creds_section}.org' = None  # type: ignore
-    influxdb_token: f'opitem:"InfluxDB" opfield:{influx_creds_section}.token' = None  # type: ignore
-    influxdb_url: f'opitem:"InfluxDB" opfield:{influx_creds_section}.url' = None  # type: ignore
-    weather_api_key: f'opitem:"OpenWeather" opfield:.password' = None  # type: ignore
-    unleash_token: f'opitem:"Unleash" opfield:.password' = None # type: ignore
-    unleash_url: f'opitem:"Unleash" opfield:default.url' = None # type: ignore
-    unleash_app: f'opitem:"Unleash" opfield:default.app_name' = None # type: ignore
-
-
-# instantiate class
-builtins.creds_config = CredsConfig()
-
-from tailucas_pylib import app_config, \
-    creds, \
-    device_name_base, \
-    log
-
+from tailucas_pylib import APP_NAME, app_config, creds, DEVICE_NAME_BASE, log, log_handler
+from tailucas_pylib.flags import is_flag_enabled
+from tailucas_pylib.datetime import (
+    make_timestamp,
+    make_unix_timestamp,
+    make_iso_timestamp,
+)
+from tailucas_pylib.device import Device
 from tailucas_pylib.process import SignalHandler
+from tailucas_pylib.rabbit import ZMQListener
 from tailucas_pylib import threads
-from tailucas_pylib.threads import thread_nanny, bye, die
+from tailucas_pylib.threads import thread_nanny, die, bye
 from tailucas_pylib.app import AppThread
-from tailucas_pylib.zmq import zmq_term, Closable
+from tailucas_pylib.zmq import zmq_term, Closable, zmq_socket, try_close, URL_WORKER_APP
 from tailucas_pylib.handler import exception_handler
 
 from requests.adapters import ConnectionError
@@ -64,16 +55,10 @@ from influxdb_client.client.write_api import ASYNCHRONOUS
 
 from prometheus_client import start_http_server, Gauge
 
+sentry_dsn = creds.get_creds(
+    app_config.get("creds", "sentry_dsn").replace("__APP_NAME__", APP_NAME)
+)
 
-# feature flags configuration
-features = UnleashClient(
-    url=creds.unleash_url,
-    app_name=creds.unleash_app,
-    custom_headers={'Authorization': creds.unleash_token})
-features.initialize_client()
-
-
-URL_WORKER_APP = 'inproc://app-worker'
 URL_WORKER_MQTT_PUBLISH = 'inproc://mqtt-publish'
 
 METRIC_PORT = 8000
@@ -274,7 +259,7 @@ class WeatherReader(AppThread):
 
     def __init__(self):
         AppThread.__init__(self, name=self.__class__.__name__)
-        self.api_key = creds.weather_api_key
+        self.api_key = creds.get_creds('OpenWeather/password')
         self.lat, self.lon = tuple(app_config.get('weather', 'coord_lat_lon').split(','))
 
     def get_weather_data(self):
@@ -504,11 +489,11 @@ class EventProcessor(AppThread, Closable):
         self.influxdb_ro = None
 
     def _influxdb_write(self, point_name, field_name, field_value):
-        if features.is_enabled("local-influxdb"):
+        if is_flag_enabled("local-influxdb"):
             try:
                 self.influxdb_rw.write(
                     bucket=self.influxdb_bucket,
-                    record=Point(point_name).tag("application", APP_NAME).tag("device", device_name_base).field(field_name, field_value))
+                    record=Point(point_name).tag("application", APP_NAME).tag("device", DEVICE_NAME_BASE).field(field_name, field_value))
             except Exception:
                 log.warning(f'Unable to post to InfluxDB.', exc_info=True)
         else:
@@ -517,12 +502,13 @@ class EventProcessor(AppThread, Closable):
     # noinspection PyBroadException
     def run(self):
         # influx DB
-        log.info(f'Connecting to InfluxDB at {creds.influxdb_url} using bucket {self.influxdb_bucket}.')
-        if features.is_enabled("local-influxdb"):
+        influxdb_url = creds.get_creds(f'InfluxDB/local/token')
+        log.info(f'Connecting to InfluxDB at {influxdb_url} using bucket {self.influxdb_bucket}.')
+        if is_flag_enabled("local-influxdb"):
             self.influxdb = InfluxDBClient(
-                url=creds.influxdb_url,
-                token=creds.influxdb_token,
-                org=creds.influxdb_org)
+                url=influxdb_url,
+                token=creds.get_creds('InfluxDB/local/token'),
+                org=creds.get_creds('InfluxDB/local/org'))
             self.influxdb_rw = self.influxdb.write_api(write_options=ASYNCHRONOUS)
             self.influxdb_ro = self.influxdb.query_api()
         my_socket = self.get_socket()
@@ -550,6 +536,17 @@ class EventProcessor(AppThread, Closable):
 
 def main():
     log.setLevel(logging.INFO)
+    # sentry instrumentation
+    log.info("Loading Sentry.io instrumentation...")
+    sentry_sdk.init(
+        dsn=sentry_dsn,
+        integrations=[
+            AsyncioIntegration(),
+            SysExitIntegration(capture_successful_exits=True),
+            ThreadingIntegration(propagate_scope=True),
+        ],
+        send_default_pii=True,
+    )
     # load basic configuration
     mappings = None
     mappings_file = ''.join([os.path.join(APP_PATH, 'config', 'field_mappings.txt')])  # type: ignore

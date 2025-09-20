@@ -7,12 +7,19 @@
             ]
         }
     },
-    "workspaceFolder": "${localWorkspaceFolder}",
-    "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind",
+    "features": {
+        "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
+        "ghcr.io/devcontainers/features/common-utils": {},
+        "ghcr.io/devcontainers/features/python:1": {}
+    },
     "containerEnv": {
+        "OP_SERVICE_ACCOUNT_TOKEN": "${localEnv:OP_SERVICE_ACCOUNT_TOKEN}",
         "OP_CONNECT_HOST": "${localEnv:OP_CONNECT_HOST}",
         "OP_CONNECT_TOKEN": "${localEnv:OP_CONNECT_TOKEN}",
-        "OP_VAULT": "${localEnv:OP_VAULT}"
+        "OP_VAULT": "${localEnv:OP_VAULT}",
+        "UV_LINK_MODE": "copy"
     },
+    "workspaceFolder": "${localWorkspaceFolder}",
+    "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind",
     "runArgs": ["--network=host"]
 }

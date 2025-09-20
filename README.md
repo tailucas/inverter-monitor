@@ -20,7 +20,6 @@ Technologies that help make this package useful:
 
 [![1Password][1p-shield]][1p-url]
 [![InfluxDB][influxdb-shield]][influxdb-url]
-[![Poetry][poetry-shield]][poetry-url]
 [![Python][python-shield]][python-url]
 [![MQTT][mqtt-shield]][mqtt-url]
 [![Sentry][sentry-shield]][sentry-url]
@@ -41,7 +40,7 @@ Here is some detail about the intended use of this package.
 
 ### Prerequisites
 
-Beyond the Python dependencies defined in the [Poetry configuration](pyproject.toml), the project carries hardcoded dependencies on [Sentry][sentry-url] and [1Password][1p-url] in order to function.
+Beyond the Python dependencies defined in the [configuration](pyproject.toml), the project carries hardcoded dependencies on [Sentry][sentry-url] and [1Password][1p-url] in order to function.
 
 ### Installation
 
@@ -158,8 +157,6 @@ Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
 [mqtt-shield]: https://img.shields.io/static/v1?style=for-the-badge&message=MQTT&color=660066&logo=MQTT&logoColor=FFFFFF&label=
 [ow-api-url]: https://openweathermap.org/current
 [ow-url]: https://openweathermap.org/
-[poetry-url]: https://python-poetry.org/
-[poetry-shield]: https://img.shields.io/static/v1?style=for-the-badge&message=Poetry&color=60A5FA&logo=Poetry&logoColor=FFFFFF&label=
 [python-url]: https://www.python.org/
 [python-shield]: https://img.shields.io/static/v1?style=for-the-badge&message=Python&color=3776AB&logo=Python&logoColor=FFFFFF&label=
 [sentry-url]: https://sentry.io/

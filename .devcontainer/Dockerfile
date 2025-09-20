@@ -1,1 +1,1 @@
-FROM ghcr.io/tailucas/base-app:latest
+FROM mcr.microsoft.com/devcontainers/base:ubuntu
