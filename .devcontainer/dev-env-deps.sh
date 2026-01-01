@@ -9,3 +9,6 @@ fi
 if ! uv --version; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
+
+uv python install
+uv sync

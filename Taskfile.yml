@@ -2,9 +2,6 @@
 
 version: '3'
 
-includes:
-  taskfile: ./app.yml
-
 vars:
   USER_ID: 999
   GROUP_ID: 999
@@ -21,6 +18,8 @@ tasks:
       - sudo chmod 755 ./data/
       - sudo chmod g+rws ./data/
       - sudo rm -f ./data/app-std* ./data/cron-std* ./data/supervisor.sock
+    generates:
+      - ./data/
   python:
     desc: Create and initialize Python virtual environment.
     preconditions:
@@ -30,16 +29,18 @@ tasks:
       - uv sync
     generates:
       - .venv
-  create-dot-env:
-    deps: [python]
-    desc: Write project .env
-    cmds:
-      - ./dot_env_setup.sh {{.PROJECT_NAME}}
+  configure:
+    desc: Create runtime configuration.
+    deps: [build]
     preconditions:
-      - uv -V
-      - jq -V
-      - tr --version
-      - sed --version
+      - docker -v
+      - docker compose version
+    cmds:
+      - rm -f .env
+      - cp base.env .env
+      - echo "" >> .env
+      - docker compose run --remove-orphans app /opt/app/dot_env_setup.sh >> .env
+      - test $(wc -l < .env) -ge 2
     generates:
       - .env
   push:
@@ -50,14 +51,13 @@ tasks:
     cmds:
       - docker compose push
   build:
-    deps: [create-dot-env, python]
     desc: Clean up volume directory and build container image.
     preconditions:
       - docker -v
     cmds:
-      - docker compose --env-file .env build --progress plain
+      - docker compose --env-file base.env build --progress plain
   run:
-    deps: [build, datadir]
+    deps: [datadir, build, configure]
     desc: Run docker container
     preconditions:
       - docker -v
@@ -65,9 +65,9 @@ tasks:
       - docker ps | grep 1password
       - test -d ./data/
     cmds:
-      - docker compose up
+      - docker compose up --remove-orphans
   rund:
-    deps: [build, datadir]
+    deps: [datadir, build, configure]
     desc: Run docker container and detach
     preconditions:
       - docker -v
@@ -75,4 +75,4 @@ tasks:
       - docker ps | grep 1password
       - test -d ./data/
     cmds:
-      - docker compose up -d
+      - docker compose up -d --remove-orphans
