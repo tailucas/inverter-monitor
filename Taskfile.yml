@@ -55,7 +55,7 @@ tasks:
     preconditions:
       - docker -v
     cmds:
-      - docker compose --env-file base.env build --progress plain
+      - docker compose --env-file base.env --progress plain build
   run:
     deps: [datadir, build, configure]
     desc: Run docker container

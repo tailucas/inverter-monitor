@@ -3,6 +3,7 @@ import logging.handlers
 
 import binascii
 import libscrc
+import os
 import re
 import requests
 import simplejson as json
@@ -41,7 +42,8 @@ from requests.exceptions import RequestException
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import ASYNCHRONOUS
 
-from prometheus_client import start_http_server, Gauge
+from prometheus_client import start_http_server, Gauge, CollectorRegistry
+from prometheus_client import multiprocess
 
 sentry_dsn = creds.get_creds(
     app_config.get("creds", "sentry_dsn").replace("__APP_NAME__", APP_NAME)
@@ -605,7 +607,7 @@ class EventProcessor(AppThread, Closable):
     # noinspection PyBroadException
     def run(self):
         # influx DB
-        influxdb_url = creds.get_creds("InfluxDB/local/token")
+        influxdb_url = creds.get_creds("InfluxDB/local/url")
         log.info(
             f"Connecting to InfluxDB at {influxdb_url} using bucket {self.influxdb_bucket}."
         )
@@ -634,7 +636,9 @@ class EventProcessor(AppThread, Closable):
                                 gauge_name = key
                                 if not gauge_name.startswith(point_name):
                                     gauge_name = f"{point_name}_{key}"
-                                gauges[key] = Gauge(gauge_name, f"{point_name} {key}")
+                                gauges[key] = Gauge(
+                                    name=gauge_name,
+                                    documentation=f"{point_name} {key}")
                             gauges[key].set(value)
                         log.debug(f"Wrote {len(point_items)} {point_name} points.")
                         if point_name == "inverter":
@@ -692,7 +696,10 @@ def main():
     log.setLevel(logging.INFO)
     try:
         log.info(f"Starting metric server on port {METRIC_PORT}...")
-        start_http_server(METRIC_PORT)
+        registry = CollectorRegistry()
+        if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+            multiprocess.MultiProcessCollector(registry)
+        start_http_server(METRIC_PORT, registry=registry)
         log.info(f"Starting {APP_NAME} threads...")
         event_processor.start()
         logger_reader.start()
