@@ -51,8 +51,6 @@ sentry_dsn = creds.get_creds(
 
 URL_WORKER_MQTT_PUBLISH = "inproc://mqtt-publish"
 
-METRIC_PORT = 8000
-
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 60
 ERROR_RETRY_INTERVAL_SECONDS = 5
 IMPLAUSIBLE_CHANGE_PERCENTAGE = 5
@@ -695,11 +693,16 @@ def main():
     # back to INFO logging
     log.setLevel(logging.INFO)
     try:
-        log.info(f"Starting metric server on port {METRIC_PORT}...")
-        registry = CollectorRegistry()
+        metric_port = app_config.getint("metrics", "network_port")
         if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+            # this will produce multiple instances per process
+            registry = CollectorRegistry()
             multiprocess.MultiProcessCollector(registry)
-        start_http_server(METRIC_PORT, registry=registry)
+            log.info(f"Starting multi-process metric server on port {metric_port}...")
+            start_http_server(metric_port, registry=registry)
+        else:
+            log.info(f"Starting metric server on port {metric_port}...")
+            start_http_server(metric_port)
         log.info(f"Starting {APP_NAME} threads...")
         event_processor.start()
         logger_reader.start()
