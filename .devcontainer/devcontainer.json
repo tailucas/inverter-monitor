@@ -14,7 +14,7 @@
         "ghcr.io/devcontainers/features/common-utils": {},
         "ghcr.io/devcontainers/features/python:1": {}
     },
-    "containerEnv": {
+    "remoteEnv": {
         "OP_CONNECT_HOST": "${localEnv:OP_CONNECT_HOST}",
         "OP_SERVICE_ACCOUNT_TOKEN": "${localEnv:OP_SERVICE_ACCOUNT_TOKEN}",
         "OP_CONNECT_TOKEN": "${localEnv:OP_CONNECT_TOKEN}",
