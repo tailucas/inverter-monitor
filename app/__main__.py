@@ -27,7 +27,8 @@ from zmq.error import ZMQError, ContextTerminated
 
 import os.path
 
-from tailucas_pylib import APP_NAME, app_config, creds, DEVICE_NAME_BASE, log
+from tailucas_pylib import APP_NAME, app_config, DEVICE_NAME_BASE, log
+from tailucas_pylib.creds import Creds
 from tailucas_pylib.flags import is_flag_enabled
 from tailucas_pylib.process import SignalHandler
 from tailucas_pylib import threads
@@ -35,6 +36,11 @@ from tailucas_pylib.threads import thread_nanny, die, bye
 from tailucas_pylib.app import AppThread
 from tailucas_pylib.zmq import zmq_term, Closable, URL_WORKER_APP
 from tailucas_pylib.handler import exception_handler
+
+from app.serial_reader import SerialPortReader
+from app.bms_decoder import parse_response
+
+from pagerduty import EventsApiV2Client
 
 from requests.adapters import ConnectionError
 from requests.exceptions import RequestException
@@ -45,9 +51,9 @@ from influxdb_client.client.write_api import ASYNCHRONOUS
 from prometheus_client import start_http_server, Gauge, CollectorRegistry
 from prometheus_client import multiprocess
 
-sentry_dsn = creds.get_creds(
-    app_config.get("creds", "sentry_dsn").replace("__APP_NAME__", APP_NAME)
-)
+
+creds: Creds = None
+debug_metrics = app_config.get("metrics", "debug_csv").split(",")
 
 URL_WORKER_MQTT_PUBLISH = "inproc://mqtt-publish"
 
@@ -319,6 +325,7 @@ class LoggerReader(AppThread):
 
 class WeatherReader(AppThread):
     def __init__(self):
+        global creds
         AppThread.__init__(self, name=self.__class__.__name__)
         self.api_key = creds.get_creds("OpenWeather/password")
         self.lat, self.lon = tuple(
@@ -385,6 +392,188 @@ class WeatherReader(AppThread):
                 threads.interruptable_sleep.wait(DEFAULT_SAMPLE_INTERVAL_SECONDS)
 
 
+class BmsReader(AppThread):
+    def __init__(self, port="/dev/ttyUSB1", baudrate=9600):
+        AppThread.__init__(self, name=self.__class__.__name__)
+        global creds
+        self.port = port
+        self.baudrate = baudrate
+        self.reader = None
+        self.bms_data = {}
+
+        # PagerDuty alerting state via Events API V2 client
+        self.pd_client:EventsApiV2Client = None
+        if app_config.getboolean("app", "paging_enabled"):
+            self.pd_client = EventsApiV2Client(
+                api_key=creds.get_creds("PagerDuty.inverter-monitor/routing_key")
+            )
+        self.pd_dedup_key = None
+        self.pd_alert_triggered = False
+        self.last_bms_data_time = 0.0
+
+    @staticmethod
+    def _build_bms_dict(data: dict) -> dict:
+        """Build a clean dictionary from parsed BMS response data."""
+        result = {
+            "addr": data.get("addr"),
+            "voltage_v": data.get("voltage_v"),
+            "cell_count": data.get("cell_count", 0),
+            "cells_v": data.get("cells_v", []),
+        }
+        if data.get("min_cell_v") is not None:
+            result["min_cell_v"] = data["min_cell_v"]
+        if data.get("max_cell_v") is not None:
+            result["max_cell_v"] = data["max_cell_v"]
+        if data.get("cell_diff_mv") is not None:
+            result["cell_diff_mv"] = data["cell_diff_mv"]
+        if data.get("min_cell_idx") is not None:
+            result["min_cell_idx"] = data["min_cell_idx"]
+        if data.get("max_cell_idx") is not None:
+            result["max_cell_idx"] = data["max_cell_idx"]
+        if data.get("model"):
+            result["model"] = data["model"]
+        if data.get("serial"):
+            result["serial"] = data["serial"]
+        if data.get("charging") is not None:
+            result["charging"] = data["charging"]
+        if data.get("discharging") is not None:
+            result["discharging"] = data["discharging"]
+        if data.get("capacity_raw_1") is not None:
+            result["capacity_raw_1"] = data["capacity_raw_1"]
+        if data.get("capacity_raw_2") is not None:
+            result["capacity_raw_2"] = data["capacity_raw_2"]
+
+        # Forward extra temperature sensor if present
+        extra_temp = data.get("extra_temp")
+        if extra_temp and extra_temp.get("celsius") is not None:
+            result["extra_temp_c"] = extra_temp["celsius"]
+
+        # Derive current from status flags and raw current
+        current_raw = data.get("current_raw")
+        if current_raw is not None:
+            idle_baseline = 1681
+            result["current_a"] = round((current_raw - idle_baseline) * 0.01, 2)
+            if data.get("discharging"):
+                result["current_a"] = -abs(result["current_a"])
+
+        # Temperature data: extract celsius values
+        temps = data.get("temps", [])
+        if temps:
+            result["temps_c"] = [t.get("celsius") for t in temps if t.get("celsius") is not None]
+
+        return result
+
+    # noinspection PyBroadException
+    def run(self):
+        log.info(f"Starting BMS reader on {self.port} at {self.baudrate} baud...")
+        self.reader = SerialPortReader(port=self.port, baudrate=self.baudrate)
+
+        if not self.reader.connect():
+            log.error(f"Could not connect to BMS serial port {self.port}")
+            return
+
+        log.info(f"Connected to BMS on {self.port}.")
+        # Frames are queued internally; we pull them from the main thread.
+        self.reader.start(on_frame=None)
+
+        with exception_handler(
+            connect_url=URL_WORKER_APP, and_raise=False, shutdown_on_error=True
+        ) as app_socket:
+            seen_addresses = set()
+            while not threads.shutting_down:
+                if not self.reader.is_connected:
+                    log.error("BMS serial connection lost.")
+                    break
+
+                # Block until a valid, decoded frame arrives (or timeout to check shutdown flag)
+                data = self.reader.get_result(timeout=1.0)
+                if data is None:
+                    # Check for data-loss timeout and trigger PagerDuty if needed
+                    if (
+                        self.last_bms_data_time > 0
+                        and time.time() - self.last_bms_data_time > 60
+                        and not self.pd_alert_triggered
+                    ):
+                        if self.pd_client is not None:
+                            try:
+                                resp = self.pd_client.trigger(
+                                    summary=f"BMS serial data loss on {self.port} — no frames received for >60 seconds",
+                                    source=str(DEVICE_NAME_BASE),
+                                    severity="critical",
+                                    component=f"BMS Serial ({self.port})",
+                                )
+                                self.pd_dedup_key = resp["dedup_key"]
+                                self.pd_alert_triggered = True
+                                log.warning("PagerDuty alert triggered for BMS data loss (dedup_key=%s).", self.pd_dedup_key)
+                            except Exception:
+                                log.warning("PagerDuty trigger failed.", exc_info=True)
+                        else:
+                            log.warning("PagerDuty client not configured; cannot trigger alert for BMS data loss.")
+                    continue
+
+                addr = data.get("addr")
+                if addr is None:
+                    continue
+
+                bms_dict = self._build_bms_dict(data)
+
+                # Record successful frame time
+                self.last_bms_data_time = time.time()
+
+                # Resolve any open PagerDuty incident
+                if self.pd_alert_triggered:
+                    if self.pd_client is not None:
+                        try:
+                            self.pd_client.resolve(
+                                dedup_key=self.pd_dedup_key,
+                                summary=f"BMS data restored on {self.port} — BMS #{addr:02X} ({bms_dict.get('cell_count', 0)} cells, {bms_dict.get('voltage_v', 0):.1f}V)",
+                                source=str(DEVICE_NAME_BASE),
+                                severity="critical",
+                                component=f"BMS Serial ({self.port})",
+                            )
+                            self.pd_alert_triggered = False
+                            log.info("PagerDuty incident resolved.")
+                        except Exception:
+                            log.warning("PagerDuty resolve failed.", exc_info=True)
+                    else:
+                        log.warning("PagerDuty client not configured; cannot resolve alert for BMS data restoration.")
+
+                # Log newly detected packs
+                if addr not in seen_addresses:
+                    seen_addresses.add(addr)
+                    model_str = f" ({bms_dict.get('model', '')})" if bms_dict.get("model") else ""
+                    serial_str = f" SN:{bms_dict.get('serial', '')}" if bms_dict.get("serial") else ""
+                    log.info(
+                        "[NEW] BMS #%02X detected: %d cells, %.2fV%s%s",
+                        addr,
+                        bms_dict.get("cell_count", 0),
+                        bms_dict.get("voltage_v", 0),
+                        model_str,
+                        serial_str,
+                    )
+
+                # Log per-frame summary
+                log.info(
+                    "BMS #%02X: %d cells, %.2fV, min=%.3fV max=%.3fV diff=%.1fmV",
+                    addr,
+                    bms_dict.get("cell_count", 0),
+                    bms_dict.get("voltage_v", 0),
+                    bms_dict.get("min_cell_v", 0),
+                    bms_dict.get("max_cell_v", 0),
+                    bms_dict.get("cell_diff_mv", 0),
+                )
+
+                # Cache latest data per address
+                self.bms_data[addr] = bms_dict
+
+                # Send this frame immediately (not batched on a timer)
+                log.debug(f"Sending BMS #%02X frame for publication.", addr)
+                app_socket.send_pyobj({"battery": {addr: bms_dict}})
+
+        self.reader.stop()
+        self.reader.disconnect()
+
+
 class MqttSubscriber(AppThread, Closable):
     def __init__(self, mqtt_server_address, mqtt_topic_prefix, mqtt_switch_devices):
         AppThread.__init__(self, name=self.__class__.__name__)
@@ -408,12 +597,12 @@ class MqttSubscriber(AppThread, Closable):
         except Exception:
             log.warning("Ignoring error closing MQTT socket.", exc_info=True)
 
-    def on_connect(self, client, userdata, flags, rc):
+    def on_connect(self, client, userdata, flags, reason_code, properties):
         subscription_topic = f"{self._mqtt_subscribe_topic_prefix}/state/#"
         log.info(f"Subscribing to topic [{subscription_topic}]...")
         self._mqtt_client.subscribe(subscription_topic)
 
-    def on_disconnect(self, client, userdata, rc):
+    def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
         log.info("MQTT client has disconnected.")
         self._disconnected = True
 
@@ -471,7 +660,7 @@ class MqttSubscriber(AppThread, Closable):
     # noinspection PyBroadException
     def run(self):
         log.info(f"Connecting to MQTT server {self._mqtt_server_address}...")
-        self._mqtt_client = mqtt.Client()
+        self._mqtt_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
         self._mqtt_client.on_connect = self.on_connect
         self._mqtt_client.on_disconnect = self.on_disconnect
         self._mqtt_client.on_message = self.on_message
@@ -604,12 +793,13 @@ class EventProcessor(AppThread, Closable):
 
     # noinspection PyBroadException
     def run(self):
+        global creds
         # influx DB
         influxdb_url = creds.get_creds("InfluxDB/local/url")
-        log.info(
-            f"Connecting to InfluxDB at {influxdb_url} using bucket {self.influxdb_bucket}."
-        )
         if is_flag_enabled("local-influxdb"):
+            log.info(
+               f"Connecting to InfluxDB at {influxdb_url} using bucket {self.influxdb_bucket}."
+            )
             self.influxdb = InfluxDBClient(
                 url=influxdb_url,
                 token=creds.get_creds("InfluxDB/local/token"),
@@ -629,6 +819,9 @@ class EventProcessor(AppThread, Closable):
                     for point_name in list(event):
                         point_items = event[point_name]
                         for key, value in point_items.items():
+                            if point_name in debug_metrics:
+                                log.debug(f"Log-only Metric: {point_name}.{key} = {value}")
+                                continue
                             self._influxdb_write(point_name, key, value)
                             if key not in gauges:
                                 gauge_name = key
@@ -639,17 +832,20 @@ class EventProcessor(AppThread, Closable):
                                     documentation=f"{point_name} {key}")
                             gauges[key].set(value)
                         log.debug(f"Wrote {len(point_items)} {point_name} points.")
-                        if point_name == "inverter":
+                        if point_name == "inverter" and point_name not in debug_metrics:
                             mqtt_socket.send_pyobj(point_items)
         self.close()
 
 
 def main():
+    global creds
     log.setLevel(logging.INFO)
+    creds = Creds()
+    creds.validate_creds()
     # sentry instrumentation
     log.info("Loading Sentry.io instrumentation...")
     sentry_sdk.init(
-        dsn=sentry_dsn,
+        dsn=creds.get_creds(f'Sentry/{APP_NAME}/dsn'),
         integrations=[
             AsyncioIntegration(),
             SysExitIntegration(capture_successful_exits=True),
@@ -671,15 +867,22 @@ def main():
     # ensure proper signal handling; must be main thread
     signal_handler = SignalHandler()
     event_processor = EventProcessor()
-    logger_reader = LoggerReader(
-        field_mappings=mappings,
-        logger_sn=app_config.getint("inverter", "logger_sn"),
-        logger_ip=app_config.get("inverter", "logger_address"),
-        logger_port=app_config.getint("inverter", "logger_port"),
-        sample_interval_secs=app_config.getint(
-            "inverter", "logger_sample_interval_seconds"
-        ),
-    )
+    logger_reader:LoggerReader = None
+    if app_config.getboolean("inverter", "logging_enabled"):
+        logger_reader = LoggerReader(
+            field_mappings=mappings,
+            logger_sn=app_config.getint("inverter", "logger_sn"),
+            logger_ip=app_config.get("inverter", "logger_address"),
+            logger_port=app_config.getint("inverter", "logger_port"),
+            sample_interval_secs=app_config.getint(
+                "inverter", "logger_sample_interval_seconds"
+            ),
+        )
+    bms_reader: BmsReader = None
+    if app_config.getboolean("bms", "logging_enabled"):
+        bms_reader = BmsReader(
+            port=app_config.get("bms", "serial_port", fallback="/dev/ttyUSB1"),
+        )
     weather_reader = WeatherReader()
     mqtt_subscriber = MqttSubscriber(
         mqtt_server_address=app_config.get("mqtt", "server_address"),
@@ -705,7 +908,14 @@ def main():
             start_http_server(metric_port)
         log.info(f"Starting {APP_NAME} threads...")
         event_processor.start()
-        logger_reader.start()
+        if logger_reader is not None:
+            logger_reader.start()
+        else:
+            log.warning("Inverter logger reader is disabled.")
+        if bms_reader is not None:
+            bms_reader.start()
+        else:
+            log.warning("BMS reader is disabled.")
         weather_reader.start()
         mqtt_subscriber.start()
         # start thread nanny

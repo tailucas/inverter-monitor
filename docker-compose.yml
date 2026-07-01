@@ -2,7 +2,7 @@ services:
   app:
     env_file: ".env"
     environment:
-      - OP_CONNECT_HOST=${OP_CONNECT_HOST}
+      - OP_CONNECT_HOST=${OP_CONNECT_HOST:-http://host.docker.internal:8080}
     secrets:
       - op_service_account_token
       - op_connect_token
@@ -17,11 +17,9 @@ services:
         LANG: "${LANG:-en_ZA.UTF-8}"
         LANGUAGE: "${LANGUAGE:-en_ZA}"
     logging:
-      driver: syslog
+      driver: "journald"
       options:
-        syslog-address: "${SYSLOG_ADDRESS:-udp://localhost:514}"
-        syslog-format: "rfc3164"
-        tag: "${DEVICE_NAME:-inverter-monitor}"
+        tag: "{{.Name}}"
     tmpfs:
     - /tmp
     hostname: ${DEVICE_NAME:-inverter-monitor}
@@ -29,7 +27,8 @@ services:
       - "9401:9401"
     volumes:
       - ./data:/data
-      - /dev/log:/dev/log
+    extra_hosts:
+        - "host.docker.internal:host-gateway"
 secrets:
     op_service_account_token:
         environment: OP_SERVICE_ACCOUNT_TOKEN
