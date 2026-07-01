@@ -38,7 +38,6 @@ from tailucas_pylib.zmq import zmq_term, Closable, URL_WORKER_APP
 from tailucas_pylib.handler import exception_handler
 
 from app.serial_reader import SerialPortReader
-from app.bms_decoder import parse_response
 
 from pagerduty import EventsApiV2Client
 
@@ -584,7 +583,7 @@ class BmsReader(AppThread):
                 self.bms_data[addr] = bms_dict
 
                 # Send this frame immediately (not batched on a timer)
-                log.debug(f"Sending BMS #%02X frame for publication.", addr)
+                log.debug("Sending BMS #%02X frame for publication.", addr)
                 app_socket.send_pyobj({"battery": {addr: bms_dict}})
 
         self.reader.stop()
