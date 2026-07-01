@@ -23,7 +23,7 @@ Payload structure (reverse-engineered from bmsdata.bin capture):
     [...]       ASCII strings: "BMS..." model or "10...BS..." serial
 
 BMS #1 (addr 0x01): 1 block of 16 cells + model "BMS0000000000000SZTB"
-BMS #2 (addr 0x02): 1 block of 16 cells + model "BMS0000000000000SZTB"  
+BMS #2 (addr 0x02): 1 block of 16 cells + model "BMS0000000000000SZTB"
 BMS #3 (addr 0x03): 1 block of 16 cells + serial "10101012BS00205"
 
 Reference: https://github.com/drewzadev/ha-hinaess-powergem
@@ -79,7 +79,9 @@ def get_s16_be(data: bytes, offset: int) -> int:
     return val - 65536 if val > 32767 else val
 
 
-def extract_ascii_string(data: bytes, offset: int, max_len: int = 32) -> tuple[str, int]:
+def extract_ascii_string(
+    data: bytes, offset: int, max_len: int = 32
+) -> tuple[str, int]:
     """Extract an ASCII string starting at offset.
 
     Returns (string, next_offset). Stops at non-printable chars or max_len.
@@ -190,7 +192,9 @@ def parse_frame_header(frame: bytes) -> dict:
     checksum_pos = len(frame) - 2
     payload = frame[header_end:checksum_pos]
 
-    is_probe = (len(frame) == MIN_PROBE_LEN and len(payload) == 1 and payload[0] == PROBE_STATUS)
+    is_probe = (
+        len(frame) == MIN_PROBE_LEN and len(payload) == 1 and payload[0] == PROBE_STATUS
+    )
 
     result["valid"] = True
     result["addr"] = addr
@@ -311,11 +315,13 @@ def parse_temperatures(payload: bytes) -> list[dict]:
             deg_f = payload[pos + 1]
             deg_c = round((deg_f - 32) * 5 / 9, 1)
             label = labels[i] if i < len(labels) else f"T{i}"
-            temps.append({
-                "label": label,
-                "fahrenheit": deg_f,
-                "celsius": deg_c,
-            })
+            temps.append(
+                {
+                    "label": label,
+                    "fahrenheit": deg_f,
+                    "celsius": deg_c,
+                }
+            )
     return temps
 
 
@@ -369,7 +375,11 @@ def parse_status_metrics(payload: bytes) -> dict:
         if payload[83] == 0x0B:
             deg_f = payload[84]
             deg_c = round((deg_f - 32) * 5 / 9, 1)
-            info["extra_temp"] = {"label": "Extra", "fahrenheit": deg_f, "celsius": deg_c}
+            info["extra_temp"] = {
+                "label": "Extra",
+                "fahrenheit": deg_f,
+                "celsius": deg_c,
+            }
 
     except (IndexError, struct.error):
         pass

@@ -402,7 +402,7 @@ class BmsReader(AppThread):
         self.bms_data = {}
 
         # PagerDuty alerting state via Events API V2 client
-        self.pd_client:EventsApiV2Client = None
+        self.pd_client: EventsApiV2Client = None
         if app_config.getboolean("app", "paging_enabled"):
             self.pd_client = EventsApiV2Client(
                 api_key=creds.get_creds("PagerDuty.inverter-monitor/routing_key")
@@ -459,7 +459,9 @@ class BmsReader(AppThread):
         # Temperature data: extract celsius values
         temps = data.get("temps", [])
         if temps:
-            result["temps_c"] = [t.get("celsius") for t in temps if t.get("celsius") is not None]
+            result["temps_c"] = [
+                t.get("celsius") for t in temps if t.get("celsius") is not None
+            ]
 
         return result
 
@@ -504,11 +506,16 @@ class BmsReader(AppThread):
                                 )
                                 self.pd_dedup_key = resp["dedup_key"]
                                 self.pd_alert_triggered = True
-                                log.warning("PagerDuty alert triggered for BMS data loss (dedup_key=%s).", self.pd_dedup_key)
+                                log.warning(
+                                    "PagerDuty alert triggered for BMS data loss (dedup_key=%s).",
+                                    self.pd_dedup_key,
+                                )
                             except Exception:
                                 log.warning("PagerDuty trigger failed.", exc_info=True)
                         else:
-                            log.warning("PagerDuty client not configured; cannot trigger alert for BMS data loss.")
+                            log.warning(
+                                "PagerDuty client not configured; cannot trigger alert for BMS data loss."
+                            )
                     continue
 
                 addr = data.get("addr")
@@ -536,13 +543,23 @@ class BmsReader(AppThread):
                         except Exception:
                             log.warning("PagerDuty resolve failed.", exc_info=True)
                     else:
-                        log.warning("PagerDuty client not configured; cannot resolve alert for BMS data restoration.")
+                        log.warning(
+                            "PagerDuty client not configured; cannot resolve alert for BMS data restoration."
+                        )
 
                 # Log newly detected packs
                 if addr not in seen_addresses:
                     seen_addresses.add(addr)
-                    model_str = f" ({bms_dict.get('model', '')})" if bms_dict.get("model") else ""
-                    serial_str = f" SN:{bms_dict.get('serial', '')}" if bms_dict.get("serial") else ""
+                    model_str = (
+                        f" ({bms_dict.get('model', '')})"
+                        if bms_dict.get("model")
+                        else ""
+                    )
+                    serial_str = (
+                        f" SN:{bms_dict.get('serial', '')}"
+                        if bms_dict.get("serial")
+                        else ""
+                    )
                     log.info(
                         "[NEW] BMS #%02X detected: %d cells, %.2fV%s%s",
                         addr,
@@ -602,7 +619,9 @@ class MqttSubscriber(AppThread, Closable):
         log.info(f"Subscribing to topic [{subscription_topic}]...")
         self._mqtt_client.subscribe(subscription_topic)
 
-    def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
+    def on_disconnect(
+        self, client, userdata, disconnect_flags, reason_code, properties
+    ):
         log.info("MQTT client has disconnected.")
         self._disconnected = True
 
@@ -660,7 +679,9 @@ class MqttSubscriber(AppThread, Closable):
     # noinspection PyBroadException
     def run(self):
         log.info(f"Connecting to MQTT server {self._mqtt_server_address}...")
-        self._mqtt_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        self._mqtt_client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2
+        )
         self._mqtt_client.on_connect = self.on_connect
         self._mqtt_client.on_disconnect = self.on_disconnect
         self._mqtt_client.on_message = self.on_message
@@ -798,7 +819,7 @@ class EventProcessor(AppThread, Closable):
         influxdb_url = creds.get_creds("InfluxDB/local/url")
         if is_flag_enabled("local-influxdb"):
             log.info(
-               f"Connecting to InfluxDB at {influxdb_url} using bucket {self.influxdb_bucket}."
+                f"Connecting to InfluxDB at {influxdb_url} using bucket {self.influxdb_bucket}."
             )
             self.influxdb = InfluxDBClient(
                 url=influxdb_url,
@@ -820,7 +841,9 @@ class EventProcessor(AppThread, Closable):
                         point_items = event[point_name]
                         for key, value in point_items.items():
                             if point_name in debug_metrics:
-                                log.debug(f"Log-only Metric: {point_name}.{key} = {value}")
+                                log.debug(
+                                    f"Log-only Metric: {point_name}.{key} = {value}"
+                                )
                                 continue
                             self._influxdb_write(point_name, key, value)
                             if key not in gauges:
@@ -828,8 +851,8 @@ class EventProcessor(AppThread, Closable):
                                 if not gauge_name.startswith(point_name):
                                     gauge_name = f"{point_name}_{key}"
                                 gauges[key] = Gauge(
-                                    name=gauge_name,
-                                    documentation=f"{point_name} {key}")
+                                    name=gauge_name, documentation=f"{point_name} {key}"
+                                )
                             gauges[key].set(value)
                         log.debug(f"Wrote {len(point_items)} {point_name} points.")
                         if point_name == "inverter" and point_name not in debug_metrics:
@@ -845,7 +868,7 @@ def main():
     # sentry instrumentation
     log.info("Loading Sentry.io instrumentation...")
     sentry_sdk.init(
-        dsn=creds.get_creds(f'Sentry/{APP_NAME}/dsn'),
+        dsn=creds.get_creds(f"Sentry/{APP_NAME}/dsn"),
         integrations=[
             AsyncioIntegration(),
             SysExitIntegration(capture_successful_exits=True),
@@ -867,7 +890,7 @@ def main():
     # ensure proper signal handling; must be main thread
     signal_handler = SignalHandler()
     event_processor = EventProcessor()
-    logger_reader:LoggerReader = None
+    logger_reader: LoggerReader = None
     if app_config.getboolean("inverter", "logging_enabled"):
         logger_reader = LoggerReader(
             field_mappings=mappings,

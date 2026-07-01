@@ -18,7 +18,14 @@ from typing import Optional, Callable
 
 import serial
 
-from .bms_decoder import SYNC, TERM, MIN_FRAME_LEN, MIN_PROBE_LEN, find_frames, parse_response
+from .bms_decoder import (
+    SYNC,
+    TERM,
+    MIN_FRAME_LEN,
+    MIN_PROBE_LEN,
+    find_frames,
+    parse_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +77,7 @@ class SerialPortReader:
             )
             self._serial.reset_input_buffer()
             self._serial.reset_output_buffer()
-            logger.info(
-                "Connected to %s at %d baud", self.port, self.baudrate
-            )
+            logger.info("Connected to %s at %d baud", self.port, self.baudrate)
             return True
         except serial.SerialException as e:
             logger.error("Failed to open serial port %s: %s", self.port, e)
