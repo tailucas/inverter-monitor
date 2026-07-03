@@ -812,7 +812,7 @@ class EventProcessor(AppThread, Closable):
 
     # noinspection PyBroadException
     def run(self):
-        log.info(f"Debug metrics are {self.debug_metrics}.")
+        log.debug(f"Debug metrics are {self.debug_metrics}.")
         my_socket = self.get_socket()
         gauges = {}
         with exception_handler(
@@ -917,8 +917,6 @@ def main():
         name="nanny", target=thread_nanny, args=(signal_handler,), daemon=True
     )
     # startup completed
-    # back to INFO logging
-    log.setLevel(logging.INFO)
     try:
         metric_port = app_config.getint("metrics", "network_port")
         if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
