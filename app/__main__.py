@@ -813,8 +813,8 @@ class EventProcessor(AppThread, Closable):
 
     # noinspection PyBroadException
     def run(self):
-        log.debug(f"Debug metrics are {debug_metrics}.")
         global creds
+        log.debug(f"Debug metrics are {debug_metrics}.")
         # influx DB
         influxdb_url = creds.get_creds("InfluxDB/local/url")
         if is_flag_enabled("local-influxdb"):
