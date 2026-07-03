@@ -813,6 +813,7 @@ class EventProcessor(AppThread, Closable):
 
     # noinspection PyBroadException
     def run(self):
+        log.debug(f"Debug metrics are {debug_metrics}.")
         global creds
         # influx DB
         influxdb_url = creds.get_creds("InfluxDB/local/url")
@@ -861,7 +862,6 @@ class EventProcessor(AppThread, Closable):
 
 def main():
     global creds
-    log.setLevel(logging.INFO)
     creds = Creds()
     creds.validate_creds()
     # sentry instrumentation
