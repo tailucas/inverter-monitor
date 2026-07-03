@@ -29,6 +29,8 @@ COPY config/field_mappings.txt ./config/field_mappings.txt
 COPY app ./app
 COPY pyproject.toml uv.lock ./
 RUN chown app:app uv.lock
+# allow user to use dialout
+RUN usermod -aG dialout app
 # switch to run user now because uv does not use the environment to infer
 USER app
 RUN "${APP_DIR}/python_setup.sh"
