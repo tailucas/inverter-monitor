@@ -784,18 +784,21 @@ class MqttSubscriber(AppThread, Closable):
 
 
 class EventProcessor(AppThread, Closable):
-    def __init__(self):
+    def __init__(self, debug_metrics, influx_client=None):
         AppThread.__init__(self, name=self.__class__.__name__)
         Closable.__init__(self, connect_url=URL_WORKER_APP)
 
-        self.influxdb_bucket = app_config.get("influxdb", "bucket")
+        self.debug_metrics = debug_metrics
 
-        self.influxdb = None
         self.influxdb_rw = None
         self.influxdb_ro = None
+        if influx_client is not None:
+            self.influxdb_bucket = app_config.get("influxdb", "bucket")
+            self.influxdb_rw = influx_client.write_api(write_options=ASYNCHRONOUS)
+            self.influxdb_ro = influx_client.query_api()
 
     def _influxdb_write(self, point_name, field_name, field_value):
-        if is_flag_enabled("local-influxdb"):
+        if self.influxdb_rw is not None:
             try:
                 self.influxdb_rw.write(
                     bucket=self.influxdb_bucket,
@@ -806,28 +809,10 @@ class EventProcessor(AppThread, Closable):
                 )
             except Exception:
                 log.warning("Unable to post to InfluxDB.", exc_info=True)
-        else:
-            log.debug(
-                f'Not writing {point_name}.{field_name}={field_value} InfluxDB due to feature flag "local-influxdb" being disabled.'
-            )
 
     # noinspection PyBroadException
     def run(self):
-        global creds
-        log.debug(f"Debug metrics are {debug_metrics}.")
-        # influx DB
-        influxdb_url = creds.get_creds("InfluxDB/local/url")
-        if is_flag_enabled("local-influxdb"):
-            log.info(
-                f"Connecting to InfluxDB at {influxdb_url} using bucket {self.influxdb_bucket}."
-            )
-            self.influxdb = InfluxDBClient(
-                url=influxdb_url,
-                token=creds.get_creds("InfluxDB/local/token"),
-                org=creds.get_creds("InfluxDB/local/org"),
-            )
-            self.influxdb_rw = self.influxdb.write_api(write_options=ASYNCHRONOUS)
-            self.influxdb_ro = self.influxdb.query_api()
+        log.info(f"Debug metrics are {self.debug_metrics}.")
         my_socket = self.get_socket()
         gauges = {}
         with exception_handler(
@@ -840,7 +825,7 @@ class EventProcessor(AppThread, Closable):
                     for point_name in list(event):
                         point_items = event[point_name]
                         for key, value in point_items.items():
-                            if point_name in debug_metrics:
+                            if point_name in self.debug_metrics:
                                 log.debug(
                                     f"Log-only Metric: {point_name}.{key} = {value}"
                                 )
@@ -862,6 +847,7 @@ class EventProcessor(AppThread, Closable):
 
 def main():
     global creds
+    global debug_metrics
     creds = Creds()
     creds.validate_creds()
     # sentry instrumentation
@@ -886,9 +872,25 @@ def main():
         except JSONDecodeError as e:
             log.exception(f"Error loading {mappings_file}.")
             raise e
+    # load time series clients
+    influx_client = None
+    if is_flag_enabled("local-influxdb"):
+        influxdb_url = creds.get_creds("InfluxDB/local/url")
+        log.info(
+            f"Connecting to InfluxDB at {influxdb_url}."
+        )
+        influx_client = InfluxDBClient(
+            url=influxdb_url,
+            token=creds.get_creds("InfluxDB/local/token"),
+            org=creds.get_creds("InfluxDB/local/org"),
+        )
+    else:
+        log.debug(
+            f'Not writing to InfluxDB due to feature flag "local-influxdb" being disabled.'
+        )
     # ensure proper signal handling; must be main thread
     signal_handler = SignalHandler()
-    event_processor = EventProcessor()
+    event_processor = EventProcessor(debug_metrics=debug_metrics, influx_client=influx_client)
     logger_reader: LoggerReader = None
     if app_config.getboolean("inverter", "logging_enabled"):
         logger_reader = LoggerReader(
