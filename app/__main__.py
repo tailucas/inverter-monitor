@@ -399,70 +399,76 @@ class BmsReader(AppThread):
         self.baudrate = baudrate
         self.reader = None
         self.bms_data = {}
+        self._bms_id_counter = 0
+        self._addr_to_name = {}
 
         # PagerDuty alerting state via Events API V2 client
         self.pd_client: EventsApiV2Client = None
         if app_config.getboolean("app", "paging_enabled"):
             self.pd_client = EventsApiV2Client(
-                api_key=creds.get_creds("PagerDuty.inverter-monitor/routing_key")
+                routing_key=creds.get_creds("PagerDuty.inverter-monitor/routing_key")
             )
         self.pd_dedup_key = None
         self.pd_alert_triggered = False
         self.last_bms_data_time = 0.0
 
     @staticmethod
-    def _build_bms_dict(data: dict) -> dict:
-        """Build a clean dictionary from parsed BMS response data."""
-        result = {
-            "addr": data.get("addr"),
-            "voltage_v": data.get("voltage_v"),
-            "cell_count": data.get("cell_count", 0),
-            "cells_v": data.get("cells_v", []),
-        }
-        if data.get("min_cell_v") is not None:
-            result["min_cell_v"] = data["min_cell_v"]
-        if data.get("max_cell_v") is not None:
-            result["max_cell_v"] = data["max_cell_v"]
-        if data.get("cell_diff_mv") is not None:
-            result["cell_diff_mv"] = data["cell_diff_mv"]
-        if data.get("min_cell_idx") is not None:
-            result["min_cell_idx"] = data["min_cell_idx"]
-        if data.get("max_cell_idx") is not None:
-            result["max_cell_idx"] = data["max_cell_idx"]
-        if data.get("model"):
-            result["model"] = data["model"]
-        if data.get("serial"):
-            result["serial"] = data["serial"]
-        if data.get("charging") is not None:
-            result["charging"] = data["charging"]
-        if data.get("discharging") is not None:
-            result["discharging"] = data["discharging"]
-        if data.get("capacity_raw_1") is not None:
-            result["capacity_raw_1"] = data["capacity_raw_1"]
-        if data.get("capacity_raw_2") is not None:
-            result["capacity_raw_2"] = data["capacity_raw_2"]
+    def _extract_scalars(data: dict) -> tuple[dict, list[float]]:
+        """Extract scalar battery metrics and cell voltage array.
 
-        # Forward extra temperature sensor if present
+        Returns (scalars_dict, cells_v_list).
+        Scalar dict contains all single-value metrics suitable for a labeled time series.
+        Array fields (cells_v, all temps) are excluded and returned separately.
+        """
+        scalars: dict = {}
+        cells_v: list[float] = data.get("cells_v", [])
+
+        if data.get("voltage_v") is not None:
+            scalars["voltage_v"] = data["voltage_v"]
+        if data.get("cell_count") is not None:
+            scalars["cell_count"] = data["cell_count"]
+        if data.get("min_cell_v") is not None:
+            scalars["min_cell_v"] = data["min_cell_v"]
+        if data.get("max_cell_v") is not None:
+            scalars["max_cell_v"] = data["max_cell_v"]
+        if data.get("cell_diff_mv") is not None:
+            scalars["cell_diff_mv"] = data["cell_diff_mv"]
+        if data.get("min_cell_idx") is not None:
+            scalars["min_cell_idx"] = data["min_cell_idx"]
+        if data.get("max_cell_idx") is not None:
+            scalars["max_cell_idx"] = data["max_cell_idx"]
+        if data.get("charging") is not None:
+            scalars["charging"] = data["charging"]
+        if data.get("discharging") is not None:
+            scalars["discharging"] = data["discharging"]
+        if data.get("capacity_raw_1") is not None:
+            scalars["capacity_raw_1"] = data["capacity_raw_1"]
+        if data.get("capacity_raw_2") is not None:
+            scalars["capacity_raw_2"] = data["capacity_raw_2"]
+
+        # Extra temperature sensor
         extra_temp = data.get("extra_temp")
         if extra_temp and extra_temp.get("celsius") is not None:
-            result["extra_temp_c"] = extra_temp["celsius"]
+            scalars["extra_temp_c"] = extra_temp["celsius"]
 
         # Derive current from status flags and raw current
         current_raw = data.get("current_raw")
         if current_raw is not None:
             idle_baseline = 1681
-            result["current_a"] = round((current_raw - idle_baseline) * 0.01, 2)
+            current_a = round((current_raw - idle_baseline) * 0.01, 2)
             if data.get("discharging"):
-                result["current_a"] = -abs(result["current_a"])
+                current_a = -abs(current_a)
+            scalars["current_a"] = current_a
 
-        # Temperature data: extract celsius values
+        # Named temperature fields by position
         temps = data.get("temps", [])
-        if temps:
-            result["temps_c"] = [
-                t.get("celsius") for t in temps if t.get("celsius") is not None
-            ]
+        temp_c_values = [t.get("celsius") for t in temps if t.get("celsius") is not None]
+        if len(temp_c_values) > 0:
+            scalars["battery_temp_c"] = temp_c_values[0]
+        if len(temp_c_values) > 1:
+            scalars["mos_temp_c"] = temp_c_values[1]
 
-        return result
+        return scalars, cells_v
 
     # noinspection PyBroadException
     def run(self):
@@ -521,7 +527,26 @@ class BmsReader(AppThread):
                 if addr is None:
                     continue
 
-                bms_dict = self._build_bms_dict(data)
+                # Assign a friendly BMS name on first sight
+                if addr not in self._addr_to_name:
+                    self._bms_id_counter += 1
+                    self._addr_to_name[addr] = f"BMS{self._bms_id_counter:02d}"
+                bms_name = self._addr_to_name[addr]
+
+                # Extract scalars and raw cell voltage list
+                scalars, cells_v = self._extract_scalars(data)
+
+                # Build a compatible dict for logging/PagerDuty/cache
+                bms_info = {
+                    "addr": addr,
+                    "voltage_v": scalars.get("voltage_v", 0),
+                    "cell_count": scalars.get("cell_count", 0),
+                    "min_cell_v": scalars.get("min_cell_v", 0),
+                    "max_cell_v": scalars.get("max_cell_v", 0),
+                    "cell_diff_mv": scalars.get("cell_diff_mv", 0),
+                    "model": data.get("model", ""),
+                    "serial": data.get("serial", ""),
+                }
 
                 # Record successful frame time
                 self.last_bms_data_time = time.time()
@@ -532,7 +557,7 @@ class BmsReader(AppThread):
                         try:
                             self.pd_client.resolve(
                                 dedup_key=self.pd_dedup_key,
-                                summary=f"BMS data restored on {self.port} — BMS #{addr:02X} ({bms_dict.get('cell_count', 0)} cells, {bms_dict.get('voltage_v', 0):.1f}V)",
+                                summary=f"BMS data restored on {self.port} — {bms_name} ({bms_info.get('cell_count', 0)} cells, {bms_info.get('voltage_v', 0):.1f}V)",
                                 source=str(DEVICE_NAME_BASE),
                                 severity="critical",
                                 component=f"BMS Serial ({self.port})",
@@ -550,41 +575,56 @@ class BmsReader(AppThread):
                 if addr not in seen_addresses:
                     seen_addresses.add(addr)
                     model_str = (
-                        f" ({bms_dict.get('model', '')})"
-                        if bms_dict.get("model")
+                        f" ({data.get('model', '')})"
+                        if data.get("model")
                         else ""
                     )
                     serial_str = (
-                        f" SN:{bms_dict.get('serial', '')}"
-                        if bms_dict.get("serial")
+                        f" SN:{data.get('serial', '')}"
+                        if data.get("serial")
                         else ""
                     )
                     log.info(
-                        "[NEW] BMS #%02X detected: %d cells, %.2fV%s%s",
+                        "[NEW] %s (#%02X) detected: %d cells, %.2fV%s%s",
+                        bms_name,
                         addr,
-                        bms_dict.get("cell_count", 0),
-                        bms_dict.get("voltage_v", 0),
+                        bms_info.get("cell_count", 0),
+                        bms_info.get("voltage_v", 0),
                         model_str,
                         serial_str,
                     )
 
                 # Log per-frame summary
                 log.info(
-                    "BMS #%02X: %d cells, %.2fV, min=%.3fV max=%.3fV diff=%.1fmV",
+                    "%s (#%02X): %d cells, %.2fV, min=%.3fV max=%.3fV diff=%.1fmV",
+                    bms_name,
                     addr,
-                    bms_dict.get("cell_count", 0),
-                    bms_dict.get("voltage_v", 0),
-                    bms_dict.get("min_cell_v", 0),
-                    bms_dict.get("max_cell_v", 0),
-                    bms_dict.get("cell_diff_mv", 0),
+                    bms_info.get("cell_count", 0),
+                    bms_info.get("voltage_v", 0),
+                    bms_info.get("min_cell_v", 0),
+                    bms_info.get("max_cell_v", 0),
+                    bms_info.get("cell_diff_mv", 0),
                 )
 
-                # Cache latest data per address
-                self.bms_data[addr] = bms_dict
+                # Cache latest data per address (keep for compatibility)
+                self.bms_data[addr] = scalars
 
-                # Send this frame immediately (not batched on a timer)
-                log.debug("Sending BMS #%02X frame for publication.", addr)
-                app_socket.send_pyobj({"battery": {addr: bms_dict}})
+                # Send labeled battery-level scalars
+                battery_metrics = [
+                    {"labels": {"bms_addr": bms_name}, "metrics": scalars}
+                ]
+                log.debug("Sending %s frame for publication (%d scalars).", bms_name, len(scalars))
+                app_socket.send_pyobj({"battery": battery_metrics})
+
+                # Send per-cell voltage as a separate labeled point
+                if cells_v:
+                    cell_metrics = []
+                    for idx, cell_v in enumerate(cells_v):
+                        cell_metrics.append({
+                            "labels": {"bms_addr": bms_name, "cell": f"{idx + 1:02d}"},
+                            "metrics": {"voltage_v": cell_v},
+                        })
+                    app_socket.send_pyobj({"bms_cell": cell_metrics})
 
         self.reader.stop()
         self.reader.disconnect()
@@ -797,15 +837,16 @@ class EventProcessor(AppThread, Closable):
             self.influxdb_rw = influx_client.write_api(write_options=ASYNCHRONOUS)
             self.influxdb_ro = influx_client.query_api()
 
-    def _influxdb_write(self, point_name, field_name, field_value):
+    def _influxdb_write(self, point_name, field_name, field_value, extra_tags=None):
         if self.influxdb_rw is not None:
             try:
+                point = Point(point_name).tag("application", APP_NAME).tag("device", DEVICE_NAME_BASE)
+                if extra_tags:
+                    for tag_key, tag_value in extra_tags.items():
+                        point = point.tag(tag_key, str(tag_value))
                 self.influxdb_rw.write(
                     bucket=self.influxdb_bucket,
-                    record=Point(point_name)
-                    .tag("application", APP_NAME)
-                    .tag("device", DEVICE_NAME_BASE)
-                    .field(field_name, field_value),
+                    record=point.field(field_name, field_value),
                 )
             except Exception:
                 log.warning("Unable to post to InfluxDB.", exc_info=True)
@@ -824,22 +865,60 @@ class EventProcessor(AppThread, Closable):
                 if isinstance(event, dict):
                     for point_name in list(event):
                         point_items = event[point_name]
-                        for key, value in point_items.items():
-                            if point_name in self.debug_metrics:
-                                log.debug(
-                                    f"Log-only Metric: {point_name}.{key} = {value}"
-                                )
-                                continue
-                            self._influxdb_write(point_name, key, value)
-                            if key not in gauges:
+                        if isinstance(point_items, list):
+                            # Labeled format: list of {"labels": {...}, "metrics": {...}}
+                            for entry in point_items:
+                                labels = entry.get("labels", {})
+                                metrics = entry.get("metrics", {})
+                                if point_name in self.debug_metrics:
+                                    log.debug(f"Log-only Metric: {point_name} labels={labels} metrics={metrics}")
+                                    continue
+                                for metric_key, metric_value in metrics.items():
+                                    if not isinstance(metric_value, (int, float, bool)):
+                                        continue
+                                    self._influxdb_write(point_name, metric_key, metric_value, extra_tags=labels)
+                                    gauge_key = f"{point_name}_{metric_key}"
+                                    if gauge_key not in gauges:
+                                        gauges[gauge_key] = Gauge(
+                                            name=gauge_key,
+                                            documentation=f"{point_name} {metric_key}",
+                                            labelnames=list(labels.keys()),
+                                        )
+                                    label_values = [str(labels[k]) for k in gauges[gauge_key]._labelnames]
+                                    try:
+                                        if len(label_values) > 0:
+                                            log.debug(f"Setting gauge {gauge_key} with labels {label_values} to value {metric_value}.")
+                                            gauges[gauge_key].labels(*label_values).set(metric_value)
+                                        else:
+                                            gauges[gauge_key].set(metric_value)
+                                    except ValueError as e:
+                                        log.warning(
+                                            f"Invalid value for gauge {gauge_key} with label values {label_values}: {metric_value} ({e})"
+                                        )
+                        elif isinstance(point_items, dict):
+                            # Legacy flat format
+                            for key, value in point_items.items():
+                                if point_name in self.debug_metrics:
+                                    log.debug(
+                                        f"Log-only Metric: {point_name}.{key} = {value}"
+                                    )
+                                    continue
+                                self._influxdb_write(point_name, key, value)
                                 gauge_name = key
-                                if not gauge_name.startswith(point_name):
-                                    gauge_name = f"{point_name}_{key}"
-                                gauges[key] = Gauge(
-                                    name=gauge_name, documentation=f"{point_name} {key}"
-                                )
-                            gauges[key].set(value)
-                        log.debug(f"Wrote {len(point_items)} {point_name} points.")
+                                if key not in gauges:
+                                    if not gauge_name.startswith(point_name):
+                                        gauge_name = f"{point_name}_{key}"
+                                    gauges[key] = Gauge(
+                                        name=gauge_name, documentation=f"{point_name} {key}"
+                                    )
+                                try:
+                                    gauges[key].set(value)
+                                except ValueError as e:
+                                    log.warning(
+                                        f"Invalid value for gauge {gauge_name}: {value} ({e})"
+                                    )
+                        else:
+                            log.warning(f"Unexpected point_items type for {point_name}: {type(point_items)}")
                         if point_name == "inverter" and point_name not in debug_metrics:
                             mqtt_socket.send_pyobj(point_items)
         self.close()
