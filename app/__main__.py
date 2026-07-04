@@ -1,57 +1,44 @@
 #!/usr/bin/env python
-import logging.handlers
-
 import binascii
-import libscrc
+import logging.handlers
 import os
 import re
-import requests
-import simplejson as json
 import socket
 import threading
 import time
-import zmq
-
-import sentry_sdk
-from sentry_sdk.integrations.asyncio import AsyncioIntegration
-from sentry_sdk.integrations.threading import ThreadingIntegration
-from sentry_sdk.integrations.sys_exit import SysExitIntegration
-
-import paho.mqtt.client as mqtt
-from paho.mqtt.client import MQTT_ERR_NO_CONN
-
 from collections import deque
 from pathlib import Path
+
+import libscrc
+import paho.mqtt.client as mqtt
+import requests
+import sentry_sdk
+import simplejson as json
+import zmq
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import ASYNCHRONOUS
+from pagerduty import EventsApiV2Client
+from paho.mqtt.client import MQTT_ERR_NO_CONN
+from prometheus_client import CollectorRegistry, Gauge, multiprocess, start_http_server
+from requests.adapters import ConnectionError
+from requests.exceptions import RequestException
+from sentry_sdk.integrations.asyncio import AsyncioIntegration
+from sentry_sdk.integrations.sys_exit import SysExitIntegration
+from sentry_sdk.integrations.threading import ThreadingIntegration
 from simplejson.scanner import JSONDecodeError
-from zmq.error import ZMQError, ContextTerminated
-
-import os.path
-
-from tailucas_pylib import APP_NAME, app_config, DEVICE_NAME_BASE, log
+from tailucas_pylib import APP_NAME, DEVICE_NAME_BASE, app_config, log, threads
+from tailucas_pylib.app import AppThread
 from tailucas_pylib.creds import Creds
 from tailucas_pylib.flags import is_flag_enabled
-from tailucas_pylib.process import SignalHandler
-from tailucas_pylib import threads
-from tailucas_pylib.threads import thread_nanny, die, bye
-from tailucas_pylib.app import AppThread
-from tailucas_pylib.zmq import zmq_term, Closable, URL_WORKER_APP
 from tailucas_pylib.handler import exception_handler
+from tailucas_pylib.process import SignalHandler
+from tailucas_pylib.threads import bye, die, thread_nanny
+from tailucas_pylib.zmq import URL_WORKER_APP, Closable, zmq_term
+from zmq.error import ContextTerminated, ZMQError
 
 from app.serial_reader import SerialPortReader
 
-from pagerduty import EventsApiV2Client
-
-from requests.adapters import ConnectionError
-from requests.exceptions import RequestException
-
-from influxdb_client import InfluxDBClient, Point
-from influxdb_client.client.write_api import ASYNCHRONOUS
-
-from prometheus_client import start_http_server, Gauge, CollectorRegistry
-from prometheus_client import multiprocess
-
-
-creds: Creds = None
+creds: Creds | None = None
 debug_metrics = app_config.get("metrics", "debug_csv").split(",")
 
 URL_WORKER_MQTT_PUBLISH = "inproc://mqtt-publish"
@@ -93,7 +80,7 @@ class LoggerReader(AppThread):
     def get_logger_data(self):
         output = {}
 
-        client_socket = None
+        client_socket: socket.socket | None = None
         pini = 59
         pfin = 112
         chunks = 0
@@ -114,7 +101,7 @@ class LoggerReader(AppThread):
                 str(hex(libscrc.modbus(businessfield))[4:6])
                 + str(hex(libscrc.modbus(businessfield))[2:4])
             )  # CRC16modbus
-            checksum = binascii.unhexlify("00")  # checksum F2
+            checksum_placeholder = binascii.unhexlify("00")  # checksum F2
             endCode = binascii.unhexlify("15")
 
             inverter_sn2 = bytearray.fromhex(
@@ -132,15 +119,15 @@ class LoggerReader(AppThread):
                 + datafield
                 + businessfield
                 + crc
-                + checksum
+                + checksum_placeholder
                 + endCode
             )
 
-            checksum = 0
+            checksum: int = 0
             frame_bytes = bytearray(frame)
-            for i in range(1, len(frame_bytes) - 2, 1):
+            for i in range(1, len(frame_bytes) - 2):
                 checksum += frame_bytes[i] & 255
-            frame_bytes[len(frame_bytes) - 2] = int((checksum & 255))
+            frame_bytes[len(frame_bytes) - 2] = checksum & 255
 
             # OPEN SOCKET
             log.debug(
@@ -154,9 +141,12 @@ class LoggerReader(AppThread):
                     client_socket = socket.socket(family, socktype, proto)
                     client_socket.settimeout(10)
                     client_socket.connect(sockadress)
-                except socket.error as msg:
+                except OSError as msg:
                     log.warning(f"{msg}")
                     return None
+
+            if client_socket is None:
+                return None
 
             # SEND DATA
             log.debug(
@@ -171,13 +161,13 @@ class LoggerReader(AppThread):
                 if data is None:
                     log.warning("No response data.")
                     return None
-            except socket.timeout as msg:
+            except TimeoutError as msg:
                 log.warning(f"{msg}")
                 return None
             finally:
                 try:
                     client_socket.close()
-                except socket.error as msg:
+                except OSError as msg:
                     log.warning(f"{msg}")
 
             log.debug(f"Received {len(data)} bytes for chunk {chunks}.")
@@ -201,7 +191,7 @@ class LoggerReader(AppThread):
                 except ValueError:
                     log.warning(f"Discarding {len(data)} byte response.", exc_info=True)
                     return None
-                hexpos = str("0x") + str(hex(a + pini)[2:].zfill(4)).upper()
+                hexpos = "0x" + str(hex(a + pini)[2:].zfill(4)).upper()
                 for parameter in self.field_mappings:
                     for item in parameter["items"]:
                         title = item["titleEN"]
@@ -221,7 +211,7 @@ class LoggerReader(AppThread):
                                 key = (
                                     key.replace(" ", "_")
                                     .replace("-", "_")
-                                    .replace("º", "c")
+                                    .replace("\u00ba", "c")
                                     .replace("%", "pct")
                                     .lower()
                                 )
@@ -326,6 +316,8 @@ class WeatherReader(AppThread):
     def __init__(self):
         global creds
         AppThread.__init__(self, name=self.__class__.__name__)
+        if creds is None:
+            raise RuntimeError("Credentials not initialized")
         self.api_key = creds.get_creds("OpenWeather/password")
         self.lat, self.lon = tuple(
             app_config.get("weather", "coord_lat_lon").split(",")
@@ -346,7 +338,7 @@ class WeatherReader(AppThread):
                 output = json.loads(r.content)
                 log.debug(f"Loaded {len(output)} weather fields.")
             except JSONDecodeError:
-                log.warning(f"JSON parse error of {r.content}", exc_info=True)
+                log.warning(f"JSON parse error of {r.content!r}", exc_info=True)
                 return None
         except (OSError, ConnectionError, RequestException):
             log.warning("Problem getting weather data.", exc_info=True)
@@ -403,12 +395,14 @@ class BmsReader(AppThread):
         self._addr_to_name = {}
 
         # PagerDuty alerting state via Events API V2 client
-        self.pd_client: EventsApiV2Client = None
+        self.pd_client: EventsApiV2Client | None = None
         if app_config.getboolean("app", "paging_enabled"):
+            if creds is None:
+                raise RuntimeError("Credentials not initialized")
             self.pd_client = EventsApiV2Client(
                 routing_key=creds.get_creds("PagerDuty.inverter-monitor/routing_key")
             )
-        self.pd_dedup_key = None
+        self.pd_dedup_key: str | None = None
         self.pd_alert_triggered = False
         self.last_bms_data_time = 0.0
         self._startup_time = 0.0
@@ -416,7 +410,7 @@ class BmsReader(AppThread):
         # Per-address last-seen timestamps for minimum count check
         self._bms_last_seen: dict[int, float] = {}
         self._minimum_bms_count = app_config.getint("alert_thresholds", "minimum_bms_count")
-        self.pd_count_dedup_key = None
+        self.pd_count_dedup_key: str | None = None
         self.pd_count_alert_triggered = False
 
     @staticmethod
@@ -523,7 +517,7 @@ class BmsReader(AppThread):
                             try:
                                 self.pd_dedup_key = self.pd_client.trigger(
                                     dedup_key="bms_heartbeat",
-                                    summary=f"BMS serial data loss on {self.port} — no frames received for >60 seconds",
+                                    summary=f"BMS serial data loss on {self.port} \u2014 no frames received for >60 seconds",
                                     source=str(DEVICE_NAME_BASE),
                                     severity="critical",
                                 )
@@ -573,9 +567,10 @@ class BmsReader(AppThread):
                 if self.pd_alert_triggered:
                     if self.pd_client is not None:
                         try:
-                            self.pd_client.resolve(
-                                dedup_key=self.pd_dedup_key,
-                            )
+                            if self.pd_dedup_key is not None:
+                                self.pd_client.resolve(
+                                    dedup_key=self.pd_dedup_key,
+                                )
                             self.pd_alert_triggered = False
                             log.info("PagerDuty heartbeat incident resolved.")
                         except Exception:
@@ -587,9 +582,10 @@ class BmsReader(AppThread):
                     # Also resolve count alert when data flow resumes
                     if self.pd_count_alert_triggered and self.pd_client is not None:
                         try:
-                            self.pd_client.resolve(
-                                dedup_key=self.pd_count_dedup_key,
-                            )
+                            if self.pd_count_dedup_key is not None:
+                                self.pd_client.resolve(
+                                    dedup_key=self.pd_count_dedup_key,
+                                )
                             self.pd_count_alert_triggered = False
                             log.info("PagerDuty count incident resolved (data flow restored).")
                         except Exception:
@@ -681,9 +677,10 @@ class BmsReader(AppThread):
                 elif active_addrs >= self._minimum_bms_count and self.pd_count_alert_triggered:
                     if self.pd_client is not None:
                         try:
-                            self.pd_client.resolve(
-                                dedup_key=self.pd_count_dedup_key,
-                            )
+                            if self.pd_count_dedup_key is not None:
+                                self.pd_client.resolve(
+                                    dedup_key=self.pd_count_dedup_key,
+                                )
                             self.pd_count_alert_triggered = False
                             log.info("PagerDuty count incident resolved.")
                         except Exception:
@@ -702,7 +699,7 @@ class MqttSubscriber(AppThread, Closable):
         AppThread.__init__(self, name=self.__class__.__name__)
         Closable.__init__(self, connect_url=URL_WORKER_MQTT_PUBLISH)
 
-        self._mqtt_client = None
+        self._mqtt_client: mqtt.Client | None = None
         self._mqtt_server_address = mqtt_server_address
         self._mqtt_subscribe_topic_prefix = mqtt_topic_prefix
         self._mqtt_switch_devices = mqtt_switch_devices
@@ -711,19 +708,21 @@ class MqttSubscriber(AppThread, Closable):
 
         self._switch_state = dict()
 
-        self._power_generation_history = deque(maxlen=5)
+        self._power_generation_history: deque[float] = deque(maxlen=5)
 
     def close(self):
         Closable.close(self)
         try:
-            self._mqtt_client.disconnect()
+            if self._mqtt_client is not None:
+                self._mqtt_client.disconnect()
         except Exception:
             log.warning("Ignoring error closing MQTT socket.", exc_info=True)
 
     def on_connect(self, client, userdata, flags, reason_code, properties):
         subscription_topic = f"{self._mqtt_subscribe_topic_prefix}/state/#"
         log.info(f"Subscribing to topic [{subscription_topic}]...")
-        self._mqtt_client.subscribe(subscription_topic)
+        if self._mqtt_client is not None:
+            self._mqtt_client.subscribe(subscription_topic)
 
     def on_disconnect(
         self, client, userdata, disconnect_flags, reason_code, properties
@@ -744,7 +743,7 @@ class MqttSubscriber(AppThread, Closable):
             return
         except ContextTerminated:
             self.close()
-        if "switches" in msg_data.keys():
+        if msg_data is not None and "switches" in msg_data.keys():
             switch_bank = topic.split("/")[2]
             new_state = msg_data["switches"]
             old_state = list()
@@ -767,17 +766,18 @@ class MqttSubscriber(AppThread, Closable):
                 [f"{self._mqtt_subscribe_topic_prefix}", "control", switch_bank]
             )
             mqtt_update = list()
-            for ids, _ in enumerate(self._switch_state[switch_bank]):
+            for _ids, _ in enumerate(self._switch_state[switch_bank]):
                 mqtt_update.append(switch_state)
             message_data = json.dumps({"state": mqtt_update})
             log.debug(
                 f"[{mqtt_pub_topic}] Publishing {len(message_data)} bytes: [{message_data}]"
             )
-            self._mqtt_client.publish(topic=mqtt_pub_topic, payload=message_data)
+            if self._mqtt_client is not None:
+                self._mqtt_client.publish(topic=mqtt_pub_topic, payload=message_data)
 
     def get_power_generation_avg(self, value):
         self._power_generation_history.append(value)
-        total = 0
+        total: float = 0.0
         for sample in self._power_generation_history:
             total += sample
         return total / len(self._power_generation_history)
@@ -884,9 +884,10 @@ class MqttSubscriber(AppThread, Closable):
                 switch_stats["switch_state"] = switch_state
                 app_socket.send_pyobj({"switches": switch_stats})
                 # for other interested consumers
-                self._mqtt_client.publish(
-                    topic="inverter/state", payload=json.dumps(inverter_data)
-                )
+                if self._mqtt_client is not None:
+                    self._mqtt_client.publish(
+                        topic="inverter/state", payload=json.dumps(inverter_data)
+                    )
         self.close()
 
 
@@ -1010,7 +1011,7 @@ def main():
     # load basic configuration
     app_path = Path(os.path.abspath(os.path.dirname(__file__))).parent
     mappings = None
-    mappings_file = "".join([os.path.join(app_path, "config", "field_mappings.txt")])  # type: ignore
+    mappings_file = os.path.join(app_path, "config", "field_mappings.txt")
     with open(mappings_file) as mapping_file:
         try:
             mappings = json.loads(mapping_file.read())
@@ -1032,12 +1033,12 @@ def main():
         )
     else:
         log.debug(
-            f'Not writing to InfluxDB due to feature flag "local-influxdb" being disabled.'
+            'Not writing to InfluxDB due to feature flag "local-influxdb" being disabled.'
         )
     # ensure proper signal handling; must be main thread
     signal_handler = SignalHandler()
     event_processor = EventProcessor(debug_metrics=debug_metrics, influx_client=influx_client)
-    logger_reader: LoggerReader = None
+    logger_reader: LoggerReader | None = None
     if app_config.getboolean("inverter", "logging_enabled"):
         logger_reader = LoggerReader(
             field_mappings=mappings,
@@ -1048,7 +1049,7 @@ def main():
                 "inverter", "logger_sample_interval_seconds"
             ),
         )
-    bms_reader: BmsReader = None
+    bms_reader: BmsReader | None = None
     if app_config.getboolean("bms", "logging_enabled"):
         bms_reader = BmsReader(
             port=app_config.get("bms", "serial_port", fallback="/dev/ttyUSB1"),

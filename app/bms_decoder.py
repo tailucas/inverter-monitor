@@ -29,9 +29,8 @@ BMS #3 (addr 0x03): 1 block of 16 cells + serial "10101012BS00205"
 Reference: https://github.com/drewzadev/ha-hinaess-powergem
 """
 
-import struct
 import logging
-from typing import Optional
+import struct
 
 logger = logging.getLogger(__name__)
 
@@ -349,14 +348,12 @@ def parse_status_metrics(payload: bytes) -> dict:
         info["status_flags"] = status
         # Decode known bit patterns
         status_byte0 = (status >> 8) & 0xFF
-        status_byte1 = status & 0xFF
         info["charging"] = bool(status_byte0 & 0x01)
         info["discharging"] = bool(status_byte0 & 0x02)
 
         # Current reading at offset 62-64
         # Offset 62-63 is a count/sequence-like value (6 in captures)
         # Offset 63-64 seems to be a current/temperature related field
-        current_seq = get_u16_be(payload, 62)
         current_raw = get_u16_be(payload, 63)
         if current_raw > 0:
             # Current: 0x0691 = 1681 observed at idle

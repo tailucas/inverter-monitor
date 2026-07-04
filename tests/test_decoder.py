@@ -7,7 +7,7 @@ regardless of the starting position in the serial data stream.
 """
 
 import os
-import struct
+
 import pytest
 
 # Project root for finding test data
@@ -332,7 +332,7 @@ class TestReplayReader:
                 break
         else:
             frame = reader.simulate_frame_injection(0)
-        
+
         assert len(frame) >= decoder.MIN_FRAME_LEN
         assert frame[:2] == decoder.SYNC
 

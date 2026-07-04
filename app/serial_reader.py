@@ -10,19 +10,16 @@ and silently ignores probe frames and unparseable data. Only valid
 battery data frames are passed through for processing.
 """
 
-import time
 import logging
 import threading
+import time
+from collections.abc import Callable
 from queue import Queue
-from typing import Optional, Callable
 
 import serial
 
 from .bms_decoder import (
     SYNC,
-    TERM,
-    MIN_FRAME_LEN,
-    MIN_PROBE_LEN,
     find_frames,
     parse_response,
 )
@@ -52,11 +49,11 @@ class SerialPortReader:
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
-        self._serial: Optional[serial.Serial] = None
+        self._serial: serial.Serial | None = None
         self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._frame_queue: Queue = Queue()
-        self._on_frame: Optional[Callable] = None
+        self._on_frame: Callable | None = None
 
         # Buffer for partial data between reads
         self._buffer = b""
@@ -98,7 +95,7 @@ class SerialPortReader:
         """Check if the serial port is open."""
         return self._serial is not None and self._serial.is_open
 
-    def start(self, on_frame: Optional[Callable] = None):
+    def start(self, on_frame: Callable | None = None) -> None:
         """Start continuous background reading from the serial port.
 
         Data is constantly consumed from the serial port. Frames are
@@ -182,7 +179,7 @@ class SerialPortReader:
                 logger.exception("Error in reader loop")
             time.sleep(0.01)
 
-    def get_result(self, timeout: float = 1.0) -> Optional[dict]:
+    def get_result(self, timeout: float = 1.0) -> dict | None:
         """Get a parsed battery data result from the queue.
 
         Args:
@@ -252,7 +249,7 @@ class ReplayReader:
         self._in_waiting = len(self._buffer)
         return chunk
 
-    def write(self, data: bytes):
+    def write(self, data: bytes) -> None:
         """Simulate serial write (no-op, but logs)."""
         logger.debug("TX > %s", data.hex())
 
