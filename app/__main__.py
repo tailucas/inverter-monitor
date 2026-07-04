@@ -615,7 +615,7 @@ class BmsReader(AppThread):
                     )
 
                 # Log per-frame summary
-                log.info(
+                log.debug(
                     "%s (#%02X): %d cells, %.2fV, min=%.3fV max=%.3fV diff=%.1fmV",
                     bms_name,
                     addr,
