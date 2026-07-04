@@ -654,11 +654,11 @@ class BmsReader(AppThread):
                 now = time.time()
                 active_addrs = sum(
                     1 for ts in self._bms_last_seen.values()
-                    if now - ts < 60
+                    if now - ts < 600
                 )
                 if (active_addrs < self._minimum_bms_count
                         and not self.pd_count_alert_triggered
-                        and time.time() - self._startup_time >= 60):
+                        and time.time() - self._startup_time >= 300):
                     if self.pd_client is not None:
                         try:
                             self.pd_count_dedup_key = self.pd_client.trigger(
