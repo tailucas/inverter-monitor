@@ -519,7 +519,7 @@ class BmsReader(AppThread):
                                     dedup_key="bms_heartbeat",
                                     summary=f"BMS serial data loss on {self.port} \u2014 no frames received for >60 seconds",
                                     source=str(DEVICE_NAME_BASE),
-                                    severity="critical",
+                                    severity="warning",
                                 )
                                 self.pd_alert_triggered = True
                                 log.warning(
@@ -661,7 +661,7 @@ class BmsReader(AppThread):
                                 dedup_key="bms_count",
                                 summary=f"Only {active_addrs}/{self._minimum_bms_count} BMS units reporting on {self.port}",
                                 source=str(DEVICE_NAME_BASE),
-                                severity="critical",
+                                severity="warning",
                             )
                             self.pd_count_alert_triggered = True
                             log.warning(
