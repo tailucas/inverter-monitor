@@ -411,6 +411,13 @@ class BmsReader(AppThread):
         self.pd_dedup_key = None
         self.pd_alert_triggered = False
         self.last_bms_data_time = 0.0
+        self._startup_time = 0.0
+
+        # Per-address last-seen timestamps for minimum count check
+        self._bms_last_seen: dict[int, float] = {}
+        self._minimum_bms_count = app_config.getint("alert_thresholds", "minimum_bms_count")
+        self.pd_count_dedup_key = None
+        self.pd_count_alert_triggered = False
 
     @staticmethod
     def _extract_scalars(data: dict) -> tuple[dict, list[float]]:
@@ -483,6 +490,17 @@ class BmsReader(AppThread):
         # Frames are queued internally; we pull them from the main thread.
         self.reader.start(on_frame=None)
 
+        # Initialize heartbeat timer so alert fires if no data arrives within 60s
+        self.last_bms_data_time = time.time()
+        self._startup_time = self.last_bms_data_time
+
+        # Seed PagerDuty state so any previously-open incidents auto-resolve on first data
+        if self.pd_client is not None:
+            self.pd_alert_triggered = True
+            self.pd_dedup_key = "bms_heartbeat"
+            self.pd_count_alert_triggered = True
+            self.pd_count_dedup_key = "bms_count"
+
         with exception_handler(
             connect_url=URL_WORKER_APP, and_raise=False, shutdown_on_error=True
         ) as app_socket:
@@ -503,13 +521,12 @@ class BmsReader(AppThread):
                     ):
                         if self.pd_client is not None:
                             try:
-                                resp = self.pd_client.trigger(
+                                self.pd_dedup_key = self.pd_client.trigger(
+                                    dedup_key="bms_heartbeat",
                                     summary=f"BMS serial data loss on {self.port} — no frames received for >60 seconds",
                                     source=str(DEVICE_NAME_BASE),
                                     severity="critical",
-                                    component=f"BMS Serial ({self.port})",
                                 )
-                                self.pd_dedup_key = resp["dedup_key"]
                                 self.pd_alert_triggered = True
                                 log.warning(
                                     "PagerDuty alert triggered for BMS data loss (dedup_key=%s).",
@@ -548,28 +565,35 @@ class BmsReader(AppThread):
                     "serial": data.get("serial", ""),
                 }
 
-                # Record successful frame time
+                # Record successful frame time and per-address last-seen
                 self.last_bms_data_time = time.time()
+                self._bms_last_seen[addr] = self.last_bms_data_time
 
-                # Resolve any open PagerDuty incident
+                # Resolve any open PagerDuty incidents
                 if self.pd_alert_triggered:
                     if self.pd_client is not None:
                         try:
                             self.pd_client.resolve(
                                 dedup_key=self.pd_dedup_key,
-                                summary=f"BMS data restored on {self.port} — {bms_name} ({bms_info.get('cell_count', 0)} cells, {bms_info.get('voltage_v', 0):.1f}V)",
-                                source=str(DEVICE_NAME_BASE),
-                                severity="critical",
-                                component=f"BMS Serial ({self.port})",
                             )
                             self.pd_alert_triggered = False
-                            log.info("PagerDuty incident resolved.")
+                            log.info("PagerDuty heartbeat incident resolved.")
                         except Exception:
-                            log.warning("PagerDuty resolve failed.", exc_info=True)
+                            log.warning("PagerDuty heartbeat resolve failed.", exc_info=True)
                     else:
                         log.warning(
                             "PagerDuty client not configured; cannot resolve alert for BMS data restoration."
                         )
+                    # Also resolve count alert when data flow resumes
+                    if self.pd_count_alert_triggered and self.pd_client is not None:
+                        try:
+                            self.pd_client.resolve(
+                                dedup_key=self.pd_count_dedup_key,
+                            )
+                            self.pd_count_alert_triggered = False
+                            log.info("PagerDuty count incident resolved (data flow restored).")
+                        except Exception:
+                            log.warning("PagerDuty count resolve failed.", exc_info=True)
 
                 # Log newly detected packs
                 if addr not in seen_addresses:
@@ -625,6 +649,49 @@ class BmsReader(AppThread):
                             "metrics": {"voltage_v": cell_v},
                         })
                     app_socket.send_pyobj({"bms_cell": cell_metrics})
+
+                # Check if enough distinct BMS units have reported recently
+                now = time.time()
+                active_addrs = sum(
+                    1 for ts in self._bms_last_seen.values()
+                    if now - ts < 60
+                )
+                if (active_addrs < self._minimum_bms_count
+                        and not self.pd_count_alert_triggered
+                        and time.time() - self._startup_time >= 60):
+                    if self.pd_client is not None:
+                        try:
+                            self.pd_count_dedup_key = self.pd_client.trigger(
+                                dedup_key="bms_count",
+                                summary=f"Only {active_addrs}/{self._minimum_bms_count} BMS units reporting on {self.port}",
+                                source=str(DEVICE_NAME_BASE),
+                                severity="critical",
+                            )
+                            self.pd_count_alert_triggered = True
+                            log.warning(
+                                "PagerDuty alert triggered for low BMS count (dedup_key=%s).",
+                                self.pd_count_dedup_key,
+                            )
+                        except Exception:
+                            log.warning("PagerDuty count trigger failed.", exc_info=True)
+                    else:
+                        log.warning(
+                            "PagerDuty client not configured; cannot trigger alert for low BMS count."
+                        )
+                elif active_addrs >= self._minimum_bms_count and self.pd_count_alert_triggered:
+                    if self.pd_client is not None:
+                        try:
+                            self.pd_client.resolve(
+                                dedup_key=self.pd_count_dedup_key,
+                            )
+                            self.pd_count_alert_triggered = False
+                            log.info("PagerDuty count incident resolved.")
+                        except Exception:
+                            log.warning("PagerDuty count resolve failed.", exc_info=True)
+                    else:
+                        log.warning(
+                            "PagerDuty client not configured; cannot resolve alert for BMS count restoration."
+                        )
 
         self.reader.stop()
         self.reader.disconnect()
