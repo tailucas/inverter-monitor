@@ -19,9 +19,11 @@ from queue import Queue
 import serial
 
 from .bms_decoder import (
+    MIN_PROBE_LEN,
     SYNC,
     find_frames,
     parse_response,
+    validate_checksum,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,6 +151,20 @@ class SerialPortReader:
                                 if self._on_frame:
                                     self._on_frame(parsed)
                                 self._frame_queue.put(parsed)
+                                processed_frames.append(frame)
+                            elif (
+                                validate_checksum(frame)
+                                and len(frame) > MIN_PROBE_LEN
+                                and not (parsed.get("valid") and parsed.get("cells_v"))
+                            ):
+                                # Unrecognized BMS data frame with valid checksum.
+                                # Log raw hex for reverse engineering.
+                                logger.warning(
+                                    "Unrecognized BMS data frame (addr=0x%02X, len=%d): %s",
+                                    parsed.get("addr", 0),
+                                    len(frame),
+                                    frame.hex(),
+                                )
                                 processed_frames.append(frame)
 
                         # Remove processed data from buffer
