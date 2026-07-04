@@ -31,6 +31,8 @@ module-root = ""
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "ruff>=0.12.0",
+    "mypy>=1.16",
 ]
 
 [project.scripts]
@@ -38,3 +40,44 @@ aws_configure = "tailucas_pylib.tools.aws_configure:main"
 config_interpol = "tailucas_pylib.tools.config_interpol:main"
 cred_tool = "tailucas_pylib.tools.cred_tool:main"
 yaml_interpol = "tailucas_pylib.tools.yaml_interpol:main"
+
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "F",    # Pyflakes (catches undefined names, e.g. misspelled kwargs)
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "B",    # flake8-bugbear (B026: star-arg after keyword arg)
+    "I",    # isort (import ordering)
+    "UP",   # pyupgrade (modern Python)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+disallow_incomplete_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "influxdb_client.*",
+    "paho.mqtt.*",
+    "pagerduty.*",
+    "prometheus_client.*",
+    "sentry_sdk.*",
+    "tailucas_pylib.*",
+    "libscrc",
+    "serial",
+    "simplejson",
+    "zmq",
+]
+ignore_missing_imports = true
