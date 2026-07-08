@@ -51,6 +51,8 @@ BATTERY_LOW_PCT = 45
 BATTERY_CRITICAL_PCT = 40
 # idle small home ~ 300W
 BATTERY_MAJOR_DRAW_W = 500
+# BMS serial data loss timeout
+BMS_DATA_LOSS_TIMEOUT = 600
 
 
 def twos_complement_hex(hexval):
@@ -510,14 +512,14 @@ class BmsReader(AppThread):
                     # Check for data-loss timeout and trigger PagerDuty if needed
                     if (
                         self.last_bms_data_time > 0
-                        and time.time() - self.last_bms_data_time > 60
+                        and time.time() - self.last_bms_data_time > BMS_DATA_LOSS_TIMEOUT
                         and not self.pd_alert_triggered
                     ):
                         if self.pd_client is not None:
                             try:
                                 self.pd_dedup_key = self.pd_client.trigger(
                                     dedup_key="bms_heartbeat",
-                                    summary=f"BMS serial data loss on {self.port} \u2014 no frames received for >60 seconds",
+                                    summary=f"BMS serial data loss on {self.port} \u2014 no frames received for >{BMS_DATA_LOSS_TIMEOUT} seconds",
                                     source=str(DEVICE_NAME_BASE),
                                     severity="warning",
                                 )
@@ -650,7 +652,7 @@ class BmsReader(AppThread):
                 now = time.time()
                 active_addrs = sum(
                     1 for ts in self._bms_last_seen.values()
-                    if now - ts < 600
+                    if now - ts < BMS_DATA_LOSS_TIMEOUT
                 )
                 if (active_addrs < self._minimum_bms_count
                         and not self.pd_count_alert_triggered
