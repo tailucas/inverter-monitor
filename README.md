@@ -94,8 +94,7 @@ The application is built around a modular, event-driven architecture using ZeroM
 │   └── bmsdata2.bin            # BMS serial capture (test fixture)
 ├── Dockerfile                  # Production container build
 ├── docker-compose.yml          # Container orchestration
-├── Taskfile.yml                # Build & run tasks (Task runner)
-├── Makefile                    # Dev container management
+├── Makefile                    # Build & run tasks, dev container management (GNU Make)
 ├── pyproject.toml              # Python project metadata & tooling config
 ├── base.env                    # Base environment configuration
 ├── dot_env_setup.sh            # Credential-based .env generator
@@ -145,17 +144,17 @@ The application is built around a modular, event-driven architecture using ZeroM
 
 2. Set up the data directory:
    ```bash
-   task datadir
+   make datadir
    ```
 
 3. Configure environment variables via 1Password Connect:
    ```bash
-   task configure
+   make configure
    ```
 
 4. Run the application:
    ```bash
-   task run
+   make run
    ```
 
 Key configuration items (see `base.env` and `config/app.conf`):
