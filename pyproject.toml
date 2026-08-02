@@ -17,7 +17,7 @@ dependencies = [
     "pyserial>=3.5",
     "requests>=2.32.5",
     "sentry-sdk>=2.38.0",
-    "tailucas-pylib[creds,monitoring,mq]>=0.7.1",
+    "tailucas-pylib[creds,monitoring,mq]>=0.7.7",
 ]
 
 [build-system]

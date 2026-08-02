@@ -17,7 +17,7 @@ services:
         LANG: "${LANG:-en_ZA.UTF-8}"
         LANGUAGE: "${LANGUAGE:-en_ZA}"
     logging:
-      driver: "journald"
+      driver: "local"
       options:
         tag: "{{.Name}}"
     tmpfs:
