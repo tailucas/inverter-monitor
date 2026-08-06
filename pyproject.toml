@@ -7,7 +7,7 @@ license-files = ["LICENSE"]
 authors = [
     { name = "Tai Lucas", email = "tglucas@gmail.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "influxdb-client>=1.49.0",
     "libscrc>=1.8.1",
@@ -43,7 +43,7 @@ yaml_interpol = "tailucas_pylib.tools.yaml_interpol:main"
 
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = [
@@ -59,7 +59,7 @@ select = [
 quote-style = "double"
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 strict = false
 warn_unused_configs = true
 warn_unused_ignores = true
