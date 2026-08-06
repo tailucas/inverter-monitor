@@ -76,10 +76,15 @@ class SerialPortReader:
             )
             self._serial.reset_input_buffer()
             self._serial.reset_output_buffer()
-            logger.info("Connected to %s at %d baud", self.port, self.baudrate)
+            logger.info(
+                "Connected to serial port",
+                extra={"port": self.port, "baudrate": self.baudrate},
+            )
             return True
         except serial.SerialException as e:
-            logger.error("Failed to open serial port %s: %s", self.port, e)
+            logger.error(
+                "Failed to open serial port", extra={"port": self.port, "error": str(e)}
+            )
             return False
 
     def disconnect(self):
@@ -90,7 +95,7 @@ class SerialPortReader:
             except Exception:
                 pass
             self._serial = None
-            logger.info("Disconnected from %s", self.port)
+            logger.info("Disconnected from serial port", extra={"port": self.port})
 
     @property
     def is_connected(self) -> bool:
@@ -160,10 +165,12 @@ class SerialPortReader:
                                 # Unrecognized BMS data frame with valid checksum.
                                 # Log raw hex for reverse engineering.
                                 logger.warning(
-                                    "Unrecognized BMS data frame (addr=0x%02X, len=%d): %s",
-                                    parsed.get("addr", 0),
-                                    len(frame),
-                                    frame.hex(),
+                                    "Unrecognized BMS data frame",
+                                    extra={
+                                        "addr": parsed.get("addr", 0),
+                                        "frame_bytes": len(frame),
+                                        "frame_hex": frame.hex(),
+                                    },
                                 )
                                 processed_frames.append(frame)
 
@@ -235,10 +242,12 @@ class ReplayReader:
             self._data = f.read()
         self._frames = find_frames(self._data)
         logger.info(
-            "Loaded %s: %d bytes, %d frames",
-            self.capture_path,
-            len(self._data),
-            len(self._frames),
+            "Loaded capture file",
+            extra={
+                "capture_path": self.capture_path,
+                "data_bytes": len(self._data),
+                "frame_count": len(self._frames),
+            },
         )
 
     @property
@@ -267,7 +276,7 @@ class ReplayReader:
 
     def write(self, data: bytes) -> None:
         """Simulate serial write (no-op, but logs)."""
-        logger.debug("TX > %s", data.hex())
+        logger.debug("Serial write", extra={"data_hex": data.hex()})
 
     def flush(self):
         """Simulate serial flush (no-op)."""

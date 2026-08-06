@@ -133,7 +133,12 @@ class LoggerReader(AppThread):
 
             # OPEN SOCKET
             log.debug(
-                f"Opening stream socket to logger {self.logger_sn} @ {self.logger_ip}:{self.logger_port}..."
+                "Opening stream socket to logger",
+                extra={
+                    "logger_sn": self.logger_sn,
+                    "logger_ip": self.logger_ip,
+                    "logger_port": self.logger_port,
+                },
             )
             for res in socket.getaddrinfo(
                 self.logger_ip, self.logger_port, socket.AF_INET, socket.SOCK_STREAM
@@ -144,7 +149,7 @@ class LoggerReader(AppThread):
                     client_socket.settimeout(10)
                     client_socket.connect(sockadress)
                 except OSError as msg:
-                    log.warning(f"{msg}")
+                    log.warning("Socket connect error", extra={"error": str(msg)})
                     return None
 
             if client_socket is None:
@@ -152,7 +157,8 @@ class LoggerReader(AppThread):
 
             # SEND DATA
             log.debug(
-                f"Sending {len(frame_bytes)} bytes data frame for chunk {chunks}."
+                "Sending data frame",
+                extra={"frame_bytes": len(frame_bytes), "chunk_number": chunks},
             )
             client_socket.sendall(frame_bytes)
 
@@ -164,15 +170,18 @@ class LoggerReader(AppThread):
                     log.warning("No response data.")
                     return None
             except TimeoutError as msg:
-                log.warning(f"{msg}")
+                log.warning("Socket receive timeout", extra={"error": str(msg)})
                 return None
             finally:
                 try:
                     client_socket.close()
                 except OSError as msg:
-                    log.warning(f"{msg}")
+                    log.warning("Socket close error", extra={"error": str(msg)})
 
-            log.debug(f"Received {len(data)} bytes for chunk {chunks}.")
+            log.debug(
+                "Received chunk",
+                extra={"data_bytes": len(data), "chunk_number": chunks},
+            )
             # PARSE RESPONSE (start position 56, end position 60)
             totalpower = 0
             i = pfin - pini
@@ -191,7 +200,11 @@ class LoggerReader(AppThread):
                         )[p1:p2]
                     )
                 except ValueError:
-                    log.warning(f"Discarding {len(data)} byte response.", exc_info=True)
+                    log.warning(
+                        "Discarding byte response",
+                        exc_info=True,
+                        extra={"response_bytes": len(data)},
+                    )
                     return None
                 hexpos = "0x" + str(hex(a + pini)[2:].zfill(4)).upper()
                 for parameter in self.field_mappings:
@@ -226,13 +239,21 @@ class LoggerReader(AppThread):
             pini = 150
             pfin = 195
             chunks += 1
-        log.debug(f"Fetched {len(output)} fields after {chunks} chunks.")
+        log.debug(
+            "Fetched fields",
+            extra={"field_count": len(output), "chunk_count": chunks},
+        )
         return output
 
     # noinspection PyBroadException
     def run(self):
         log.info(
-            f"Using inverter logger {self.logger_sn} at address {self.logger_ip}:{self.logger_port}."
+            "Using inverter logger",
+            extra={
+                "logger_sn": self.logger_sn,
+                "logger_ip": self.logger_ip,
+                "logger_port": self.logger_port,
+            },
         )
         with exception_handler(
             connect_url=URL_WORKER_APP, and_raise=False, shutdown_on_error=True
@@ -258,7 +279,12 @@ class LoggerReader(AppThread):
                             # implausible battery state
                             if battery_soc == 0 and battery_voltage == 0:
                                 log.warning(
-                                    f"{battery_soc=}% and {battery_voltage=}v. Treating this output as implausible: {str(logger_data)}"
+                                    "Treating inverter output as implausible",
+                                    extra={
+                                        "battery_soc_pct": battery_soc,
+                                        "battery_voltage_v": battery_voltage,
+                                        "logger_data": str(logger_data),
+                                    },
                                 )
                                 continue
                             # no previous to compare
@@ -270,7 +296,15 @@ class LoggerReader(AppThread):
                             soc_delta_pct = int(battery_soc - prev_battery_soc)
                             prev_battery_soc_last_set = now - prev_battery_soc_set
                             log.debug(
-                                f"battery_soc_pct changed by {soc_delta_pct}% from {prev_battery_soc} (set {prev_battery_soc_last_set:.2f}s ago) to {battery_soc}."
+                                "battery_soc_pct changed",
+                                extra={
+                                    "soc_delta_pct": soc_delta_pct,
+                                    "prev_battery_soc": prev_battery_soc,
+                                    "prev_battery_soc_set_secs_ago": round(
+                                        prev_battery_soc_last_set, 2
+                                    ),
+                                    "battery_soc": battery_soc,
+                                },
                             )
                             # check for an implausible negative change within some time bound
                             if (
@@ -279,7 +313,13 @@ class LoggerReader(AppThread):
                                 < DEFAULT_SAMPLE_INTERVAL_SECONDS * 2
                             ):
                                 log.warning(
-                                    f"battery_soc_pct changed by more than {IMPLAUSIBLE_CHANGE_PERCENTAGE}% from {prev_battery_soc} to {battery_soc}. Treating this output as implausible: {str(logger_data)}"
+                                    "Treating battery_soc_pct change as implausible",
+                                    extra={
+                                        "max_change_pct": IMPLAUSIBLE_CHANGE_PERCENTAGE,
+                                        "prev_battery_soc": prev_battery_soc,
+                                        "battery_soc": battery_soc,
+                                        "logger_data": str(logger_data),
+                                    },
                                 )
                             else:
                                 # accept the new value as good
@@ -288,15 +328,26 @@ class LoggerReader(AppThread):
                                 # control field change is plausible
                                 break
                     log.warning(
-                        f"Waiting {ERROR_RETRY_INTERVAL_SECONDS}s after {tries} unsuccessful tries."
+                        "Waiting after unsuccessful tries",
+                        extra={
+                            "retry_interval_secs": ERROR_RETRY_INTERVAL_SECONDS,
+                            "tries": tries,
+                        },
                     )
                     threads.interruptable_sleep.wait(ERROR_RETRY_INTERVAL_SECONDS)
                 if logger_data is not None and len(logger_data) > 0:
-                    log.debug(f"Sending {len(logger_data)} fields for publication.")
+                    log.debug(
+                        "Sending fields for publication",
+                        extra={"field_count": len(logger_data)},
+                    )
                     app_socket.send_pyobj({"inverter": logger_data})
                 else:
                     log.warning(
-                        f"Unable to fetch any valid data after {tries} tries (within {DEFAULT_SAMPLE_INTERVAL_SECONDS}s)."
+                        "Unable to fetch any valid data",
+                        extra={
+                            "tries": tries,
+                            "interval_secs": DEFAULT_SAMPLE_INTERVAL_SECONDS,
+                        },
                     )
                 # stop for the remainder of the sampling interval
                 operation_time = time.time() - operation_start_time
@@ -306,11 +357,19 @@ class LoggerReader(AppThread):
                         operation_time, self.sample_interval_secs
                     )
                     log.warning(
-                        f"Sample interval of {self.sample_interval_secs}s is too short, implying wait of {sample_delay:.2f}s. Resetting delay to {normalized_sample_delay:.2f}s."
+                        "Sample interval is too short. Resetting delay",
+                        extra={
+                            "sample_interval_secs": self.sample_interval_secs,
+                            "implied_wait_secs": round(sample_delay, 2),
+                            "normalized_delay_secs": round(normalized_sample_delay, 2),
+                        },
                     )
                     # don't use 0: never spin
                     sample_delay = normalized_sample_delay
-                log.debug(f"Waiting {sample_delay:.2f}s until the next sample.")
+                log.debug(
+                    "Waiting until the next sample",
+                    extra={"sample_delay_secs": round(sample_delay, 2)},
+                )
                 threads.interruptable_sleep.wait(sample_delay)
 
 
@@ -338,9 +397,13 @@ class WeatherReader(AppThread):
             )
             try:
                 output = json.loads(r.content)
-                log.debug(f"Loaded {len(output)} weather fields.")
+                log.debug("Loaded weather fields", extra={"field_count": len(output)})
             except JSONDecodeError:
-                log.warning(f"JSON parse error of {r.content!r}", exc_info=True)
+                log.warning(
+                    "JSON parse error of weather response",
+                    exc_info=True,
+                    extra={"response_content": repr(r.content)},
+                )
                 return None
         except (OSError, ConnectionError, RequestException):
             log.warning("Problem getting weather data.", exc_info=True)
@@ -349,13 +412,16 @@ class WeatherReader(AppThread):
 
     # noinspection PyBroadException
     def run(self):
-        log.info(f"Fetching weather data using coordinates [{self.lat},{self.lon}].")
+        log.info(
+            "Fetching weather data using coordinates",
+            extra={"lat": self.lat, "lon": self.lon},
+        )
         with exception_handler(
             connect_url=URL_WORKER_APP, and_raise=False, shutdown_on_error=True
         ) as app_socket:
             while not threads.shutting_down:
                 wd = self.get_weather_data()
-                log.debug(f"Received weather data: {wd}")
+                log.debug("Received weather data", extra={"weather_data": wd})
                 if wd is not None and len(wd) > 0:
                     weather = dict()
                     weather["cloudiness_pct"] = wd["clouds"]["all"]
@@ -370,16 +436,35 @@ class WeatherReader(AppThread):
                         secs_from_dark = min(date_value - sunrise, sunset - date_value)
                         sun_output = int((secs_from_dark / midday_secs) * 100)
                         log.debug(
-                            f"Derived {sun_output}% sun output from {sunrise=},{date_value=},{sunset=},{midday_secs=},{secs_from_dark=}"
+                            "Derived sun output",
+                            extra={
+                                "sun_output_pct": sun_output,
+                                "sunrise": sunrise,
+                                "date_value": date_value,
+                                "sunset": sunset,
+                                "midday_secs": midday_secs,
+                                "secs_from_dark": secs_from_dark,
+                            },
                         )
                     else:
                         log.debug(
-                            f"Using {sun_output}% sun output from {sunrise=},{date_value=},{sunset=}"
+                            "Using sun output",
+                            extra={
+                                "sun_output_pct": sun_output,
+                                "sunrise": sunrise,
+                                "date_value": date_value,
+                                "sunset": sunset,
+                            },
                         )
                     country = wd["sys"]["country"]
                     weather["midday_pct"] = sun_output
                     log.debug(
-                        f"{country}: Sending {len(weather)} fields for publication: {weather}"
+                        "Sending weather fields for publication",
+                        extra={
+                            "country": country,
+                            "field_count": len(weather),
+                            "weather": weather,
+                        },
                     )
                     app_socket.send_pyobj({"weather": weather})
                 threads.interruptable_sleep.wait(DEFAULT_SAMPLE_INTERVAL_SECONDS)
@@ -475,14 +560,17 @@ class BmsReader(AppThread):
 
     # noinspection PyBroadException
     def run(self):
-        log.info(f"Starting BMS reader on {self.port} at {self.baudrate} baud...")
+        log.info(
+            "Starting BMS reader",
+            extra={"port": self.port, "baudrate": self.baudrate},
+        )
         self.reader = SerialPortReader(port=self.port, baudrate=self.baudrate)
 
         if not self.reader.connect():
-            log.error(f"Could not connect to BMS serial port {self.port}")
+            log.error("Could not connect to BMS serial port", extra={"port": self.port})
             return
 
-        log.info(f"Connected to BMS on {self.port}.")
+        log.info("Connected to BMS", extra={"port": self.port})
         # Frames are queued internally; we pull them from the main thread.
         self.reader.start(on_frame=None)
 
@@ -525,8 +613,8 @@ class BmsReader(AppThread):
                                 )
                                 self.pd_alert_triggered = True
                                 log.warning(
-                                    "PagerDuty alert triggered for BMS data loss (dedup_key=%s).",
-                                    self.pd_dedup_key,
+                                    "PagerDuty alert triggered for BMS data loss",
+                                    extra={"dedup_key": self.pd_dedup_key},
                                 )
                             except Exception:
                                 log.warning("PagerDuty trigger failed.", exc_info=True)
@@ -596,36 +684,30 @@ class BmsReader(AppThread):
                 # Log newly detected packs
                 if addr not in seen_addresses:
                     seen_addresses.add(addr)
-                    model_str = (
-                        f" ({data.get('model', '')})"
-                        if data.get("model")
-                        else ""
-                    )
-                    serial_str = (
-                        f" SN:{data.get('serial', '')}"
-                        if data.get("serial")
-                        else ""
-                    )
                     log.info(
-                        "[NEW] %s (#%02X) detected: %d cells, %.2fV%s%s",
-                        bms_name,
-                        addr,
-                        bms_info.get("cell_count", 0),
-                        bms_info.get("voltage_v", 0),
-                        model_str,
-                        serial_str,
+                        "New BMS detected",
+                        extra={
+                            "bms_name": bms_name,
+                            "addr": addr,
+                            "cell_count": bms_info.get("cell_count", 0),
+                            "voltage_v": bms_info.get("voltage_v", 0),
+                            "model": data.get("model", ""),
+                            "serial": data.get("serial", ""),
+                        },
                     )
 
                 # Log per-frame summary
                 log.debug(
-                    "%s (#%02X): %d cells, %.2fV, min=%.3fV max=%.3fV diff=%.1fmV",
-                    bms_name,
-                    addr,
-                    bms_info.get("cell_count", 0),
-                    bms_info.get("voltage_v", 0),
-                    bms_info.get("min_cell_v", 0),
-                    bms_info.get("max_cell_v", 0),
-                    bms_info.get("cell_diff_mv", 0),
+                    "BMS frame summary",
+                    extra={
+                        "bms_name": bms_name,
+                        "addr": addr,
+                        "cell_count": bms_info.get("cell_count", 0),
+                        "voltage_v": bms_info.get("voltage_v", 0),
+                        "min_cell_v": bms_info.get("min_cell_v", 0),
+                        "max_cell_v": bms_info.get("max_cell_v", 0),
+                        "cell_diff_mv": bms_info.get("cell_diff_mv", 0),
+                    },
                 )
 
                 # Cache latest data per address (keep for compatibility)
@@ -635,7 +717,10 @@ class BmsReader(AppThread):
                 battery_metrics = [
                     {"labels": {"bms_addr": bms_name}, "metrics": scalars}
                 ]
-                log.debug("Sending %s frame for publication (%d scalars).", bms_name, len(scalars))
+                log.debug(
+                    "Sending BMS frame for publication",
+                    extra={"bms_name": bms_name, "scalar_count": len(scalars)},
+                )
                 app_socket.send_pyobj({"battery": battery_metrics})
 
                 # Send per-cell voltage as a separate labeled point
@@ -667,8 +752,8 @@ class BmsReader(AppThread):
                             )
                             self.pd_count_alert_triggered = True
                             log.warning(
-                                "PagerDuty alert triggered for low BMS count (dedup_key=%s).",
-                                self.pd_count_dedup_key,
+                                "PagerDuty alert triggered for low BMS count",
+                                extra={"dedup_key": self.pd_count_dedup_key},
                             )
                         except Exception:
                             log.warning("PagerDuty count trigger failed.", exc_info=True)
@@ -722,7 +807,9 @@ class MqttSubscriber(AppThread, Closable):
 
     def on_connect(self, client, userdata, flags, reason_code, properties):
         subscription_topic = f"{self._mqtt_subscribe_topic_prefix}/state/#"
-        log.info(f"Subscribing to topic [{subscription_topic}]...")
+        log.info(
+            "Subscribing to topic", extra={"subscription_topic": subscription_topic}
+        )
         if self._mqtt_client is not None:
             self._mqtt_client.subscribe(subscription_topic)
 
@@ -735,13 +822,18 @@ class MqttSubscriber(AppThread, Closable):
     def on_message(self, client, userdata, msg):
         topic = msg.topic
         payload = msg.payload
-        log.debug(f"{topic} received {len(payload)} bytes.")
+        log.debug(
+            "MQTT message received",
+            extra={"topic": topic, "payload_bytes": len(payload)},
+        )
         msg_data = None
         try:
-            log.debug(f"{topic} received: {payload}")
+            log.debug(
+                "MQTT payload received", extra={"topic": topic, "payload": payload}
+            )
             msg_data = json.loads(payload)
         except JSONDecodeError:
-            log.exception(f"Unstructured message: {payload}")
+            log.exception("Unstructured message", extra={"payload": payload})
             return
         except ContextTerminated:
             self.close()
@@ -753,7 +845,14 @@ class MqttSubscriber(AppThread, Closable):
                 old_state = self._switch_state[switch_bank]
             if new_state != old_state:
                 for ids, s in enumerate(new_state):
-                    log.info(f"[{switch_bank}] Switch {ids + 1} is now in state [{s}]")
+                    log.info(
+                        "Switch state changed",
+                        extra={
+                            "switch_bank": switch_bank,
+                            "switch_number": ids + 1,
+                            "state": s,
+                        },
+                    )
             # state capture
             self._switch_state[switch_bank] = new_state
 
@@ -761,7 +860,8 @@ class MqttSubscriber(AppThread, Closable):
         for switch_bank in self._switch_state.keys():
             if switch_bank not in self._mqtt_switch_devices:
                 log.warning(
-                    f"Not changing state for {switch_bank} due to missing configuration."
+                    "Not changing switch state due to missing configuration",
+                    extra={"switch_bank": switch_bank},
                 )
                 continue
             mqtt_pub_topic = "/".join(
@@ -772,7 +872,12 @@ class MqttSubscriber(AppThread, Closable):
                 mqtt_update.append(switch_state)
             message_data = json.dumps({"state": mqtt_update})
             log.debug(
-                f"[{mqtt_pub_topic}] Publishing {len(message_data)} bytes: [{message_data}]"
+                "Publishing switch state",
+                extra={
+                    "mqtt_topic": mqtt_pub_topic,
+                    "message_bytes": len(message_data),
+                    "message_data": message_data,
+                },
             )
             if self._mqtt_client is not None:
                 self._mqtt_client.publish(topic=mqtt_pub_topic, payload=message_data)
@@ -786,7 +891,10 @@ class MqttSubscriber(AppThread, Closable):
 
     # noinspection PyBroadException
     def run(self):
-        log.info(f"Connecting to MQTT server {self._mqtt_server_address}...")
+        log.info(
+            "Connecting to MQTT server",
+            extra={"mqtt_server_address": self._mqtt_server_address},
+        )
         self._mqtt_client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2
         )
@@ -870,15 +978,22 @@ class MqttSubscriber(AppThread, Closable):
                     switch_stats["battery_ration"] = 1
                 # log the supporting data
                 log_msg = (
-                    f"Inverter is delivering {inverter_power_w}w to consumers from backup (solar/battery). "
-                    f"Power surplus average is {power_generation_w_avg:.2f}w ({pv1_power_w=:.2f}w, {pv2_power_w=:.2f}w, {battery_power_w=:.2f}w). "
-                    f"Battery discharge {battery_power_w}w with remaining charge of {battery_soc_pct}% and supporting grid voltage of {grid_voltage}v. "
-                    f"Updating switch banks to [{switch_state}]."
+                    "Inverter is delivering power to consumers from backup (solar/battery)"
                 )
+                log_fields = {
+                    "inverter_power_w": inverter_power_w,
+                    "power_generation_w_avg": round(power_generation_w_avg, 2),
+                    "pv1_power_w": round(pv1_power_w, 2),
+                    "pv2_power_w": round(pv2_power_w, 2),
+                    "battery_power_w": round(battery_power_w, 2),
+                    "battery_soc_pct": battery_soc_pct,
+                    "grid_voltage_v": grid_voltage,
+                    "switch_state": switch_state,
+                }
                 if prev_switch_state != switch_state:
-                    log.info(log_msg)
+                    log.info(log_msg, extra=log_fields)
                 elif log.level == logging.DEBUG:
-                    log.debug(log_msg)
+                    log.debug(log_msg, extra=log_fields)
                 # update switches
                 self.set_switch_state(switch_state=switch_state)
                 prev_switch_state = switch_state
@@ -923,7 +1038,9 @@ class EventProcessor(AppThread, Closable):
 
     # noinspection PyBroadException
     def run(self):
-        log.debug(f"Debug metrics are {self.debug_metrics}.")
+        log.debug(
+            "Debug metrics configured", extra={"debug_metrics": self.debug_metrics}
+        )
         my_socket = self.get_socket()
         gauges = {}
         with exception_handler(
@@ -931,7 +1048,7 @@ class EventProcessor(AppThread, Closable):
         ) as mqtt_socket:
             while not threads.shutting_down:
                 event = my_socket.recv_pyobj()
-                log.debug(event)
+                log.debug("Event received", extra={"event": event})
                 if isinstance(event, dict):
                     for point_name in list(event):
                         point_items = event[point_name]
@@ -941,7 +1058,14 @@ class EventProcessor(AppThread, Closable):
                                 labels = entry.get("labels", {})
                                 metrics = entry.get("metrics", {})
                                 if point_name in self.debug_metrics:
-                                    log.debug(f"Log-only Metric: {point_name} labels={labels} metrics={metrics}")
+                                    log.debug(
+                                        "Log-only Metric",
+                                        extra={
+                                            "point_name": point_name,
+                                            "labels": labels,
+                                            "metrics": metrics,
+                                        },
+                                    )
                                     continue
                                 for metric_key, metric_value in metrics.items():
                                     if not isinstance(metric_value, (int, float, bool)):
@@ -957,20 +1081,38 @@ class EventProcessor(AppThread, Closable):
                                     label_values = [str(labels[k]) for k in gauges[gauge_key]._labelnames]
                                     try:
                                         if len(label_values) > 0:
-                                            log.debug(f"Setting gauge {gauge_key} with labels {label_values} to value {metric_value}.")
+                                            log.debug(
+                                                "Setting gauge",
+                                                extra={
+                                                    "gauge_key": gauge_key,
+                                                    "label_values": label_values,
+                                                    "metric_value": metric_value,
+                                                },
+                                            )
                                             gauges[gauge_key].labels(*label_values).set(metric_value)
                                         else:
                                             gauges[gauge_key].set(metric_value)
                                     except ValueError as e:
                                         log.warning(
-                                            f"Invalid value for gauge {gauge_key} with label values {label_values}: {metric_value} ({e})"
+                                            "Invalid value for gauge",
+                                            extra={
+                                                "gauge_key": gauge_key,
+                                                "label_values": label_values,
+                                                "metric_value": metric_value,
+                                                "error": str(e),
+                                            },
                                         )
                         elif isinstance(point_items, dict):
                             # Legacy flat format
                             for key, value in point_items.items():
                                 if point_name in self.debug_metrics:
                                     log.debug(
-                                        f"Log-only Metric: {point_name}.{key} = {value}"
+                                        "Log-only Metric",
+                                        extra={
+                                            "point_name": point_name,
+                                            "field_key": key,
+                                            "value": value,
+                                        },
                                     )
                                     continue
                                 self._influxdb_write(point_name, key, value)
@@ -985,10 +1127,21 @@ class EventProcessor(AppThread, Closable):
                                     gauges[key].set(value)
                                 except ValueError as e:
                                     log.warning(
-                                        f"Invalid value for gauge {gauge_name}: {value} ({e})"
+                                        "Invalid value for gauge",
+                                        extra={
+                                            "gauge_name": gauge_name,
+                                            "value": value,
+                                            "error": str(e),
+                                        },
                                     )
                         else:
-                            log.warning(f"Unexpected point_items type for {point_name}: {type(point_items)}")
+                            log.warning(
+                                "Unexpected point_items type",
+                                extra={
+                                    "point_name": point_name,
+                                    "point_items_type": str(type(point_items)),
+                                },
+                            )
                         if point_name == "inverter" and point_name not in debug_metrics:
                             mqtt_socket.send_pyobj(point_items)
         self.close()
@@ -1003,6 +1156,7 @@ def main():
     log.info("Loading Sentry.io instrumentation...")
     sentry_sdk.init(
         dsn=creds.get_creds(f"Sentry/{APP_NAME}/dsn"),
+        enable_logs=True,
         integrations=[
             AsyncioIntegration(),
             SysExitIntegration(capture_successful_exits=True),
@@ -1017,16 +1171,22 @@ def main():
     with open(mappings_file) as mapping_file:
         try:
             mappings = json.loads(mapping_file.read())
-            log.info(f"Loaded {len(mappings)} field mappings from {mappings_file}")
+            log.info(
+                "Loaded field mappings",
+                extra={"mapping_count": len(mappings), "mappings_file": mappings_file},
+            )
         except JSONDecodeError as e:
-            log.exception(f"Error loading {mappings_file}.")
+            log.exception(
+                "Error loading field mappings", extra={"mappings_file": mappings_file}
+            )
             raise e
     # load time series clients
     influx_client = None
     if is_flag_enabled("local-influxdb"):
         influxdb_url = creds.get_creds("InfluxDB/local/url")
         log.info(
-            f"Connecting to InfluxDB at {influxdb_url}."
+            "Connecting to InfluxDB",
+            extra={"influxdb_url": influxdb_url},
         )
         influx_client = InfluxDBClient(
             url=influxdb_url,
@@ -1035,7 +1195,8 @@ def main():
         )
     else:
         log.debug(
-            'Not writing to InfluxDB due to feature flag "local-influxdb" being disabled.'
+            "Not writing to InfluxDB due to disabled feature flag",
+            extra={"feature_flag": "local-influxdb"},
         )
     # ensure proper signal handling; must be main thread
     signal_handler = SignalHandler()
@@ -1072,12 +1233,15 @@ def main():
             # this will produce multiple instances per process
             registry = CollectorRegistry()
             multiprocess.MultiProcessCollector(registry)
-            log.info(f"Starting multi-process metric server on port {metric_port}...")
+            log.info(
+                "Starting multi-process metric server",
+                extra={"metric_port": metric_port},
+            )
             start_http_server(metric_port, registry=registry)
         else:
-            log.info(f"Starting metric server on port {metric_port}...")
+            log.info("Starting metric server", extra={"metric_port": metric_port})
             start_http_server(metric_port)
-        log.info(f"Starting {APP_NAME} threads...")
+        log.info("Starting application threads", extra={"app_name": APP_NAME})
         event_processor.start()
         if logger_reader is not None:
             logger_reader.start()
