@@ -39,6 +39,7 @@ def decoder():
 
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
     from app import bms_decoder as decoder
+
     return decoder
 
 
@@ -86,9 +87,7 @@ class TestFrameHeader:
         frames = decoder.find_frames(capture_data)
 
         # Find a probe/echo frame (7 bytes, status byte = 0x00)
-        probe_frames = [
-            f for f in frames if len(f) == decoder.MIN_PROBE_LEN
-        ]
+        probe_frames = [f for f in frames if len(f) == decoder.MIN_PROBE_LEN]
         assert len(probe_frames) > 0, "No probe frames found in capture"
 
         for frame in probe_frames:
@@ -104,7 +103,12 @@ class TestFrameHeader:
 
         for frame in frames:
             hdr = decoder.parse_frame_header(frame)
-            if hdr["valid"] and hdr["addr"] == 0x01 and not hdr.get("is_probe") and len(hdr["payload"]) > 40:
+            if (
+                hdr["valid"]
+                and hdr["addr"] == 0x01
+                and not hdr.get("is_probe")
+                and len(hdr["payload"]) > 40
+            ):
                 assert hdr["addr"] == 0x01
                 assert hdr["cmd"] == decoder.CMD_ALL
                 return
@@ -117,7 +121,12 @@ class TestFrameHeader:
 
         for frame in frames:
             hdr = decoder.parse_frame_header(frame)
-            if hdr["valid"] and hdr["addr"] == 0x02 and not hdr.get("is_probe") and len(hdr["payload"]) > 40:
+            if (
+                hdr["valid"]
+                and hdr["addr"] == 0x02
+                and not hdr.get("is_probe")
+                and len(hdr["payload"]) > 40
+            ):
                 assert hdr["addr"] == 0x02
                 assert hdr["cmd"] == decoder.CMD_ALL
                 return
@@ -130,7 +139,12 @@ class TestFrameHeader:
 
         for frame in frames:
             hdr = decoder.parse_frame_header(frame)
-            if hdr["valid"] and hdr["addr"] == 0x03 and not hdr.get("is_probe") and len(hdr["payload"]) > 40:
+            if (
+                hdr["valid"]
+                and hdr["addr"] == 0x03
+                and not hdr.get("is_probe")
+                and len(hdr["payload"]) > 40
+            ):
                 assert hdr["addr"] == 0x03
                 assert hdr["cmd"] == decoder.CMD_ALL
                 return
@@ -159,8 +173,10 @@ class TestCellVoltageParsing:
         addr_results = [r for r in results if r.get("addr") == addr]
         assert len(addr_results) > 0, f"No valid results for addr=0x{addr:02x}"
         for result in addr_results:
-            assert result["cell_count"] == expected_cells, \
-                f"BMS 0x{addr:02x} expected {expected_cells} cells, got {result['cell_count']}"
+            assert result["cell_count"] == expected_cells, (
+                f"BMS 0x{addr:02x} expected {expected_cells} "
+                f"cells, got {result['cell_count']}",
+            )
             assert len(result["cells_v"]) == expected_cells
             assert result["cell_blocks"] == expected_blocks
 
@@ -197,7 +213,9 @@ class TestCellVoltageParsing:
             if len(cells) >= 2:
                 max_diff = max(cells) - min(cells)
                 # Well-balanced LiFePO4 cells should differ by < 50mV
-                assert max_diff < 0.050, f"Cell voltage diff {max_diff*1000:.1f}mV exceeds 50mV"
+                assert max_diff < 0.050, (
+                    f"Cell voltage diff {max_diff * 1000:.1f}mV exceeds 50mV"
+                )
 
     def test_min_max_cell_tracking(self, capture_data, decoder):
         """verify min/max cell voltage tracking is correct"""
@@ -220,8 +238,9 @@ class TestCellVoltageParsing:
         for result in results:
             if "voltage_v" in result:
                 # 16S LiFePO4: nominal 51.2V, typical range 48-58V
-                assert 48.0 <= result["voltage_v"] <= 58.0, \
+                assert 48.0 <= result["voltage_v"] <= 58.0, (
                     f"Pack voltage {result['voltage_v']}V out of range"
+                )
 
 
 # ── Model/serial string parsing tests ────────────────────────────────────────
@@ -236,7 +255,9 @@ class TestModelSerial:
         assert len(bms1_results) > 0
         for result in bms1_results:
             assert "model" in result, f"BMS #1 missing model: {result}"
-            assert "BMS" in result["model"], f"BMS #1 model doesn't contain 'BMS': {result['model']}"
+            assert "BMS" in result["model"], (
+                f"BMS #1 model doesn't contain 'BMS': {result['model']}"
+            )
 
     def test_bms2_has_model_string(self, capture_data, decoder):
         """verify BMS #2 frames contain model string (was serial in old protocol)"""
@@ -246,7 +267,9 @@ class TestModelSerial:
         assert len(bms2_results) > 0
         for result in bms2_results:
             assert "model" in result, f"BMS #2 missing model: {result}"
-            assert "BMS" in result["model"], f"BMS #2 model doesn't contain 'BMS': {result['model']}"
+            assert "BMS" in result["model"], (
+                f"BMS #2 model doesn't contain 'BMS': {result['model']}"
+            )
 
     def test_bms3_has_serial_string(self, capture_data, decoder):
         """verify BMS #3 frames contain serial number"""
@@ -256,7 +279,9 @@ class TestModelSerial:
         assert len(bms3_results) > 0
         for result in bms3_results:
             assert "serial" in result, f"BMS #3 missing serial: {result}"
-            assert "BS" in result["serial"], f"BMS #3 serial doesn't contain 'BS': {result['serial']}"
+            assert "BS" in result["serial"], (
+                f"BMS #3 serial doesn't contain 'BS': {result['serial']}"
+            )
 
     def test_bms3_serial_format(self, capture_data, decoder):
         """verify BMS #3 serial number matches expected format"""
@@ -280,8 +305,9 @@ class TestMultiBlock:
         bms1_results = [r for r in results if r.get("addr") == 0x01]
 
         for result in bms1_results:
-            assert result["cell_blocks"] == 1, \
+            assert result["cell_blocks"] == 1, (
                 f"BMS #1 expected 1 block, got {result['cell_blocks']}"
+            )
 
     def test_bms2_is_single_block(self, capture_data, decoder):
         """verify BMS #2 frames contain exactly 1 cell block (was 2 in old protocol)"""
@@ -289,8 +315,9 @@ class TestMultiBlock:
         bms2_results = [r for r in results if r.get("addr") == 0x02]
 
         for result in bms2_results:
-            assert result["cell_blocks"] == 1, \
+            assert result["cell_blocks"] == 1, (
                 f"BMS #2 expected 1 block, got {result['cell_blocks']}"
+            )
 
     def test_bms3_is_single_block(self, capture_data, decoder):
         """verify BMS #3 frames contain exactly 1 cell block"""
@@ -298,8 +325,9 @@ class TestMultiBlock:
         bms3_results = [r for r in results if r.get("addr") == 0x03]
 
         for result in bms3_results:
-            assert result["cell_blocks"] == 1, \
+            assert result["cell_blocks"] == 1, (
                 f"BMS #3 expected 1 block, got {result['cell_blocks']}"
+            )
 
 
 # ── Replay reader tests ─────────────────────────────────────────────────────
@@ -309,6 +337,7 @@ class TestReplayReader:
     def test_replay_reader_loads_capture(self, capture_name, decoder):
         """verify ReplayReader loads and parses a capture"""
         import sys
+
         sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
         from app.serial_reader import ReplayReader
 
@@ -320,6 +349,7 @@ class TestReplayReader:
     def test_replay_reader_frame_injection(self, capture_name, decoder):
         """verify frame injection works for a capture"""
         import sys
+
         sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
         from app.serial_reader import ReplayReader
 
@@ -339,6 +369,7 @@ class TestReplayReader:
     def test_replay_read_all_frames(self, capture_name, decoder):
         """verify read_all_frames returns parsed results for a capture"""
         import sys
+
         sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
         from app.serial_reader import ReplayReader
 
@@ -363,15 +394,17 @@ class TestKnownContent:
         bms1 = [r for r in results if r.get("addr") == 0x01 and r.get("model")]
         assert len(bms1) > 0
         for r in bms1:
-            assert r["model"] == "BMS0000000000000SZTB", \
+            assert r["model"] == "BMS0000000000000SZTB", (
                 f"BMS #1 model mismatch: {r['model']}"
+            )
 
         # Check BMS #2
         bms2 = [r for r in results if r.get("addr") == 0x02 and r.get("model")]
         assert len(bms2) > 0
         for r in bms2:
-            assert r["model"] == "BMS0000000000000SZTB", \
+            assert r["model"] == "BMS0000000000000SZTB", (
                 f"BMS #2 model mismatch: {r['model']}"
+            )
 
     def test_known_serial_number(self, capture_data, decoder):
         """verify BMS #3 has the expected serial number"""
@@ -380,16 +413,18 @@ class TestKnownContent:
         bms3 = [r for r in results if r.get("addr") == 0x03 and r.get("serial")]
         assert len(bms3) > 0
         for r in bms3:
-            assert r["serial"] == "10101012BS00205", \
+            assert r["serial"] == "10101012BS00205", (
                 f"BMS #3 serial mismatch: {r['serial']}"
+            )
 
     def test_known_cell_count(self, capture_data, decoder):
         """verify all BMS units have exactly 16 cells"""
         results = decoder.find_data_frames(capture_data)
 
         for r in results:
-            assert r["cell_count"] == 16, \
+            assert r["cell_count"] == 16, (
                 f"BMS 0x{r['addr']:02x} has {r['cell_count']} cells, expected 16"
+            )
             assert len(r["cells_v"]) == 16
 
     def test_known_cell_blocks(self, capture_data, decoder):
@@ -397,8 +432,9 @@ class TestKnownContent:
         results = decoder.find_data_frames(capture_data)
 
         for r in results:
-            assert r["cell_blocks"] == 1, \
+            assert r["cell_blocks"] == 1, (
                 f"BMS 0x{r['addr']:02x} has {r['cell_blocks']} blocks, expected 1"
+            )
 
     def test_known_pack_voltage_variation(self, capture_data, decoder):
         """verify pack voltage is in the expected 52-53V range"""
@@ -407,8 +443,10 @@ class TestKnownContent:
         for r in results:
             v = r.get("voltage_v")
             if v:
-                assert 52.0 <= v <= 53.0, \
-                    f"BMS 0x{r['addr']:02x} pack voltage {v}V outside expected 52-53V range"
+                assert 52.0 <= v <= 53.0, (
+                    f"BMS 0x{r['addr']:02x} pack voltage {v}V "
+                    f"outside expected 52-53V range",
+                )
 
     def test_known_addresses_present(self, capture_data, decoder):
         """verify all three expected BMS addresses (0x01, 0x02, 0x03) are present"""
@@ -416,8 +454,9 @@ class TestKnownContent:
 
         addrs_found = set(r["addr"] for r in results)
         for expected_addr in [0x01, 0x02, 0x03]:
-            assert expected_addr in addrs_found, \
+            assert expected_addr in addrs_found, (
                 f"BMS 0x{expected_addr:02x} not found in decoded data"
+            )
 
     def test_frame_count_consistency(self, capture_data, decoder):
         """verify the ratio of probe to data frames is consistent"""
@@ -433,8 +472,9 @@ class TestKnownContent:
         frames = decoder.find_frames(capture_data)
         probe_frames = [f for f in frames if len(f) == decoder.MIN_PROBE_LEN]
         for frame in probe_frames:
-            assert decoder.validate_checksum(frame), \
+            assert decoder.validate_checksum(frame), (
                 f"Probe frame has invalid checksum: {frame.hex()}"
+            )
 
 
 # ── Build query packet tests ────────────────────────────────────────────────
@@ -476,8 +516,9 @@ class TestQueryPacket:
         """verify query packet checksum is valid"""
         for addr in [0x01, 0x02, 0x03]:
             packet = decoder.build_query_packet(addr)
-            assert decoder.validate_checksum(packet), \
+            assert decoder.validate_checksum(packet), (
                 f"Query packet for addr 0x{addr:02x} has invalid checksum"
+            )
 
     def test_query_packet_format_matches_probe(self, decoder):
         """verify query packet format matches probe/echo frame format"""
@@ -538,12 +579,12 @@ class TestEdgeCases:
         assert decoder.is_valid_cell_voltage(3650)  # 3.65V - max for LiFePO4
         assert not decoder.is_valid_cell_voltage(1000)  # too low
         assert not decoder.is_valid_cell_voltage(5000)  # too high
-        assert not decoder.is_valid_cell_voltage(0)     # zero
+        assert not decoder.is_valid_cell_voltage(0)  # zero
 
     def test_get_u16_be(self, decoder):
         """verify big-endian uint16 extraction"""
         data = b"\x0c\xa0"
-        assert decoder.get_u16_be(data, 0) == 0x0ca0  # 3232
+        assert decoder.get_u16_be(data, 0) == 0x0CA0  # 3232
 
     def test_get_s16_be_positive(self, decoder):
         """verify signed 16-bit extraction for positive values"""

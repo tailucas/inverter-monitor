@@ -26,7 +26,7 @@ A multi-threaded Python application that interfaces with Deye/Sunsynk hybrid inv
 | **Battery Monitoring** | RS485 serial protocol decoder for HinaESS Hi-5 batteries — reads individual cell voltages (16 per BMS unit), pack voltage, temperature sensors, charge/discharge status, and derived current across multiple BMS units. |
 | **Weather Correlation** | Fetches current conditions from OpenWeather API and estimates theoretical solar output based on cloud cover and time of day. |
 | **Time-Series Storage** | Asynchronous writes to InfluxDB with per-field tagging for device, application, and BMS unit identification. |
-| **Prometheus Metrics** | Exposes all inverter, battery, and BMS metrics as Prometheus gauges on port 9401. |
+| **OpenTelemetry Metrics** | Exports all inverter, battery, and BMS metrics as OTEL synchronous gauges via OTLP to any OpenTelemetry backend. |
 | **MQTT Integration** | Publishes inverter state to MQTT topics and subscribes to control topics for remote switch management. |
 | **Smart Switching** | Evaluates battery state-of-charge, load draw, and grid status to make decisions about switching off non-essential consumers via MQTT-controlled switches. |
 | **Alerting & Paging** | PagerDuty Events API v2 integration for critical alerts including BMS data loss and minimum BMS unit count violations. |
@@ -42,7 +42,7 @@ The application is built around a modular, event-driven architecture using ZeroM
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        EventProcessor                           │
-│  (central consumer — InfluxDB writes, Prometheus gauges,        │
+│  (central consumer — InfluxDB writes, OTEL gauges,        │
 │   MQTT publishing, debug logging)                               │
 └──────▲────────────────────▲─────────────────────▲───────────────┘
        │                    │                     │
@@ -74,7 +74,7 @@ The application is built around a modular, event-driven architecture using ZeroM
 - **`BmsReader`** — Drives the `SerialPortReader` which reads from `/dev/ttyUSB0` (9600 8N1), extracts and decodes BMS frames via the protocol decoder, assigns friendly names (BMS01, BMS02, etc.) per address, tracks per-unit health, and publishes battery metrics with cell-level granularity.
 - **`WeatherReader`** — Periodically fetches current weather from OpenWeather API and calculates a theoretical sun production multiplier.
 - **`MqttSubscriber`** — Maintains state for MQTT-controlled switch devices, evaluates inverter conditions (battery SOC, power draw, grid mode) to make automated switching decisions, and publishes status updates.
-- **`EventProcessor`** — Central consumer that receives all telemetry events, writes to InfluxDB, updates Prometheus gauges, performs debug metrics logging, and handles graceful shutdown.
+- **`EventProcessor`** — Central consumer that receives all telemetry events, writes to InfluxDB, updates OTEL synchronous gauges, performs debug metrics logging, and handles graceful shutdown.
 
 ### Project Structure
 
@@ -107,7 +107,7 @@ The application is built around a modular, event-driven architecture using ZeroM
 
 [![Python][python-shield]][python-url]
 [![InfluxDB][influxdb-shield]][influxdb-url]
-[![Prometheus][prometheus-shield]][prometheus-url]
+[![OpenTelemetry][otel-shield]][otel-url]
 [![MQTT][mqtt-shield]][mqtt-url]
 [![Sentry][sentry-shield]][sentry-url]
 [![1Password][1p-shield]][1p-url]
@@ -115,7 +115,7 @@ The application is built around a modular, event-driven architecture using ZeroM
 - **Python ≥ 3.12** with uv package manager
 - **ZeroMQ** — In-process thread communication
 - **InfluxDB** — Time-series metric storage
-- **Prometheus** — Metrics endpoint (port 9401)
+- **OpenTelemetry** — Metrics, traces, and logs export via OTLP
 - **MQTT (Paho)** — Message broker integration
 - **PagerDuty** — Critical alerting
 - **Sentry** — Error tracking
@@ -178,8 +178,7 @@ uv sync
 uv run pytest
 
 # Run linting
-uv run ruff check
-uv run mypy app/
+make lint
 ```
 
 ### Sample Metrics
@@ -258,8 +257,8 @@ Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
 [mqtt-url]: https://mqtt.org/
 [mqtt-shield]: https://img.shields.io/static/v1?style=for-the-badge&message=MQTT&color=660066&logo=MQTT&logoColor=FFFFFF&label=
 [ow-url]: https://openweathermap.org/
-[prometheus-shield]: https://img.shields.io/static/v1?style=for-the-badge&message=Prometheus&color=E6522C&logo=Prometheus&logoColor=FFFFFF&label=
-[prometheus-url]: https://prometheus.io/
+[otel-shield]: https://img.shields.io/static/v1?style=for-the-badge&message=OpenTelemetry&color=000000&logo=OpenTelemetry&logoColor=FFFFFF&label=
+[otel-url]: https://opentelemetry.io/
 [python-url]: https://www.python.org/
 [python-shield]: https://img.shields.io/static/v1?style=for-the-badge&message=Python&color=3776AB&logo=Python&logoColor=FFFFFF&label=
 [sentry-url]: https://sentry.io/

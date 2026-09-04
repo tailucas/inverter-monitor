@@ -9,7 +9,7 @@ DOCKER_COMPOSE_URL := https://docs.docker.com/compose/install
 DEVCLI_URL := https://code.visualstudio.com/docs/devcontainers/devcontainer-cli
 CHECK_USER := vscode
 
-.PHONY: help check dev dev-build dev-up datadir python configure build push run rund
+.PHONY: help check dev dev-build dev-up datadir python configure build push run rund lint
 
 # ---------- Dev container (host only) ----------
 
@@ -80,6 +80,11 @@ rund: data/ build .env ## Run the app container (detached)
 	@docker ps | grep 1password || (echo "1Password container not running."; exit 1)
 	@test -d ./data/
 	docker compose up -d --remove-orphans
+
+lint: .venv ## Lint and type-check (ruff format + ruff check + mypy)
+	@uv run ruff format app tests
+	@uv run ruff check app tests
+	@uv run mypy app tests
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "}; /^[a-zA-Z0-9_\/.-]+:.*## / {printf "\033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)

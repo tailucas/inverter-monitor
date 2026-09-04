@@ -57,20 +57,27 @@ log.info(message.format("RabbitMQ control"))                    # .format()
    (`header_bytes`, `frame_hex`, `control_code`, `response_bytes`) so failures
    are debuggable from logs alone.
 4. **PagerDuty lifecycle** logs always carry `dedup_key`; trigger/resolve
-   failures are WARNING with `exc_info=True`.
+   failures are INFO (recoverable — retried on next cycle); "client not
+   configured" messages stay WARNING.
 5. **No secrets** in logs (API keys, tokens, passwords).
 6. **Hot loops:** sample chatty debug logs (see the `randint(0, 1000)`
    guards in the ADC sampling loop) and gate expensive field construction on
    `log.level == logging.DEBUG`.
-7. **Conditional level, same event:** keep message + fields in variables:
+7. **MQTT traceparent injection:** Every MQTT publish is wrapped in an OTEL
+   span (`mqtt.publish`, `SpanKind.PRODUCER`). The generated traceparent is
+   injected into the JSON payload (`"traceparent": "00-..."`) and logged as
+   a structured field. Log at INFO:
 
    ```python
-   log_msg = "Inverter is delivering power to consumers from backup (solar/battery)"
-   log_fields = {"inverter_power_w": inverter_power_w, "switch_state": switch_state, ...}
-   if prev_switch_state != switch_state:
-       log.info(log_msg, extra=log_fields)
-   elif log.level == logging.DEBUG:
-       log.debug(log_msg, extra=log_fields)
+   with OTEL_TRACER.start_as_current_span("mqtt.publish", kind=SpanKind.PRODUCER) as span:
+       span.set_attribute("messaging.system", "mqtt")
+       span.set_attribute("messaging.destination.name", topic)
+       tp = format_traceparent(span)
+       span.set_attribute("traceparent", tp)
+       payload_obj["traceparent"] = tp
+       payload = json.dumps(payload_obj)
+       client.publish(topic=topic, payload=payload)
+       log.info("MQTT message dispatched", extra={"topic": topic, "traceparent": tp})
    ```
 
 8. **Tests** must assert on structured fields (`caplog.records` attributes) or
@@ -80,8 +87,8 @@ log.info(message.format("RabbitMQ control"))                    # .format()
 
 | Level | Use here |
 |---|---|
-| DEBUG | per-sample/chunk/frame tracing, gauge updates |
-| INFO | reader lifecycle, switch state changes, PD resolves, startup |
-| WARNING | timeouts, implausible samples, PD trigger failures, degraded config |
+| DEBUG | per-sample/chunk/frame tracing, gauge updates, "Inverter is delivering power to consumers from backup…" supporting data (always, not conditional) |
+| INFO | reader lifecycle, switch state changes, MQTT publishes, PagerDuty triggers & resolves, startup, recoverable warnings (timeouts, implausible samples, PD trigger/resolve failures, InfluxDB write failures) |
+| WARNING | non-recoverable config gaps (PagerDuty client not configured, missing switch-bank config, reader disabled) |
 | ERROR | lost connections (serial, MQTT), unreadable mappings |
 | CRITICAL | reserved |

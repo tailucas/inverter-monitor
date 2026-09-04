@@ -10,7 +10,7 @@ paths:
 Multi-threaded energy monitoring application for Deye/Sunsynk hybrid inverters
 and HinaESS Hi-5 BMS units: collects inverter telemetry over the logger's
 proprietary TCP protocol, BMS telemetry over RS485 serial, correlates weather,
-publishes to InfluxDB/MQTT, exports Prometheus metrics, and drives load-shed
+publishes to InfluxDB/MQTT, exports OpenTelemetry metrics, and drives load-shed
 switch banks via MQTT.
 
 ## 1. Posture
@@ -34,7 +34,7 @@ One `AppThread` per concern, wired over ZMQ inproc (`URL_WORKER_APP`,
 - `WeatherReader`: OpenWeather sampling correlated with inverter data.
 - `MqttSubscriber`: consumes `inverter/state`, applies the rationing checks
   (surplus, battery SoC, grid fallback) and controls switch banks.
-- `EventProcessor`: fans metrics out to InfluxDB + Prometheus gauges.
+- `EventProcessor`: fans metrics out to InfluxDB + OTEL synchronous gauges.
 
 Rules:
 
@@ -58,9 +58,10 @@ Rules:
   (`bms_heartbeat`, `bms_count`); triggers and resolves must be logged with
   their dedup key as a structured field; seed alert state at startup so stale
   incidents auto-resolve.
-- InfluxDB writes are feature-flagged (`local-influxdb`); Prometheus gauges
-  are named `<point_name>_<metric_key>` with label sets from the metrics
-  payload; log-only metrics are configured via `[metrics] debug_csv`.
+- InfluxDB writes are feature-flagged (`local-influxdb`); OTEL synchronous
+  gauges are named `<point_name>_<metric_key>` with attributes from the
+  metrics payload's label set; log-only metrics are configured via
+  `[metrics] debug_csv`.
 
 ## 5. Configuration
 

@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 import binascii
-import logging.handlers
 import os
 import re
 import socket
@@ -12,21 +11,18 @@ from pathlib import Path
 import libscrc
 import paho.mqtt.client as mqtt
 import requests
-import sentry_sdk
 import simplejson as json
 import zmq
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import ASYNCHRONOUS
+from opentelemetry import metrics, trace
+from opentelemetry.trace import SpanKind
 from pagerduty import EventsApiV2Client
 from paho.mqtt.client import MQTT_ERR_NO_CONN
-from prometheus_client import CollectorRegistry, Gauge, multiprocess, start_http_server
 from requests.adapters import ConnectionError
 from requests.exceptions import RequestException
-from sentry_sdk.integrations.asyncio import AsyncioIntegration
-from sentry_sdk.integrations.sys_exit import SysExitIntegration
-from sentry_sdk.integrations.threading import ThreadingIntegration
-from simplejson.scanner import JSONDecodeError
-from tailucas_pylib import APP_NAME, DEVICE_NAME_BASE, app_config, log, threads
+from simplejson import JSONDecodeError
+from tailucas_pylib import APP_NAME, DEVICE_NAME_BASE, app_config, log, threads, tracing
 from tailucas_pylib.app import AppThread
 from tailucas_pylib.creds import Creds
 from tailucas_pylib.flags import is_flag_enabled
@@ -53,6 +49,19 @@ BATTERY_CRITICAL_PCT = 40
 BATTERY_MAJOR_DRAW_W = 500
 # BMS serial data loss timeout
 BMS_DATA_LOSS_TIMEOUT = 600
+
+# OpenTelemetry meter and tracer (module-level, shared across all threads)
+OTEL_METER = metrics.get_meter(APP_NAME)
+OTEL_TRACER = trace.get_tracer(APP_NAME)
+
+
+def format_traceparent(span: trace.Span) -> str:
+    """Build a W3C traceparent string from the current span's context."""
+    ctx = span.get_span_context()
+    return (
+        f"00-{trace.format_trace_id(ctx.trace_id)}"
+        f"-{trace.format_span_id(ctx.span_id)}-{ctx.trace_flags:02x}"
+    )
 
 
 def twos_complement_hex(hexval):
@@ -264,7 +273,8 @@ class LoggerReader(AppThread):
                 operation_start_time = time.time()
                 tries = 1
                 logger_data = None
-                # try within the time budget to get a plausible value, relative to the previous
+                # try within the time budget to get a plausible value,
+                # relative to the previous
                 while (
                     time.time() - operation_start_time
                     < DEFAULT_SAMPLE_INTERVAL_SECONDS / 2
@@ -306,7 +316,8 @@ class LoggerReader(AppThread):
                                     "battery_soc": battery_soc,
                                 },
                             )
-                            # check for an implausible negative change within some time bound
+                            # check for an implausible negative change within
+                            # some time bound
                             if (
                                 abs(soc_delta_pct) >= IMPLAUSIBLE_CHANGE_PERCENTAGE
                                 and prev_battery_soc_last_set
@@ -405,7 +416,7 @@ class WeatherReader(AppThread):
                     extra={"response_content": repr(r.content)},
                 )
                 return None
-        except (OSError, ConnectionError, RequestException):
+        except OSError, ConnectionError, RequestException:
             log.warning("Problem getting weather data.", exc_info=True)
             return None
         return output
@@ -496,7 +507,9 @@ class BmsReader(AppThread):
 
         # Per-address last-seen timestamps for minimum count check
         self._bms_last_seen: dict[int, float] = {}
-        self._minimum_bms_count = app_config.getint("alert_thresholds", "minimum_bms_count")
+        self._minimum_bms_count = app_config.getint(
+            "alert_thresholds", "minimum_bms_count"
+        )
         self.pd_count_dedup_key: str | None = None
         self.pd_count_alert_triggered = False
 
@@ -505,7 +518,8 @@ class BmsReader(AppThread):
         """Extract scalar battery metrics and cell voltage array.
 
         Returns (scalars_dict, cells_v_list).
-        Scalar dict contains all single-value metrics suitable for a labeled time series.
+        Scalar dict contains all single-value metrics suitable for a
+        labeled time series.
         Array fields (cells_v, all temps) are excluded and returned separately.
         """
         scalars: dict = {}
@@ -550,7 +564,9 @@ class BmsReader(AppThread):
 
         # Named temperature fields by position
         temps = data.get("temps", [])
-        temp_c_values = [t.get("celsius") for t in temps if t.get("celsius") is not None]
+        temp_c_values = [
+            t.get("celsius") for t in temps if t.get("celsius") is not None
+        ]
         if len(temp_c_values) > 0:
             scalars["battery_temp_c"] = temp_c_values[0]
         if len(temp_c_values) > 1:
@@ -578,7 +594,8 @@ class BmsReader(AppThread):
         self.last_bms_data_time = time.time()
         self._startup_time = self.last_bms_data_time
 
-        # Seed PagerDuty state so any previously-open incidents auto-resolve on first data
+        # Seed PagerDuty state so any previously-open incidents
+        # auto-resolve on first data
         if self.pd_client is not None:
             self.pd_alert_triggered = True
             self.pd_dedup_key = "bms_heartbeat"
@@ -594,20 +611,26 @@ class BmsReader(AppThread):
                     log.error("BMS serial connection lost.")
                     break
 
-                # Block until a valid, decoded frame arrives (or timeout to check shutdown flag)
+                # Block until a valid, decoded frame arrives
+                # (or timeout to check shutdown flag)
                 data = self.reader.get_result(timeout=1.0)
                 if data is None:
                     # Check for data-loss timeout and trigger PagerDuty if needed
                     if (
                         self.last_bms_data_time > 0
-                        and time.time() - self.last_bms_data_time > BMS_DATA_LOSS_TIMEOUT
+                        and time.time() - self.last_bms_data_time
+                        > BMS_DATA_LOSS_TIMEOUT
                         and not self.pd_alert_triggered
                     ):
                         if self.pd_client is not None:
                             try:
                                 self.pd_dedup_key = self.pd_client.trigger(
                                     dedup_key="bms_heartbeat",
-                                    summary=f"BMS serial data loss on {self.port} \u2014 no frames received for >{BMS_DATA_LOSS_TIMEOUT} seconds",
+                                    summary=(
+                                        f"BMS serial data loss on {self.port} "
+                                        f"\u2014 no frames received for "
+                                        f">{BMS_DATA_LOSS_TIMEOUT} seconds"
+                                    ),
                                     source=str(DEVICE_NAME_BASE),
                                     severity="warning",
                                 )
@@ -620,7 +643,8 @@ class BmsReader(AppThread):
                                 log.warning("PagerDuty trigger failed.", exc_info=True)
                         else:
                             log.warning(
-                                "PagerDuty client not configured; cannot trigger alert for BMS data loss."
+                                "PagerDuty not configured; cannot trigger"
+                                " alert for BMS data loss."
                             )
                     continue
 
@@ -664,10 +688,13 @@ class BmsReader(AppThread):
                             self.pd_alert_triggered = False
                             log.info("PagerDuty heartbeat incident resolved.")
                         except Exception:
-                            log.warning("PagerDuty heartbeat resolve failed.", exc_info=True)
+                            log.warning(
+                                "PagerDuty heartbeat resolve failed.", exc_info=True
+                            )
                     else:
                         log.warning(
-                            "PagerDuty client not configured; cannot resolve alert for BMS data restoration."
+                            "PagerDuty not configured; cannot resolve"
+                            " alert for BMS data restoration."
                         )
                     # Also resolve count alert when data flow resumes
                     if self.pd_count_alert_triggered and self.pd_client is not None:
@@ -677,9 +704,13 @@ class BmsReader(AppThread):
                                     dedup_key=self.pd_count_dedup_key,
                                 )
                             self.pd_count_alert_triggered = False
-                            log.info("PagerDuty count incident resolved (data flow restored).")
+                            log.info(
+                                "PagerDuty count incident resolved (data restored).",
+                            )
                         except Exception:
-                            log.warning("PagerDuty count resolve failed.", exc_info=True)
+                            log.warning(
+                                "PagerDuty count resolve failed.", exc_info=True
+                            )
 
                 # Log newly detected packs
                 if addr not in seen_addresses:
@@ -727,26 +758,38 @@ class BmsReader(AppThread):
                 if cells_v:
                     cell_metrics = []
                     for idx, cell_v in enumerate(cells_v):
-                        cell_metrics.append({
-                            "labels": {"bms_addr": bms_name, "cell": f"{idx + 1:02d}"},
-                            "metrics": {"voltage_v": cell_v},
-                        })
+                        cell_metrics.append(
+                            {
+                                "labels": {
+                                    "bms_addr": bms_name,
+                                    "cell": f"{idx + 1:02d}",
+                                },
+                                "metrics": {"voltage_v": cell_v},
+                            }
+                        )
                     app_socket.send_pyobj({"bms_cell": cell_metrics})
 
                 # Check if enough distinct BMS units have reported recently
                 now = time.time()
                 active_addrs = sum(
-                    1 for ts in self._bms_last_seen.values()
+                    1
+                    for ts in self._bms_last_seen.values()
                     if now - ts < BMS_DATA_LOSS_TIMEOUT
                 )
-                if (active_addrs < self._minimum_bms_count
-                        and not self.pd_count_alert_triggered
-                        and time.time() - self._startup_time >= 300):
+                if (
+                    active_addrs < self._minimum_bms_count
+                    and not self.pd_count_alert_triggered
+                    and time.time() - self._startup_time >= 300
+                ):
                     if self.pd_client is not None:
                         try:
                             self.pd_count_dedup_key = self.pd_client.trigger(
                                 dedup_key="bms_count",
-                                summary=f"Only {active_addrs}/{self._minimum_bms_count} BMS units reporting on {self.port}",
+                                summary=(
+                                    f"Only {active_addrs}/"
+                                    f"{self._minimum_bms_count} BMS units "
+                                    f"reporting on {self.port}"
+                                ),
                                 source=str(DEVICE_NAME_BASE),
                                 severity="warning",
                             )
@@ -756,12 +799,18 @@ class BmsReader(AppThread):
                                 extra={"dedup_key": self.pd_count_dedup_key},
                             )
                         except Exception:
-                            log.warning("PagerDuty count trigger failed.", exc_info=True)
+                            log.warning(
+                                "PagerDuty count trigger failed.", exc_info=True
+                            )
                     else:
                         log.warning(
-                            "PagerDuty client not configured; cannot trigger alert for low BMS count."
+                            "PagerDuty not configured; cannot trigger"
+                            " alert for low BMS count."
                         )
-                elif active_addrs >= self._minimum_bms_count and self.pd_count_alert_triggered:
+                elif (
+                    active_addrs >= self._minimum_bms_count
+                    and self.pd_count_alert_triggered
+                ):
                     if self.pd_client is not None:
                         try:
                             if self.pd_count_dedup_key is not None:
@@ -771,10 +820,13 @@ class BmsReader(AppThread):
                             self.pd_count_alert_triggered = False
                             log.info("PagerDuty count incident resolved.")
                         except Exception:
-                            log.warning("PagerDuty count resolve failed.", exc_info=True)
+                            log.warning(
+                                "PagerDuty count resolve failed.", exc_info=True
+                            )
                     else:
                         log.warning(
-                            "PagerDuty client not configured; cannot resolve alert for BMS count restoration."
+                            "PagerDuty not configured; cannot resolve"
+                            " alert for BMS count restoration."
                         )
 
         self.reader.stop()
@@ -871,16 +923,29 @@ class MqttSubscriber(AppThread, Closable):
             for _ids, _ in enumerate(self._switch_state[switch_bank]):
                 mqtt_update.append(switch_state)
             message_data = json.dumps({"state": mqtt_update})
-            log.debug(
-                "Publishing switch state",
-                extra={
-                    "mqtt_topic": mqtt_pub_topic,
-                    "message_bytes": len(message_data),
-                    "message_data": message_data,
-                },
-            )
-            if self._mqtt_client is not None:
-                self._mqtt_client.publish(topic=mqtt_pub_topic, payload=message_data)
+            with OTEL_TRACER.start_as_current_span(
+                "mqtt.publish", kind=SpanKind.PRODUCER
+            ) as span:
+                span.set_attribute("messaging.system", "mqtt")
+                span.set_attribute("messaging.destination.name", mqtt_pub_topic)
+                span.set_attribute("messaging.destination_kind", "topic")
+                span.set_attribute("messaging.message.body.size", len(message_data))
+                tp = format_traceparent(span)
+                span.set_attribute("traceparent", tp)
+                payload_obj = {"state": mqtt_update, "traceparent": tp}
+                message_data = json.dumps(payload_obj)
+                if self._mqtt_client is not None:
+                    self._mqtt_client.publish(
+                        topic=mqtt_pub_topic, payload=message_data
+                    )
+                log.info(
+                    "MQTT message dispatched",
+                    extra={
+                        "topic": mqtt_pub_topic,
+                        "message_bytes": len(message_data),
+                        "traceparent": tp,
+                    },
+                )
 
     def get_power_generation_avg(self, value):
         self._power_generation_history.append(value)
@@ -906,13 +971,14 @@ class MqttSubscriber(AppThread, Closable):
         with exception_handler(
             connect_url=URL_WORKER_APP, and_raise=False, shutdown_on_error=True
         ) as app_socket:
-            prev_switch_state = 0
             while not threads.shutting_down:
                 switch_stats = dict()
                 rc = self._mqtt_client.loop()
                 if rc == MQTT_ERR_NO_CONN or self._disconnected:
                     raise ResourceWarning(
-                        f"No connection to MQTT broker at {self._mqtt_server_address} (disconnected? {self._disconnected})"
+                        f"No connection to MQTT broker at "
+                        f"{self._mqtt_server_address} "
+                        f"(disconnected? {self._disconnected})"
                     )
                 inverter_data = None
                 # check for messages to publish
@@ -941,14 +1007,16 @@ class MqttSubscriber(AppThread, Closable):
                     # do not load shed during an alert condition
                     self.set_switch_state()
                     continue
-                # check 1: calculate surplus as a function of PV reported *usage* and how much the batteries are supplying
+                # check 1: calculate surplus as a function of PV reported *usage*
+                # and how much the batteries are supplying
                 pv1_power_w = float(inverter_data["pv1_power_w"])
                 pv2_power_w = float(inverter_data["pv2_power_w"])
                 battery_power_w = float(inverter_data["battery_power_w"])
                 power_generation_w_avg = self.get_power_generation_avg(
                     value=pv1_power_w + pv2_power_w - battery_power_w
                 )
-                # disable switch if battery is critically low without adequate surplus (i.e. not charging from solar)
+                # disable switch if battery is critically low without
+                # adequate surplus (i.e. not charging from solar)
                 battery_soc_pct = inverter_data["battery_soc_pct"]
                 if (
                     battery_soc_pct < BATTERY_CRITICAL_PCT
@@ -956,11 +1024,13 @@ class MqttSubscriber(AppThread, Closable):
                 ):
                     switch_state = 0
                     switch_stats["surplus_ration"] = 1
-                # check 2: determine battery state of charge and whether there is any grid fallback
+                # check 2: determine battery state of charge and
+                # whether there is any grid fallback
                 grid_voltage_l1_v = float(inverter_data["grid_voltage_l1_v"])
                 grid_voltage_l2_v = float(inverter_data["grid_voltage_l2_v"])
                 grid_voltage = max(grid_voltage_l1_v, grid_voltage_l2_v)
-                # more conservative rationing if there is no grid backup (draw assumes no surplus)
+                # more conservative rationing if no grid backup
+                # (draw assumes no surplus)
                 if (
                     battery_soc_pct < BATTERY_LOW_PCT
                     and grid_voltage < 90
@@ -968,7 +1038,8 @@ class MqttSubscriber(AppThread, Closable):
                 ):
                     switch_state = 0
                     switch_stats["battery_ration"] = 1
-                # check 3: determine whether the inverter is no longer pulling from solar or battery (i.e. from grid)
+                # check 3: determine whether the inverter is no longer
+                # pulling from solar or battery (i.e. from grid)
                 inverter_l1_power_w = float(inverter_data["inverter_l1_power_w"])
                 inverter_l2_power_w = float(inverter_data["inverter_l2_power_w"])
                 # can't use min/max because l2 is normally 0
@@ -978,7 +1049,8 @@ class MqttSubscriber(AppThread, Closable):
                     switch_stats["battery_ration"] = 1
                 # log the supporting data
                 log_msg = (
-                    "Inverter is delivering power to consumers from backup (solar/battery)"
+                    "Inverter is delivering power to consumers from backup "
+                    "(solar/battery)"
                 )
                 log_fields = {
                     "inverter_power_w": inverter_power_w,
@@ -990,21 +1062,38 @@ class MqttSubscriber(AppThread, Closable):
                     "grid_voltage_v": grid_voltage,
                     "switch_state": switch_state,
                 }
-                if prev_switch_state != switch_state:
-                    log.info(log_msg, extra=log_fields)
-                elif log.level == logging.DEBUG:
-                    log.debug(log_msg, extra=log_fields)
+                log.debug(log_msg, extra=log_fields)
                 # update switches
                 self.set_switch_state(switch_state=switch_state)
-                prev_switch_state = switch_state
                 # post stats
                 switch_stats["switch_state"] = switch_state
                 app_socket.send_pyobj({"switches": switch_stats})
                 # for other interested consumers
                 if self._mqtt_client is not None:
-                    self._mqtt_client.publish(
-                        topic="inverter/state", payload=json.dumps(inverter_data)
-                    )
+                    with OTEL_TRACER.start_as_current_span(
+                        "mqtt.publish", kind=SpanKind.PRODUCER
+                    ) as span:
+                        span.set_attribute("messaging.system", "mqtt")
+                        span.set_attribute(
+                            "messaging.destination.name", "inverter/state"
+                        )
+                        span.set_attribute("messaging.destination_kind", "topic")
+                        tp = format_traceparent(span)
+                        span.set_attribute("traceparent", tp)
+                        inverter_data["traceparent"] = tp
+                        payload = json.dumps(inverter_data)
+                        span.set_attribute("messaging.message.body.size", len(payload))
+                        self._mqtt_client.publish(
+                            topic="inverter/state", payload=payload
+                        )
+                        log.info(
+                            "MQTT message dispatched",
+                            extra={
+                                "topic": "inverter/state",
+                                "traceparent": tp,
+                                "message_bytes": len(payload),
+                            },
+                        )
         self.close()
 
 
@@ -1025,7 +1114,11 @@ class EventProcessor(AppThread, Closable):
     def _influxdb_write(self, point_name, field_name, field_value, extra_tags=None):
         if self.influxdb_rw is not None:
             try:
-                point = Point(point_name).tag("application", APP_NAME).tag("device", DEVICE_NAME_BASE)
+                point = (
+                    Point(point_name)
+                    .tag("application", APP_NAME)
+                    .tag("device", DEVICE_NAME_BASE)
+                )
                 if extra_tags:
                     for tag_key, tag_value in extra_tags.items():
                         point = point.tag(tag_key, str(tag_value))
@@ -1042,7 +1135,7 @@ class EventProcessor(AppThread, Closable):
             "Debug metrics configured", extra={"debug_metrics": self.debug_metrics}
         )
         my_socket = self.get_socket()
-        gauges = {}
+        self._gauges: dict = {}
         with exception_handler(
             connect_url=URL_WORKER_MQTT_PUBLISH, and_raise=False, shutdown_on_error=True
         ) as mqtt_socket:
@@ -1053,7 +1146,8 @@ class EventProcessor(AppThread, Closable):
                     for point_name in list(event):
                         point_items = event[point_name]
                         if isinstance(point_items, list):
-                            # Labeled format: list of {"labels": {...}, "metrics": {...}}
+                            # Labeled format: list of
+                            # {"labels": {...}, "metrics": {...}}
                             for entry in point_items:
                                 labels = entry.get("labels", {})
                                 metrics = entry.get("metrics", {})
@@ -1070,35 +1164,46 @@ class EventProcessor(AppThread, Closable):
                                 for metric_key, metric_value in metrics.items():
                                     if not isinstance(metric_value, (int, float, bool)):
                                         continue
-                                    self._influxdb_write(point_name, metric_key, metric_value, extra_tags=labels)
+                                    self._influxdb_write(
+                                        point_name,
+                                        metric_key,
+                                        metric_value,
+                                        extra_tags=labels,
+                                    )
                                     gauge_key = f"{point_name}_{metric_key}"
-                                    if gauge_key not in gauges:
-                                        gauges[gauge_key] = Gauge(
-                                            name=gauge_key,
-                                            documentation=f"{point_name} {metric_key}",
-                                            labelnames=list(labels.keys()),
+                                    if gauge_key not in self._gauges:
+                                        self._gauges[gauge_key] = (
+                                            OTEL_METER.create_gauge(
+                                                name=gauge_key,
+                                                description=(
+                                                    f"{point_name} {metric_key}"
+                                                ),
+                                            )
                                         )
-                                    label_values = [str(labels[k]) for k in gauges[gauge_key]._labelnames]
                                     try:
-                                        if len(label_values) > 0:
+                                        attrs = {
+                                            str(k): str(v) for k, v in labels.items()
+                                        }
+                                        if attrs:
                                             log.debug(
                                                 "Setting gauge",
                                                 extra={
                                                     "gauge_key": gauge_key,
-                                                    "label_values": label_values,
+                                                    "attributes": attrs,
                                                     "metric_value": metric_value,
                                                 },
                                             )
-                                            gauges[gauge_key].labels(*label_values).set(metric_value)
+                                            self._gauges[gauge_key].set(
+                                                metric_value, attributes=attrs
+                                            )
                                         else:
-                                            gauges[gauge_key].set(metric_value)
+                                            self._gauges[gauge_key].set(metric_value)
                                     except ValueError as e:
                                         log.warning(
                                             "Invalid value for gauge",
                                             extra={
                                                 "gauge_key": gauge_key,
-                                                "label_values": label_values,
-                                                "metric_value": metric_value,
+                                                "value": metric_value,
                                                 "error": str(e),
                                             },
                                         )
@@ -1117,14 +1222,15 @@ class EventProcessor(AppThread, Closable):
                                     continue
                                 self._influxdb_write(point_name, key, value)
                                 gauge_name = key
-                                if key not in gauges:
+                                if key not in self._gauges:
                                     if not gauge_name.startswith(point_name):
                                         gauge_name = f"{point_name}_{key}"
-                                    gauges[key] = Gauge(
-                                        name=gauge_name, documentation=f"{point_name} {key}"
+                                    self._gauges[key] = OTEL_METER.create_gauge(
+                                        name=gauge_name,
+                                        description=f"{point_name} {key}",
                                     )
                                 try:
-                                    gauges[key].set(value)
+                                    self._gauges[key].set(value)
                                 except ValueError as e:
                                     log.warning(
                                         "Invalid value for gauge",
@@ -1152,18 +1258,6 @@ def main():
     global debug_metrics
     creds = Creds()
     creds.validate_creds()
-    # sentry instrumentation
-    log.info("Loading Sentry.io instrumentation...")
-    sentry_sdk.init(
-        dsn=creds.get_creds(f"Sentry/{APP_NAME}/dsn"),
-        enable_logs=True,
-        integrations=[
-            AsyncioIntegration(),
-            SysExitIntegration(capture_successful_exits=True),
-            ThreadingIntegration(propagate_scope=True),
-        ],
-        send_default_pii=True,
-    )
     # load basic configuration
     app_path = Path(os.path.abspath(os.path.dirname(__file__))).parent
     mappings = None
@@ -1200,7 +1294,9 @@ def main():
         )
     # ensure proper signal handling; must be main thread
     signal_handler = SignalHandler()
-    event_processor = EventProcessor(debug_metrics=debug_metrics, influx_client=influx_client)
+    event_processor = EventProcessor(
+        debug_metrics=debug_metrics, influx_client=influx_client
+    )
     logger_reader: LoggerReader | None = None
     if app_config.getboolean("inverter", "logging_enabled"):
         logger_reader = LoggerReader(
@@ -1228,19 +1324,6 @@ def main():
     )
     # startup completed
     try:
-        metric_port = app_config.getint("metrics", "network_port")
-        if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
-            # this will produce multiple instances per process
-            registry = CollectorRegistry()
-            multiprocess.MultiProcessCollector(registry)
-            log.info(
-                "Starting multi-process metric server",
-                extra={"metric_port": metric_port},
-            )
-            start_http_server(metric_port, registry=registry)
-        else:
-            log.info("Starting metric server", extra={"metric_port": metric_port})
-            start_http_server(metric_port)
         log.info("Starting application threads", extra={"app_name": APP_NAME})
         event_processor.start()
         if logger_reader is not None:
@@ -1259,9 +1342,10 @@ def main():
         # hang around until something goes wrong
         threads.interruptable_sleep.wait()
         raise RuntimeWarning("Shutting down...")
-    except (KeyboardInterrupt, RuntimeWarning, ContextTerminated):
+    except KeyboardInterrupt, RuntimeWarning, ContextTerminated:
         die()
     finally:
+        tracing.shutdown()
         zmq_term()
     bye()
 

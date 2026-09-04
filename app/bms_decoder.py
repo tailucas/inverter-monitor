@@ -378,7 +378,7 @@ def parse_status_metrics(payload: bytes) -> dict:
                 "celsius": deg_c,
             }
 
-    except (IndexError, struct.error):
+    except IndexError, struct.error:
         pass
 
     return info
