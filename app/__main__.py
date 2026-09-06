@@ -1149,6 +1149,11 @@ class EventProcessor(AppThread, Closable):
                                 for metric_key, metric_value in metrics.items():
                                     if not isinstance(metric_value, (int, float, bool)):
                                         continue
+                                    # OTEL NumberDataPoint cannot encode
+                                    # booleans; coerce to 0/1 for the gauge
+                                    gauge_value = metric_value
+                                    if isinstance(metric_value, bool):
+                                        gauge_value = int(metric_value)
                                     gauge_key = f"{point_name}_{metric_key}"
                                     if gauge_key not in self._gauges:
                                         self._gauges[gauge_key] = (
@@ -1169,20 +1174,20 @@ class EventProcessor(AppThread, Closable):
                                                 extra={
                                                     "gauge_key": gauge_key,
                                                     "attributes": attrs,
-                                                    "metric_value": metric_value,
+                                                    "metric_value": gauge_value,
                                                 },
                                             )
                                             self._gauges[gauge_key].set(
-                                                metric_value, attributes=attrs
+                                                gauge_value, attributes=attrs
                                             )
                                         else:
-                                            self._gauges[gauge_key].set(metric_value)
+                                            self._gauges[gauge_key].set(gauge_value)
                                     except ValueError as e:
                                         log.warning(
                                             "Invalid value for gauge",
                                             extra={
                                                 "gauge_key": gauge_key,
-                                                "value": metric_value,
+                                                "value": gauge_value,
                                                 "error": str(e),
                                             },
                                         )
@@ -1207,14 +1212,19 @@ class EventProcessor(AppThread, Closable):
                                         name=gauge_name,
                                         description=f"{point_name} {key}",
                                     )
+                                # OTEL NumberDataPoint cannot encode
+                                # booleans; coerce to 0/1 for the gauge
+                                gauge_value = value
+                                if isinstance(value, bool):
+                                    gauge_value = int(value)
                                 try:
-                                    self._gauges[key].set(value)
+                                    self._gauges[key].set(gauge_value)
                                 except ValueError as e:
                                     log.warning(
                                         "Invalid value for gauge",
                                         extra={
                                             "gauge_name": gauge_name,
-                                            "value": value,
+                                            "value": gauge_value,
                                             "error": str(e),
                                         },
                                     )
