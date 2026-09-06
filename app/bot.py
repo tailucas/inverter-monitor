@@ -53,16 +53,21 @@ from app.telegram_bot import (
 
 def terminator(
     loop: AbstractEventLoop,
-    application: Application,
 ) -> None:
-    """Wait for shutdown signal, then stop the asyncio loop and the bot."""
-    log.debug("asyncio loop terminator is ready.", extra={"app_thread": "TelegramBot"})
+    """Wait for shutdown signal, then stop the asyncio loop.
+
+    PTB's __run() finally block handles updater/application shutdown;
+    this just interrupts run_forever so that the finally block can run.
+    """
+    log.debug(
+        "asyncio loop terminator is ready.",
+        extra={"app_thread": "TelegramBot"},
+    )
     threads.interruptable_sleep.wait()
-    log.info("Terminating asyncio loop", extra={"shutting_down": threads.shutting_down})
-    try:
-        loop.call_soon_threadsafe(application.stop)
-    except Exception:
-        log.warning("Error stopping application during terminator.", exc_info=True)
+    log.info(
+        "Terminating asyncio loop",
+        extra={"shutting_down": threads.shutting_down},
+    )
     loop.stop()
 
 
@@ -421,13 +426,13 @@ class TelegramBot(AppThread, Closable):
         terminator_thread = threading.Thread(
             name="telegram-terminator",
             target=terminator,
-            args=(self._loop, application),
+            args=(self._loop,),
             daemon=True,
         )
         terminator_thread.start()
 
         try:
-            application.run_polling()
+            application.run_polling(stop_signals=None)
         except TimedOut:
             log.warning("Telegram client error.", exc_info=True)
         except Exception:
