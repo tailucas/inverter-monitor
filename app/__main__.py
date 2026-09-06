@@ -1116,7 +1116,7 @@ class EventProcessor(AppThread, Closable):
         # Set up Telegram bot fan-out PUSH socket
         telegram_socket = None
         if self._telegram_enabled:
-            from tailucas_pylib.zmq import zmq_socket
+            from tailucas_pylib.zmq import try_close, zmq_socket
 
             telegram_socket = zmq_socket(socket_type=zmq.PUSH)
             telegram_socket.connect(URL_WORKER_TELEGRAM)
@@ -1248,6 +1248,8 @@ class EventProcessor(AppThread, Closable):
                                 point_items, list
                             ):
                                 telegram_socket.send_pyobj({"battery": point_items})
+        if telegram_socket is not None:
+            try_close(telegram_socket)
         self.close()
 
 

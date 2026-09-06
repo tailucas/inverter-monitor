@@ -18,7 +18,7 @@ import pandas as pd
 import zmq
 from tailucas_pylib import app_config, log, threads
 from tailucas_pylib.app import AppThread
-from tailucas_pylib.zmq import URL_WORKER_APP, Closable, zmq_socket
+from tailucas_pylib.zmq import Closable
 from telegram import Update
 from telegram import User as TelegramUser
 from telegram.constants import ChatAction, ParseMode
@@ -351,7 +351,9 @@ class TelegramBot(AppThread, Closable):
 
     def __init__(self, creds_obj: Any) -> None:
         AppThread.__init__(self, name=self.__class__.__name__)
-        Closable.__init__(self, connect_url=URL_WORKER_APP)
+        # Closable PULL binds to the Telegram ZMQ endpoint; EventProcessor's
+        # PUSH socket connects to it. One side must bind for inproc delivery.
+        Closable.__init__(self, connect_url=URL_WORKER_TELEGRAM)
         self._creds = creds_obj
         self._token = _get_telegram_token(creds_obj)
         self._buffer = StatusBuffer()
@@ -359,10 +361,10 @@ class TelegramBot(AppThread, Closable):
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def _receiver(self) -> None:
-        """Background thread: pull events from the Telegram ZMQ endpoint."""
+        """Background thread: bind PULL socket and ingest telemetry events."""
         log.info("Telegram receiver thread started")
-        pull_socket = zmq_socket(socket_type=zmq.PULL)
-        pull_socket.connect(URL_WORKER_TELEGRAM)
+        # get_socket() binds the PULL socket to URL_WORKER_TELEGRAM
+        pull_socket = self.get_socket()
         while not threads.shutting_down:
             try:
                 event = pull_socket.recv_pyobj()
