@@ -9,12 +9,15 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
-    "influxdb-client>=1.49.0",
+    "emoji>=2.15.0",
     "libscrc>=1.8.1",
+    "matplotlib>=3.10.0",
     "pagerduty>=6.3.0",
     "paho-mqtt>=2.1.0",
+    "pandas>=3.0.3",
     "pyserial>=3.5",
-    "requests>=2.32.5",
+    "python-telegram-bot>=22.7",
+    "requests>=2.34.2",
     "tailucas-pylib[creds,monitoring,mq]>=0.7.7",
 ]
 
@@ -67,10 +70,19 @@ disallow_incomplete_defs = true
 
 [[tool.mypy.overrides]]
 module = [
-    "influxdb_client.*",
+    "app.bot",
+    "app.telegram_bot",
+]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = [
+    "matplotlib.*",
     "paho.mqtt.*",
     "pagerduty.*",
+    "pandas",
     "tailucas_pylib.*",
+    "telegram.*",
     "libscrc",
     "serial",
     "simplejson",

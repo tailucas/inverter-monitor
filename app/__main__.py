@@ -13,14 +13,13 @@ import paho.mqtt.client as mqtt
 import requests
 import simplejson as json
 import zmq
-from influxdb_client import InfluxDBClient, Point
-from influxdb_client.client.write_api import ASYNCHRONOUS
 from opentelemetry import metrics, trace
 from opentelemetry.trace import SpanKind
 from pagerduty import EventsApiV2Client
 from paho.mqtt.client import MQTT_ERR_NO_CONN
 from requests.adapters import ConnectionError
 from requests.exceptions import RequestException
+from sentry_sdk.integrations.logging import ignore_logger
 from simplejson import JSONDecodeError
 from tailucas_pylib import APP_NAME, DEVICE_NAME_BASE, app_config, log, threads, tracing
 from tailucas_pylib.app import AppThread
@@ -32,7 +31,9 @@ from tailucas_pylib.threads import bye, die, thread_nanny
 from tailucas_pylib.zmq import URL_WORKER_APP, Closable, zmq_term
 from zmq.error import ContextTerminated, ZMQError
 
+from app.metrics import configure as metrics_configure
 from app.serial_reader import SerialPortReader
+from app.telegram_bot import URL_WORKER_TELEGRAM  # noqa: E402
 
 creds: Creds | None = None
 debug_metrics = app_config.get("metrics", "debug_csv").split(",")
@@ -1098,36 +1099,12 @@ class MqttSubscriber(AppThread, Closable):
 
 
 class EventProcessor(AppThread, Closable):
-    def __init__(self, debug_metrics, influx_client=None):
+    def __init__(self, debug_metrics, telegram_enabled=False):
         AppThread.__init__(self, name=self.__class__.__name__)
         Closable.__init__(self, connect_url=URL_WORKER_APP)
 
         self.debug_metrics = debug_metrics
-
-        self.influxdb_rw = None
-        self.influxdb_ro = None
-        if influx_client is not None:
-            self.influxdb_bucket = app_config.get("influxdb", "bucket")
-            self.influxdb_rw = influx_client.write_api(write_options=ASYNCHRONOUS)
-            self.influxdb_ro = influx_client.query_api()
-
-    def _influxdb_write(self, point_name, field_name, field_value, extra_tags=None):
-        if self.influxdb_rw is not None:
-            try:
-                point = (
-                    Point(point_name)
-                    .tag("application", APP_NAME)
-                    .tag("device", DEVICE_NAME_BASE)
-                )
-                if extra_tags:
-                    for tag_key, tag_value in extra_tags.items():
-                        point = point.tag(tag_key, str(tag_value))
-                self.influxdb_rw.write(
-                    bucket=self.influxdb_bucket,
-                    record=point.field(field_name, field_value),
-                )
-            except Exception:
-                log.warning("Unable to post to InfluxDB.", exc_info=True)
+        self._telegram_enabled = telegram_enabled
 
     # noinspection PyBroadException
     def run(self):
@@ -1136,6 +1113,14 @@ class EventProcessor(AppThread, Closable):
         )
         my_socket = self.get_socket()
         self._gauges: dict = {}
+        # Set up Telegram bot fan-out PUSH socket
+        telegram_socket = None
+        if self._telegram_enabled:
+            from tailucas_pylib.zmq import zmq_socket
+
+            telegram_socket = zmq_socket(socket_type=zmq.PUSH)
+            telegram_socket.connect(URL_WORKER_TELEGRAM)
+            log.info("Telegram bot fan-out enabled")
         with exception_handler(
             connect_url=URL_WORKER_MQTT_PUBLISH, and_raise=False, shutdown_on_error=True
         ) as mqtt_socket:
@@ -1164,12 +1149,6 @@ class EventProcessor(AppThread, Closable):
                                 for metric_key, metric_value in metrics.items():
                                     if not isinstance(metric_value, (int, float, bool)):
                                         continue
-                                    self._influxdb_write(
-                                        point_name,
-                                        metric_key,
-                                        metric_value,
-                                        extra_tags=labels,
-                                    )
                                     gauge_key = f"{point_name}_{metric_key}"
                                     if gauge_key not in self._gauges:
                                         self._gauges[gauge_key] = (
@@ -1220,7 +1199,6 @@ class EventProcessor(AppThread, Closable):
                                         },
                                     )
                                     continue
-                                self._influxdb_write(point_name, key, value)
                                 gauge_name = key
                                 if key not in self._gauges:
                                     if not gauge_name.startswith(point_name):
@@ -1250,6 +1228,16 @@ class EventProcessor(AppThread, Closable):
                             )
                         if point_name == "inverter" and point_name not in debug_metrics:
                             mqtt_socket.send_pyobj(point_items)
+                        # Forward inverter and battery to Telegram bot when enabled
+                        if telegram_socket is not None:
+                            if point_name == "inverter" and isinstance(
+                                point_items, dict
+                            ):
+                                telegram_socket.send_pyobj({"inverter": point_items})
+                            elif point_name == "battery" and isinstance(
+                                point_items, list
+                            ):
+                                telegram_socket.send_pyobj({"battery": point_items})
         self.close()
 
 
@@ -1258,6 +1246,12 @@ def main():
     global debug_metrics
     creds = Creds()
     creds.validate_creds()
+
+    # Reduce Sentry noise from Telegram/async libraries
+    ignore_logger("telegram.ext.Updater")
+    ignore_logger("telegram.ext._updater")
+    ignore_logger("asyncio")
+
     # load basic configuration
     app_path = Path(os.path.abspath(os.path.dirname(__file__))).parent
     mappings = None
@@ -1275,27 +1269,37 @@ def main():
             )
             raise e
     # load time series clients
-    influx_client = None
-    if is_flag_enabled("local-influxdb"):
-        influxdb_url = creds.get_creds("InfluxDB/local/url")
-        log.info(
-            "Connecting to InfluxDB",
-            extra={"influxdb_url": influxdb_url},
-        )
-        influx_client = InfluxDBClient(
-            url=influxdb_url,
-            token=creds.get_creds("InfluxDB/local/token"),
-            org=creds.get_creds("InfluxDB/local/org"),
-        )
-    else:
-        log.debug(
-            "Not writing to InfluxDB due to disabled feature flag",
-            extra={"feature_flag": "local-influxdb"},
-        )
+    # Extract Prometheus credentials before the event loop starts
+    prom_url = ""
+    prom_user = ""
+    prom_token = ""
+    try:
+        prom_url = creds.get_creds(f"Prometheus/{APP_NAME}/url")
+    except Exception:
+        pass
+    try:
+        prom_user = creds.get_creds(f"Prometheus/{APP_NAME}/user")
+    except Exception:
+        pass
+    try:
+        prom_token = creds.get_creds(f"Prometheus/{APP_NAME}/token")
+    except Exception:
+        pass
+    log.info(
+        "Prometheus configured",
+        extra={
+            "prometheus_url": prom_url,
+            "prometheus_user": prom_user,
+            "prometheus_token_set": bool(prom_token),
+        },
+    )
+    metrics_configure(url=prom_url, user=prom_user, token=prom_token)
     # ensure proper signal handling; must be main thread
     signal_handler = SignalHandler()
+    telegram_enabled = is_flag_enabled("telegram-bot")
     event_processor = EventProcessor(
-        debug_metrics=debug_metrics, influx_client=influx_client
+        debug_metrics=debug_metrics,
+        telegram_enabled=telegram_enabled,
     )
     logger_reader: LoggerReader | None = None
     if app_config.getboolean("inverter", "logging_enabled"):
@@ -1319,6 +1323,13 @@ def main():
         mqtt_topic_prefix=app_config.get("mqtt", "topic_prefix"),
         mqtt_switch_devices=app_config.get("mqtt", "switch_device_csv").split(","),
     )
+    telegram_bot: TelegramBot | None = None
+    if telegram_enabled:
+        from app.bot import TelegramBot
+
+        telegram_bot = TelegramBot(creds_obj=creds)
+    else:
+        log.warning("Telegram bot is disabled.")
     nanny = threading.Thread(
         name="nanny", target=thread_nanny, args=(signal_handler,), daemon=True
     )
@@ -1336,6 +1347,8 @@ def main():
             log.warning("BMS reader is disabled.")
         weather_reader.start()
         mqtt_subscriber.start()
+        if telegram_bot is not None:
+            telegram_bot.start()
         # start thread nanny
         nanny.start()
         log.info("Startup complete.")
