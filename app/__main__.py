@@ -939,7 +939,7 @@ class MqttSubscriber(AppThread, Closable):
                     self._mqtt_client.publish(
                         topic=mqtt_pub_topic, payload=message_data
                     )
-                log.info(
+                log.debug(
                     "MQTT message dispatched",
                     extra={
                         "topic": mqtt_pub_topic,
@@ -1087,7 +1087,7 @@ class MqttSubscriber(AppThread, Closable):
                         self._mqtt_client.publish(
                             topic="inverter/state", payload=payload
                         )
-                        log.info(
+                        log.debug(
                             "MQTT message dispatched",
                             extra={
                                 "topic": "inverter/state",

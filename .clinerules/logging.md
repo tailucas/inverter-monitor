@@ -77,7 +77,7 @@ log.info(message.format("RabbitMQ control"))                    # .format()
        payload_obj["traceparent"] = tp
        payload = json.dumps(payload_obj)
        client.publish(topic=topic, payload=payload)
-       log.info("MQTT message dispatched", extra={"topic": topic, "traceparent": tp})
+       log.debug("MQTT message dispatched", extra={"topic": topic, "traceparent": tp})
    ```
 
 8. **Tests** must assert on structured fields (`caplog.records` attributes) or
