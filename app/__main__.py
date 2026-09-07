@@ -33,6 +33,7 @@ from zmq.error import ContextTerminated, ZMQError
 
 from app.metrics import configure as metrics_configure
 from app.serial_reader import SerialPortReader
+from app.single_flight import SingleFlight
 from app.telegram_bot import URL_WORKER_TELEGRAM  # noqa: E402
 
 creds: Creds | None = None
@@ -88,6 +89,7 @@ class LoggerReader(AppThread):
         self.logger_ip = logger_ip
         self.logger_port = logger_port
         self.sample_interval_secs = sample_interval_secs
+        self._query_flight = SingleFlight()
 
     def get_logger_data(self):
         output = {}
@@ -255,6 +257,15 @@ class LoggerReader(AppThread):
         )
         return output
 
+    def query_now(self) -> dict | None:
+        """Trigger a real-time inverter query, or wait for an in-flight one.
+
+        Uses SingleFlight to serialise access with the scheduled polling
+        loop so that concurrent queries never reach the logger socket.
+        Returns the parsed field dict, or None on failure.
+        """
+        return self._query_flight.call(self.get_logger_data)
+
     # noinspection PyBroadException
     def run(self):
         log.info(
@@ -282,7 +293,7 @@ class LoggerReader(AppThread):
                 ):
                     tries += 1
                     now = time.time()
-                    logger_data = self.get_logger_data()
+                    logger_data = self.query_now()
                     if isinstance(logger_data, dict):
                         if "battery_soc_pct" in logger_data.keys():
                             battery_soc = logger_data["battery_soc_pct"]
@@ -1339,7 +1350,12 @@ def main():
     if telegram_enabled:
         from app.bot import TelegramBot
 
-        telegram_bot = TelegramBot(creds_obj=creds)
+        telegram_bot = TelegramBot(
+            creds_obj=creds,
+            inverter_query=logger_reader.query_now
+            if logger_reader is not None
+            else None,
+        )
     else:
         log.warning("Telegram bot is disabled.")
     nanny = threading.Thread(

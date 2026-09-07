@@ -10,7 +10,9 @@ Pure helper functions and data structures are in `app.telegram_bot`.
 
 import asyncio
 import threading
+import time
 from asyncio import AbstractEventLoop
+from collections.abc import Callable
 from typing import Any
 
 import emoji
@@ -41,6 +43,7 @@ from app.telegram_bot import (
     DEFAULT_HISTORY_HOURS,
     URL_WORKER_TELEGRAM,
     StatusBuffer,
+    StatusSnapshot,
     _get_telegram_token,
     build_history_caption,
     format_status_message,
@@ -177,7 +180,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle /status -- reply with the current snapshot from the buffer."""
+    """Handle /status -- reply with buffer snapshot, then a live inverter query."""
     if update.effective_message is None:
         return ConversationHandler.END
     user = await validate("status", update)
@@ -187,10 +190,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         bot: TelegramBot = context.application.bot_data.get("telegram_bot")  # type: ignore[assignment]
         if bot is None:
             raise RuntimeError("TelegramBot not registered in bot_data")
+
+        # Step 1 -- buffered status (unchanged behaviour)
         snap = bot._buffer.snapshot()
         msg = format_status_message(snap)
         log.debug(
-            "Replying to status request",
+            "Replying to status request (buffered)",
             extra={"user_id": user.id, "data_age_secs": int(snap.age_secs)},
         )
         await update.effective_message.reply_text(
@@ -198,12 +203,51 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             disable_web_page_preview=True,
             parse_mode=ParseMode.MARKDOWN,
         )
+
+        # Step 2 -- live query (skipped if no callable is available)
+        if bot._inverter_query is None:
+            log.debug(
+                "No inverter query callable; live status skipped",
+                extra={"user_id": user.id},
+            )
+            return ConversationHandler.END
+
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.TYPING,
+        )
+        loop = asyncio.get_running_loop()
+        fresh = await loop.run_in_executor(None, bot._inverter_query)
+
+        if fresh is not None and isinstance(fresh, dict) and fresh:
+            # Build a StatusSnapshot from the live data, reusing the
+            # last BMS summary so battery details are still visible.
+            live_snap = StatusSnapshot(
+                inverter=fresh,
+                bms_summary=bot._buffer.snapshot().bms_summary,
+                timestamp=time.time(),
+            )
+            live_msg = format_status_message(live_snap)
+            log.debug(
+                "Replying to status request (live)",
+                extra={"user_id": user.id},
+            )
+            await update.effective_message.reply_text(
+                text=live_msg,
+                disable_web_page_preview=True,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            log.warning(
+                "Live inverter query returned no data",
+                extra={"user_id": user.id, "fresh": str(fresh)},
+            )
     except Exception as exc:
         log.warning(
             "Failed to handle status command", exc_info=exc, extra={"user_id": user.id}
         )
         await update.effective_message.reply_text(
-            text=f"{emoji.emojize(':warning:')} Could not retrieve status: {exc}",
+            text=(f"{emoji.emojize(':warning:')} Could not get status: {exc}"),
             disable_web_page_preview=True,
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -349,7 +393,11 @@ def _fetch_and_render(
 class TelegramBot(AppThread, Closable):
     """Runs the Telegram bot polling loop and manages the status buffer."""
 
-    def __init__(self, creds_obj: Any) -> None:
+    def __init__(
+        self,
+        creds_obj: Any,
+        inverter_query: Callable[[], dict | None] | None = None,
+    ) -> None:
         AppThread.__init__(self, name=self.__class__.__name__)
         # Closable PULL binds to the Telegram ZMQ endpoint; EventProcessor's
         # PUSH socket connects to it. One side must bind for inproc delivery.
@@ -357,6 +405,7 @@ class TelegramBot(AppThread, Closable):
         self._creds = creds_obj
         self._token = _get_telegram_token(creds_obj)
         self._buffer = StatusBuffer()
+        self._inverter_query = inverter_query
         self._receiver_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
