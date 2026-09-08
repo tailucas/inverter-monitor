@@ -23,6 +23,18 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
   `<point_name>_<metric_key>`.
 - **Attributes** are derived from the per-point label set — e.g. `bms_addr`,
   `cell`, etc. — and passed as `attributes={...}` to `gauge.set()`.
+- **Timing gauges** are created at module scope using
+  `OTEL_METER.create_gauge(...)` and named with `_duration_seconds` or
+  `_seconds` suffixes. Each holds the latest measured duration value,
+  updated at every sample cycle via `.set(duration)`. Current timing gauges:
+  - `inverter_query_duration_seconds` — TCP socket round-trip + parse
+  - `inverter_cycle_duration_seconds` — full cycle (query + plausibility + publish)
+  - `weather_fetch_duration_seconds` — OpenWeather API HTTP round-trip
+  - `bms_frame_process_duration_seconds` — from frame receipt to ZMQ publish
+  - `mqtt_publish_duration_seconds` — traceparent injection + client.publish
+  - `event_process_duration_seconds` — InfluxDB + OTEL gauge + fan-out per event
+- The cadence gauge `inverter_sample_cadence_ratio` is a synchronous Gauge
+  tracking the ratio of cycle time to sample interval (> 1.0 = overrun).
 - Log-only metrics (configured via `[metrics] debug_csv`) are discarded after
   debug-logging; they never become OTEL gauges.
 - InfluxDB writes remain feature-flagged (`local-influxdb`) and are written
@@ -56,7 +68,7 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
 
 | Level | Where |
 |---|---|
-| DEBUG | Per-poll/per-sample/frame tracing, gauge updates, "Inverter is delivering power to consumers…" supporting data |
+| DEBUG | Per-poll/per-sample/frame tracing, gauge updates (including timing data), "Inverter is delivering power to consumers…" supporting data |
 | INFO | Startup/lifecycle events, MQTT publishes (with `traceparent` in `extra`), PagerDuty triggers & resolves, recoverable warnings (socket timeouts, implausible samples, PD trigger/resolve failures, InfluxDB write failures) |
 | WARNING | PagerDuty client not configured, missing switch-bank config, reader disabled at startup |
 | ERROR | Lost connections (serial, MQTT), unreadable mappings |

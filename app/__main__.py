@@ -55,6 +55,35 @@ BMS_DATA_LOSS_TIMEOUT = 600
 # OpenTelemetry meter and tracer (module-level, shared across all threads)
 OTEL_METER = metrics.get_meter(APP_NAME)
 OTEL_TRACER = trace.get_tracer(APP_NAME)
+# Timing histograms for key operations (module-level, thread-safe instruments)
+INVERTER_QUERY_DURATION = OTEL_METER.create_gauge(
+    name="inverter_query_duration_seconds",
+    description="Time to query inverter (TCP connect+send+recv+parse)",
+)
+INVERTER_CYCLE_DURATION = OTEL_METER.create_gauge(
+    name="inverter_cycle_duration_seconds",
+    description="Full inverter sampling cycle (query + plausibility retries + publish)",
+)
+INVERTER_CADENCE_RATIO = OTEL_METER.create_gauge(
+    name="inverter_sample_cadence_ratio",
+    description="Ratio of cycle duration to sample interval; values > 1.0 mean overrun",
+)
+WEATHER_FETCH_DURATION = OTEL_METER.create_gauge(
+    name="weather_fetch_duration_seconds",
+    description="Round-trip time for OpenWeather API fetch",
+)
+BMS_FRAME_PROCESS_DURATION = OTEL_METER.create_gauge(
+    name="bms_frame_process_duration_seconds",
+    description="Time from BMS frame receipt to ZMQ publish",
+)
+MQTT_PUBLISH_DURATION = OTEL_METER.create_gauge(
+    name="mqtt_publish_duration_seconds",
+    description="Time for traceparent injection + client.publish",
+)
+EVENT_PROCESS_DURATION = OTEL_METER.create_gauge(
+    name="event_process_duration_seconds",
+    description="Time for one event (InfluxDB + OTEL gauge + fan-out)",
+)
 
 
 def format_traceparent(span: trace.Span) -> str:
@@ -92,6 +121,7 @@ class LoggerReader(AppThread):
         self._query_flight = SingleFlight()
 
     def get_logger_data(self):
+        _query_start = time.time()
         output = {}
 
         client_socket: socket.socket | None = None
@@ -251,9 +281,15 @@ class LoggerReader(AppThread):
             pini = 150
             pfin = 195
             chunks += 1
+        _query_duration = time.time() - _query_start
+        INVERTER_QUERY_DURATION.set(_query_duration)
         log.debug(
             "Fetched fields",
-            extra={"field_count": len(output), "chunk_count": chunks},
+            extra={
+                "field_count": len(output),
+                "chunk_count": chunks,
+                "query_duration_secs": round(_query_duration, 3),
+            },
         )
         return output
 
@@ -374,6 +410,10 @@ class LoggerReader(AppThread):
                     )
                 # stop for the remainder of the sampling interval
                 operation_time = time.time() - operation_start_time
+                INVERTER_CYCLE_DURATION.set(operation_time)
+                INVERTER_CADENCE_RATIO.set(
+                    operation_time / self.sample_interval_secs
+                )
                 sample_delay = self.sample_interval_secs - operation_time
                 if sample_delay < 0:
                     normalized_sample_delay = min(
@@ -408,6 +448,7 @@ class WeatherReader(AppThread):
         )
 
     def get_weather_data(self):
+        _weather_start = time.time()
         output = None
         try:
             r = requests.get(
@@ -427,10 +468,16 @@ class WeatherReader(AppThread):
                     exc_info=True,
                     extra={"response_content": repr(r.content)},
                 )
+                _weather_duration = time.time() - _weather_start
+                WEATHER_FETCH_DURATION.set(_weather_duration)
                 return None
         except OSError, ConnectionError, RequestException:
             log.warning("Problem getting weather data.", exc_info=True)
+            _weather_duration = time.time() - _weather_start
+            WEATHER_FETCH_DURATION.set(_weather_duration)
             return None
+        _weather_duration = time.time() - _weather_start
+        WEATHER_FETCH_DURATION.set(_weather_duration)
         return output
 
     # noinspection PyBroadException
@@ -663,6 +710,7 @@ class BmsReader(AppThread):
                 addr = data.get("addr")
                 if addr is None:
                     continue
+                _bms_process_start = time.time()
 
                 # Assign a friendly BMS name on first sight
                 if addr not in self._addr_to_name:
@@ -780,6 +828,9 @@ class BmsReader(AppThread):
                             }
                         )
                     app_socket.send_pyobj({"bms_cell": cell_metrics})
+
+                _bms_process_duration = time.time() - _bms_process_start
+                BMS_FRAME_PROCESS_DURATION.set(_bms_process_duration)
 
                 # Check if enough distinct BMS units have reported recently
                 now = time.time()
@@ -935,6 +986,7 @@ class MqttSubscriber(AppThread, Closable):
             for _ids, _ in enumerate(self._switch_state[switch_bank]):
                 mqtt_update.append(switch_state)
             message_data = json.dumps({"state": mqtt_update})
+            _mqtt_publish_start = time.time()
             with OTEL_TRACER.start_as_current_span(
                 "mqtt.publish", kind=SpanKind.PRODUCER
             ) as span:
@@ -958,6 +1010,8 @@ class MqttSubscriber(AppThread, Closable):
                         "traceparent": tp,
                     },
                 )
+                _mqtt_publish_duration = time.time() - _mqtt_publish_start
+                MQTT_PUBLISH_DURATION.set(_mqtt_publish_duration)
 
     def get_power_generation_avg(self, value):
         self._power_generation_history.append(value)
@@ -1082,6 +1136,7 @@ class MqttSubscriber(AppThread, Closable):
                 app_socket.send_pyobj({"switches": switch_stats})
                 # for other interested consumers
                 if self._mqtt_client is not None:
+                    _mqtt_publish_start = time.time()
                     with OTEL_TRACER.start_as_current_span(
                         "mqtt.publish", kind=SpanKind.PRODUCER
                     ) as span:
@@ -1106,6 +1161,8 @@ class MqttSubscriber(AppThread, Closable):
                                 "message_bytes": len(payload),
                             },
                         )
+                        _mqtt_publish_duration = time.time() - _mqtt_publish_start
+                        MQTT_PUBLISH_DURATION.set(_mqtt_publish_duration)
         self.close()
 
 
@@ -1138,6 +1195,7 @@ class EventProcessor(AppThread, Closable):
             while not threads.shutting_down:
                 event = my_socket.recv_pyobj()
                 log.debug("Event received", extra={"event": event})
+                _event_process_start = time.time()
                 if isinstance(event, dict):
                     for point_name in list(event):
                         point_items = event[point_name]
@@ -1255,6 +1313,8 @@ class EventProcessor(AppThread, Closable):
                                 point_items, list
                             ):
                                 telegram_socket.send_pyobj({"battery": point_items})
+                _event_process_duration = time.time() - _event_process_start
+                EVENT_PROCESS_DURATION.set(_event_process_duration)
         if telegram_socket is not None:
             try_close(telegram_socket)
         self.close()
