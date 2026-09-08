@@ -7,8 +7,6 @@ handlers, no AppThread -- those live in `app.bot`.
 """
 
 import io
-import time
-from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 
@@ -30,69 +28,72 @@ def _get_telegram_token(creds_obj: Any) -> str:
     return token
 
 
-# -- in-memory status buffer --------------------------------------------------
+# -- BMS summary buffer (thread-safe) -----------------------------------------
 
 
-@dataclass
-class StatusSnapshot:
-    """Latest inverter and battery data with timestamp."""
+class BmsSummaryBuffer:
+    """Thread-safe buffer holding only the latest BMS summary.
 
-    inverter: dict[str, Any] = field(default_factory=dict)
-    battery: dict[str, Any] = field(default_factory=dict)
-    bms_summary: dict[str, Any] = field(default_factory=dict)
-    age_secs: float = 0.0
-    timestamp: float = 0.0
-
-
-class StatusBuffer:
-    """Thread-safe buffer holding the latest inverter + battery snapshots."""
+    The inverter data is queried live on demand; only the derived BMS summary
+    (which comes via the ZMQ fan-out from EventProcessor) is cached.
+    """
 
     def __init__(self) -> None:
         self._lock = Lock()
-        self._data: StatusSnapshot = StatusSnapshot()
+        self._data: dict[str, Any] = {}
 
-    def update_inverter(self, data: dict[str, Any]) -> None:
-        """Store the latest inverter telemetry."""
+    def update(self, data: dict[str, Any]) -> None:
+        """Store the latest BMS summary (copy semantics)."""
         with self._lock:
-            self._data.inverter = data.copy()
-            self._data.timestamp = time.time()
+            self._data = data.copy()
 
-    def update_battery(self, data: dict[str, Any]) -> None:
-        """Store the latest battery / BMS summary."""
+    def summary(self) -> dict[str, Any]:
+        """Return a copy of the current BMS summary."""
         with self._lock:
-            self._data.battery = data.copy()
-            self._data.timestamp = time.time()
+            return self._data.copy()
 
-    def update_bms_summary(self, data: dict[str, Any]) -> None:
-        """Store the latest BMS summary (derived from battery payloads)."""
-        with self._lock:
-            self._data.bms_summary = data.copy()
-            self._data.timestamp = time.time()
 
-    def snapshot(self) -> StatusSnapshot:
-        """Return a copy of the current snapshot with age."""
-        with self._lock:
-            snap = StatusSnapshot(
-                inverter=self._data.inverter.copy(),
-                battery=self._data.battery.copy(),
-                bms_summary=self._data.bms_summary.copy(),
-                timestamp=self._data.timestamp,
-            )
-            if snap.timestamp > 0:
-                snap.age_secs = time.time() - snap.timestamp
-            return snap
+# -- BMS summary derivation helper --------------------------------------------
+
+
+def build_bms_summary(battery_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derive a compact BMS summary dict from a battery payload list.
+
+    Each entry is expected to have a ``metrics`` dict with keys like
+    ``voltage_v``, ``min_cell_v``, ``max_cell_v``, ``cell_diff_mv``.
+    The first entry that provides a value wins for each key.
+    """
+    summary: dict[str, Any] = {"active_count": len(battery_items)}
+    _PICK_KEYS = ("voltage_v", "min_cell_v", "max_cell_v", "cell_diff_mv")
+    for entry in battery_items:
+        metrics = entry.get("metrics", {})
+        if not isinstance(metrics, dict):
+            continue
+        for k in _PICK_KEYS:
+            v = metrics.get(k)
+            if v is not None:
+                summary.setdefault(k, v)
+    return summary
 
 
 # -- status formatter (Markdown output) ----------------------------------------
 
 
-def format_status_message(snap: StatusSnapshot) -> str:
-    """Build a compact Markdown status message from the latest snapshot."""
-    inv = snap.inverter
-    bms = snap.bms_summary
+def format_status_message(inverter: dict[str, Any], bms_summary: dict[str, Any]) -> str:
+    """Build a compact Markdown status message from inverter data and BMS summary.
+
+    Args:
+        inverter: A dict of scalar inverter telemetry fields.
+        bms_summary: A dict of BMS summary fields (e.g. ``active_count``,
+            ``voltage_v``, ``min_cell_v``, ``max_cell_v``, ``cell_diff_mv``).
+
+    Returns:
+        A Markdown-formatted status string.
+    """
+    bms = bms_summary
 
     def _get(key: str, unit: str = "", default: str = "\u2014") -> str:
-        val = inv.get(key)
+        val = inverter.get(key)
         if val is None:
             return default
         try:
@@ -113,8 +114,8 @@ def format_status_message(snap: StatusSnapshot) -> str:
         f"`{_get('grid_voltage_l2_v', 'V')}`",
         f"Daily PV: `{_get('daily_production_kwh', 'kWh')}`  "
         f"Load: `{_get('daily_load_consumption_kwh', 'kWh')}`",
-        f"Work mode: `{inv.get('work_mode', '\u2014')}`   "
-        f"Alert: `{inv.get('alert', '\u2014')}`",
+        f"Work mode: `{inverter.get('work_mode', '\u2014')}`   "
+        f"Alert: `{inverter.get('alert', '\u2014')}`",
     ]
 
     if bms:
@@ -129,18 +130,6 @@ def format_status_message(snap: StatusSnapshot) -> str:
             f"Max cell: `{bms.get('max_cell_v', '\u2014')}` V   "
             f"Delta: `{bms.get('cell_diff_mv', '\u2014')}` mV"
         )
-
-    if snap.timestamp > 0:
-        age_s = int(snap.age_secs)
-        if age_s < 120:
-            age_str = f"{age_s} s ago"
-        else:
-            age_str = f"{age_s // 60} min {age_s % 60} s ago"
-        lines.append("")
-        lines.append(f"_Last update: {age_str}_")
-    else:
-        lines.append("")
-        lines.append("_No data received yet._")
 
     return "\n".join(lines)
 

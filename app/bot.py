@@ -10,7 +10,6 @@ Pure helper functions and data structures are in `app.telegram_bot`.
 
 import asyncio
 import threading
-import time
 from asyncio import AbstractEventLoop
 from collections.abc import Callable
 from typing import Any
@@ -42,9 +41,9 @@ from app.metrics import (
 from app.telegram_bot import (
     DEFAULT_HISTORY_HOURS,
     URL_WORKER_TELEGRAM,
-    StatusBuffer,
-    StatusSnapshot,
+    BmsSummaryBuffer,
     _get_telegram_token,
+    build_bms_summary,
     build_history_caption,
     format_status_message,
     render_battery_chart,
@@ -180,7 +179,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle /status -- reply with buffer snapshot, then a live inverter query."""
+    """Handle /status -- live inverter query with cached BMS summary."""
     if update.effective_message is None:
         return ConversationHandler.END
     user = await validate("status", update)
@@ -191,24 +190,15 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if bot is None:
             raise RuntimeError("TelegramBot not registered in bot_data")
 
-        # Step 1 -- buffered status (unchanged behaviour)
-        snap = bot._buffer.snapshot()
-        msg = format_status_message(snap)
-        log.debug(
-            "Replying to status request (buffered)",
-            extra={"user_id": user.id, "data_age_secs": int(snap.age_secs)},
-        )
-        await update.effective_message.reply_text(
-            text=msg,
-            disable_web_page_preview=True,
-            parse_mode=ParseMode.MARKDOWN,
-        )
-
-        # Step 2 -- live query (skipped if no callable is available)
         if bot._inverter_query is None:
-            log.debug(
-                "No inverter query callable; live status skipped",
+            log.warning(
+                "Inverter query not available for status command",
                 extra={"user_id": user.id},
+            )
+            await update.effective_message.reply_text(
+                text=(f"{emoji.emojize(':warning:')} Inverter query is not available."),
+                disable_web_page_preview=True,
+                parse_mode=ParseMode.MARKDOWN,
             )
             return ConversationHandler.END
 
@@ -220,14 +210,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         fresh = await loop.run_in_executor(None, bot._inverter_query)
 
         if fresh is not None and isinstance(fresh, dict) and fresh:
-            # Build a StatusSnapshot from the live data, reusing the
-            # last BMS summary so battery details are still visible.
-            live_snap = StatusSnapshot(
+            live_msg = format_status_message(
                 inverter=fresh,
-                bms_summary=bot._buffer.snapshot().bms_summary,
-                timestamp=time.time(),
+                bms_summary=bot._bms_summary.summary(),
             )
-            live_msg = format_status_message(live_snap)
             log.debug(
                 "Replying to status request (live)",
                 extra={"user_id": user.id},
@@ -241,6 +227,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             log.warning(
                 "Live inverter query returned no data",
                 extra={"user_id": user.id, "fresh": str(fresh)},
+            )
+            await update.effective_message.reply_text(
+                text=(
+                    f"{emoji.emojize(':warning:')} Could not retrieve live status: "
+                    "inverter query returned no data."
+                ),
+                disable_web_page_preview=True,
+                parse_mode=ParseMode.MARKDOWN,
             )
     except Exception as exc:
         log.warning(
@@ -404,7 +398,7 @@ class TelegramBot(AppThread, Closable):
         Closable.__init__(self, connect_url=URL_WORKER_TELEGRAM)
         self._creds = creds_obj
         self._token = _get_telegram_token(creds_obj)
-        self._buffer = StatusBuffer()
+        self._bms_summary = BmsSummaryBuffer()
         self._inverter_query = inverter_query
         self._receiver_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -422,23 +416,9 @@ class TelegramBot(AppThread, Closable):
             if not isinstance(event, dict):
                 continue
             for point_name, point_items in event.items():
-                if point_name == "inverter" and isinstance(point_items, dict):
-                    self._buffer.update_inverter(point_items)
-                elif point_name == "battery" and isinstance(point_items, list):
-                    bms_summary: dict[str, Any] = {"active_count": len(point_items)}
-                    for entry in point_items:
-                        metrics = entry.get("metrics", {})
-                        if isinstance(metrics, dict):
-                            for k in (
-                                "voltage_v",
-                                "min_cell_v",
-                                "max_cell_v",
-                                "cell_diff_mv",
-                            ):
-                                v = metrics.get(k)
-                                if v is not None:
-                                    bms_summary.setdefault(k, v)
-                    self._buffer.update_bms_summary(bms_summary)
+                if point_name == "battery" and isinstance(point_items, list):
+                    bms_summary = build_bms_summary(point_items)
+                    self._bms_summary.update(bms_summary)
         log.info("Telegram receiver thread finished")
         try:
             pull_socket.close()

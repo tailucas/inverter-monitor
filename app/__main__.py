@@ -1249,13 +1249,9 @@ class EventProcessor(AppThread, Closable):
                             )
                         if point_name == "inverter" and point_name not in debug_metrics:
                             mqtt_socket.send_pyobj(point_items)
-                        # Forward inverter and battery to Telegram bot when enabled
+                        # Forward battery to Telegram bot when enabled
                         if telegram_socket is not None:
-                            if point_name == "inverter" and isinstance(
-                                point_items, dict
-                            ):
-                                telegram_socket.send_pyobj({"inverter": point_items})
-                            elif point_name == "battery" and isinstance(
+                            if point_name == "battery" and isinstance(
                                 point_items, list
                             ):
                                 telegram_socket.send_pyobj({"battery": point_items})

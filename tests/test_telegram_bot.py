@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 """Unit tests for the Telegram bot module — pure functions only."""
 
-import time
 from typing import Any
 
 import pandas as pd
@@ -14,8 +13,8 @@ from app.metrics import (
     fetch_metrics,
 )
 from app.telegram_bot import (
-    StatusBuffer,
-    StatusSnapshot,
+    BmsSummaryBuffer,
+    build_bms_summary,
     build_history_caption,
     format_status_message,
     render_battery_chart,
@@ -54,44 +53,76 @@ def sample_bms_summary() -> dict[str, Any]:
     }
 
 
-def test_status_buffer_store_and_snapshot() -> None:
-    """Verify StatusBuffer stores keys and computes age."""
-    buf = StatusBuffer()
-    snap = buf.snapshot()
-    assert snap.timestamp == 0.0
-    assert snap.inverter == {}
-    assert snap.bms_summary == {}
+def test_bms_summary_buffer_empty() -> None:
+    """A fresh buffer returns empty dict."""
+    buf = BmsSummaryBuffer()
+    assert buf.summary() == {}
 
-    inv = {"battery_soc_pct": 65.0, "pv1_power_w": 1000.0}
-    buf.update_inverter(inv)
-    snap = buf.snapshot()
-    assert snap.inverter["battery_soc_pct"] == 65.0
-    assert snap.timestamp > 0
-    assert snap.age_secs >= 0
+
+def test_bms_summary_buffer_store_and_copy() -> None:
+    """Verify BmsSummaryBuffer stores keys and returns a copy on read."""
+    buf = BmsSummaryBuffer()
+    data = {"active_count": 2, "voltage_v": 51.2}
+    buf.update(data)
+
+    result = buf.summary()
+    assert result == data
+    # Verify copy semantics: mutating the returned dict does not affect buffer
+    result["active_count"] = 99
+    assert buf.summary()["active_count"] == 2
+
+
+def test_build_bms_summary() -> None:
+    """Verify build_bms_summary derives correct fields from battery payloads."""
+    battery_items = [
+        {
+            "labels": {"bms_addr": "0x01"},
+            "metrics": {"voltage_v": 51.2, "min_cell_v": 3.15, "cell_diff_mv": 70},
+        },
+        {
+            "labels": {"bms_addr": "0x02"},
+            "metrics": {"voltage_v": 51.0, "max_cell_v": 3.22, "cell_diff_mv": 80},
+        },
+    ]
+    summary = build_bms_summary(battery_items)
+    assert summary["active_count"] == 2
+    assert summary["voltage_v"] == 51.2  # first entry wins
+    assert summary["min_cell_v"] == 3.15
+    assert summary["max_cell_v"] == 3.22
+    assert summary["cell_diff_mv"] == 70  # first entry wins
+
+
+def test_build_bms_summary_empty() -> None:
+    """Empty battery items produce only active_count."""
+    summary = build_bms_summary([])
+    assert summary == {"active_count": 0}
 
 
 def test_format_status_message(sample_inverter: dict[str, Any]) -> None:
     """Verify status message contains expected fields."""
-    snap = StatusSnapshot(
+    msg = format_status_message(
         inverter=sample_inverter,
         bms_summary={"active_count": 2},
-        timestamp=time.time(),
     )
-    msg = format_status_message(snap)
     assert "SOC: `72.3 %`" in msg
     assert "PV1: `1200.0 W`" in msg
     assert "PV2: `800.0 W`" in msg
     assert "Load: `950.0 W`" in msg
     assert "Grid: `230.5 V`" in msg
     assert "*Inverter Status*" in msg
+    # No "Last update" / "No data" lines since inverter is always live
+    assert "ago" not in msg
     assert "No data" not in msg
 
 
 def test_format_status_message_empty() -> None:
-    """Verify empty snapshot yields appropriate message."""
-    snap = StatusSnapshot(timestamp=0.0)
-    msg = format_status_message(snap)
-    assert "_No data received yet._" in msg
+    """Verify empty inverter yields appropriate message."""
+    msg = format_status_message(inverter={}, bms_summary={})
+    assert "*Inverter Status*" in msg
+    # Every field shows the em dash placeholder
+    assert "\u2014" in msg
+    assert "ago" not in msg
+    assert "No data" not in msg
 
 
 def test_format_status_message_with_bms(
@@ -99,12 +130,10 @@ def test_format_status_message_with_bms(
     sample_bms_summary: dict[str, Any],
 ) -> None:
     """Verify BMS details appear in status message."""
-    snap = StatusSnapshot(
+    msg = format_status_message(
         inverter=sample_inverter,
         bms_summary=sample_bms_summary,
-        timestamp=time.time(),
     )
-    msg = format_status_message(snap)
     assert "*BMS Summary*" in msg
     assert "Packs: `2`" in msg
     assert "Min cell: `3.15` V" in msg
