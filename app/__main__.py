@@ -985,6 +985,17 @@ class MqttSubscriber(AppThread, Closable):
             mqtt_update = list()
             for _ids, _ in enumerate(self._switch_state[switch_bank]):
                 mqtt_update.append(switch_state)
+            # only publish (and trace a switch event) on an actual state change
+            if not any(s != switch_state for s in self._switch_state[switch_bank]):
+                log.debug(
+                    "Switch state unchanged; skipping control publish",
+                    extra={
+                        "switch_bank": switch_bank,
+                        "switch_state": switch_state,
+                        "current_state": self._switch_state[switch_bank],
+                    },
+                )
+                continue
             message_data = json.dumps({"state": mqtt_update})
             _mqtt_publish_start = time.time()
             with OTEL_TRACER.start_as_current_span(
