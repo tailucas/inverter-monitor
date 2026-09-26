@@ -29,6 +29,7 @@ A multi-threaded Python application that interfaces with Deye/Sunsynk hybrid inv
 | **OpenTelemetry Metrics** | Exports all inverter, battery, and BMS metrics as OTEL synchronous gauges via OTLP to any OpenTelemetry backend. |
 | **MQTT Integration** | Publishes inverter state to MQTT topics and subscribes to control topics for remote switch management. |
 | **Smart Switching** | Evaluates battery state-of-charge, load draw, and grid status to make decisions about switching off non-essential consumers via MQTT-controlled switches. |
+| **Imagined Status** | The Telegram `/imagine` command turns live inverter, BMS, weather and switch-bank state into a narrative scene prompt that Gemini renders as a portrait image; prompts are budgeted to the model's 480-token limit. |
 | **Alerting & Paging** | PagerDuty Events API v2 integration for critical alerts including BMS data loss and minimum BMS unit count violations. |
 | **Error Tracking** | Sentry SDK integration with threading and async support for production error monitoring. |
 | **Health Monitoring** | Healthchecks.io and Cronitor integration for uptime tracking. |
@@ -75,6 +76,7 @@ The application is built around a modular, event-driven architecture using ZeroM
 - **`WeatherReader`** — Periodically fetches current weather from OpenWeather API and calculates a theoretical sun production multiplier.
 - **`MqttSubscriber`** — Maintains state for MQTT-controlled switch devices, evaluates inverter conditions (battery SOC, power draw, grid mode) to make automated switching decisions, and publishes status updates.
 - **`EventProcessor`** — Central consumer that receives all telemetry events, writes to InfluxDB, updates OTEL synchronous gauges, performs debug metrics logging, and handles graceful shutdown.
+- **`TelegramBot`** — Runs the Telegram command bot (`/status`, `/history`, `/battery`, `/cell`, `/imagine`), caches BMS, weather and switch-bank summaries for on-demand replies, and dispatches bot-initiated notifications.
 
 ### Project Structure
 
@@ -84,6 +86,8 @@ The application is built around a modular, event-driven architecture using ZeroM
 │   ├── __init__.py
 │   ├── __main__.py             # Main entry point with all threads
 │   ├── bms_decoder.py          # HinaESS BMS RS485 protocol decoder
+│   ├── gemini_image.py         # Gemini text-to-image client (/imagine)
+│   ├── image_prompts.py        # Pure /imagine prompt builder & scene presets
 │   └── serial_reader.py        # Serial port reader & frame synchronizer
 ├── config/
 │   ├── app.conf                # Application configuration template
@@ -163,6 +167,7 @@ Key configuration items (see `base.env` and `config/app.conf`):
 - `BMS_SERIAL_PORT` — Serial device for BMS (e.g., `/dev/ttyUSB0`)
 - `MQTT_SERVER_ADDRESS` — MQTT broker hostname
 - `WEATHER_COORD` — Latitude,longitude for weather data
+- `GEMINI_MODEL` — Optional `/imagine` text-to-image model override (defaults to `gemini-3.1-flash-lite-image`)
 - `INFLUXDB_BUCKET` — Target InfluxDB bucket name
 
 #### Development

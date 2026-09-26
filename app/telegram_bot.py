@@ -17,6 +17,12 @@ import matplotlib
 import pandas as pd
 from tailucas_pylib import APP_NAME, DEVICE_NAME_BASE, app_config
 
+from app.image_prompts import (
+    DEFAULT_LOAD_WARNING_W,
+    load_shed_state,
+    numeric_value,
+)
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -73,6 +79,27 @@ class WeatherBuffer:
 
     def summary(self) -> dict[str, Any]:
         """Return a copy of the current weather sample."""
+        with self._lock:
+            return self._data.copy()
+
+
+# -- switch stats buffer (thread-safe) -----------------------------------------
+
+
+class SwitchStatsBuffer:
+    """Thread-safe buffer holding the latest switch/rationing stats."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._data: dict[str, Any] = {}
+
+    def update(self, data: dict[str, Any]) -> None:
+        """Store the latest switch stats (copy semantics)."""
+        with self._lock:
+            self._data = data.copy()
+
+    def summary(self) -> dict[str, Any]:
+        """Return a copy of the current switch stats."""
         with self._lock:
             return self._data.copy()
 
@@ -408,6 +435,42 @@ def build_history_caption(df_power: pd.DataFrame, hours: int) -> str:
 def build_battery_caption(df_battery: pd.DataFrame, hours: int) -> str:
     """Build a plain-text caption for the battery history chart."""
     return _build_caption("Battery history", df_battery, hours)
+
+
+# -- /imagine caption (plain text) ---------------------------------------------
+
+
+def build_imagine_caption(
+    inverter: dict[str, Any] | None = None,
+    weather: dict[str, Any] | None = None,
+    switches: dict[str, Any] | None = None,
+    load_warning_w: float = DEFAULT_LOAD_WARNING_W,
+    load_shed_w: float | None = None,
+) -> str:
+    """Build a short plain-text caption for the /imagine photo.
+
+    Plain text (no parse mode): the caption rides on a photo message, where
+    any markup would be rendered literally.
+    """
+    inverter = inverter or {}
+    weather = weather or {}
+    state = load_shed_state(
+        inverter,
+        switches,
+        load_warning_w=load_warning_w,
+        load_shed_w=load_shed_w,
+    )
+    details = ["load shedding active" if state.needed else "no load shedding"]
+    soc_pct = numeric_value(inverter.get("battery_soc_pct"))
+    if soc_pct is not None:
+        details.append(f"battery {soc_pct:.0f} %")
+    load_w = numeric_value(inverter.get("total_load_power_w"))
+    if load_w is not None:
+        details.append(f"load {load_w:,.0f} W")
+    cloudiness_pct = numeric_value(weather.get("cloudiness_pct"))
+    if cloudiness_pct is not None:
+        details.append(f"cloud {cloudiness_pct:.0f} %")
+    return f"Inverter imagination -- {', '.join(details)}"
 
 
 # -- cell plot + recommendation (plain-text caption) ---------------------------

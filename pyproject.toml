@@ -10,11 +10,13 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "emoji>=2.15.0",
+    "google-genai>=2.25.0",
     "libscrc>=1.8.1",
     "matplotlib>=3.10.0",
     "pagerduty>=6.3.0",
     "paho-mqtt>=2.1.0",
     "pandas>=3.0.3",
+    "pillow>=12.3.0",
     "pyserial>=3.5",
     "python-telegram-bot>=22.7",
     "requests>=2.34.2",

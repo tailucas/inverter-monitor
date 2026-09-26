@@ -14,11 +14,13 @@ from app.metrics import (
 )
 from app.telegram_bot import (
     BmsSummaryBuffer,
+    SwitchStatsBuffer,
     WeatherBuffer,
     build_battery_caption,
     build_bms_summary,
     build_cell_recommendation,
     build_history_caption,
+    build_imagine_caption,
     build_notification_message,
     format_load_recovery_message,
     format_load_warning_message,
@@ -90,6 +92,44 @@ def test_weather_buffer_store_and_copy() -> None:
     assert result == data
     result["cloudiness_pct"] = 100
     assert buf.summary()["cloudiness_pct"] == 62
+
+
+def test_switch_stats_buffer_store_and_copy() -> None:
+    """Verify SwitchStatsBuffer stores keys and returns a copy on read."""
+    buf = SwitchStatsBuffer()
+    assert buf.summary() == {}
+    data = {"load_shed": 1, "overcast": 0, "switch_state": 0}
+    buf.update(data)
+    result = buf.summary()
+    assert result == data
+    result["load_shed"] = 0
+    assert buf.summary()["load_shed"] == 1
+
+
+def test_build_imagine_caption_reports_load_shedding() -> None:
+    """The /imagine caption summarises the shed state and live readings."""
+    caption = build_imagine_caption(
+        {"battery_soc_pct": 61.4, "total_load_power_w": 7240.0},
+        {"cloudiness_pct": 100.2},
+        {"load_shed": 1},
+    )
+    assert "load shedding active" in caption
+    assert "battery 61 %" in caption
+    assert "load 7,240 W" in caption
+    assert "cloud 100 %" in caption
+
+
+def test_build_imagine_caption_without_data() -> None:
+    """A caption is always produced, even with no telemetry."""
+    caption = build_imagine_caption()
+    assert caption.startswith("Inverter imagination --")
+    assert "no load shedding" in caption
+
+
+def test_build_imagine_caption_uses_ratio_threshold() -> None:
+    """The battery-ration latch forces the shedding wording."""
+    caption = build_imagine_caption(None, None, {"battery_ration": 1})
+    assert "load shedding active" in caption
 
 
 def test_build_bms_summary() -> None:

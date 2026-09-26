@@ -37,6 +37,7 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
   - `bms_frame_process_duration_seconds` — from frame receipt to ZMQ publish
   - `mqtt_publish_duration_seconds` — traceparent injection + client.publish
   - `event_process_duration_seconds` — InfluxDB + OTEL gauge + fan-out per event
+  - `gemini_image_duration_seconds` — Gemini text-to-image round trip for `/imagine`
 - The cadence gauge `inverter_poll_backoff_seconds` is a synchronous Gauge
   holding the current poll backoff applied by the inverter reader (the base
   value after a successful poll, doubled up to 60 s after failures or

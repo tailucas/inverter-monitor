@@ -45,7 +45,13 @@ URL_WORKER_LOAD_MONITOR = "inproc://load-monitor"
 # Points that carry notifications only and are never exported as metrics
 NOTIFICATION_ONLY_POINTS = {"switch_event", "load_alert"}
 # Points forwarded to the Telegram bot fan-out
-TELEGRAM_FANOUT_POINTS = {"battery", "weather", "switch_event", "load_alert"}
+TELEGRAM_FANOUT_POINTS = {
+    "battery",
+    "switches",
+    "weather",
+    "switch_event",
+    "load_alert",
+}
 
 # inverter polling: poll quickly and back off exponentially after failures
 DEFAULT_POLL_BACKOFF_SECONDS = 1.0

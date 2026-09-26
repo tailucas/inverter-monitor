@@ -9,6 +9,7 @@ Pure helper functions and data structures are in `app.telegram_bot`.
 """
 
 import asyncio
+import html
 import queue
 import threading
 from asyncio import AbstractEventLoop
@@ -34,6 +35,19 @@ from telegram.ext import (
     filters,
 )
 
+from app.gemini_image import GeminiImageClient
+from app.image_prompts import (
+    DEFAULT_LOAD_WARNING_W,
+    DEFAULT_SCENES,
+    MAX_PROMPT_TOKENS,
+    ImaginePrompt,
+    SceneConfig,
+    build_image_prompt,
+    estimate_prompt_tokens,
+    find_scene,
+    scene_names,
+    select_scene,
+)
 from app.metrics import (
     BATTERY_QUERIES,
     CELL_QUERIES,
@@ -44,12 +58,14 @@ from app.telegram_bot import (
     DEFAULT_HISTORY_HOURS,
     URL_WORKER_TELEGRAM,
     BmsSummaryBuffer,
+    SwitchStatsBuffer,
     WeatherBuffer,
     _get_telegram_token,
     build_battery_caption,
     build_bms_summary,
     build_cell_recommendation,
     build_history_caption,
+    build_imagine_caption,
     build_notification_message,
     format_status_message,
     render_battery_chart,
@@ -148,6 +164,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"/history [hours] -- power time-series chart\n"
                 f"/battery [hours] -- battery time-series chart\n"
                 f"/cell [hours] -- per-cell voltages and balancing advice\n"
+                f"/imagine [scene] -- picture of the inverter in its mood\n"
                 f"/help -- this message"
             ),
             disable_web_page_preview=True,
@@ -174,10 +191,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 f"/status -- live snapshot: inverter, battery, weather\n"
                 f"/history [hours] \u2014 power time-series chart\n"
                 f"/battery [hours] \u2014 battery time-series chart\n"
-                f"/cell [hours] \u2014 per-cell voltages and balancing advice\n\n"
+                f"/cell [hours] \u2014 per-cell voltages and balancing advice\n"
+                f"/imagine [scene] \u2014 generated picture of the inverter\n\n"
                 f"Examples:\n"
                 f"/history 12 \u2014 last 12 hours\n"
-                f"/history \u2014 default ({DEFAULT_HISTORY_HOURS} hours)"
+                f"/history \u2014 default ({DEFAULT_HISTORY_HOURS} hours)\n"
+                f"/imagine \u2014 a random scene; a wrong scene lists the options"
             ),
             disable_web_page_preview=True,
             parse_mode=ParseMode.MARKDOWN,
@@ -441,6 +460,87 @@ async def cell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /imagine [scene] -- generate a picture of the inverter."""
+    if update.effective_message is None:
+        return ConversationHandler.END
+    user = await validate("imagine", update)
+    if user is None:
+        return ConversationHandler.END
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_message.chat_id,
+            action=ChatAction.TYPING,
+        )
+
+        bot: TelegramBot = context.application.bot_data.get(  # type: ignore[assignment]
+            "telegram_bot"
+        )
+        if bot is None:
+            raise RuntimeError("TelegramBot not registered in bot_data")
+        if bot._image_client is None:
+            await update.effective_message.reply_text(
+                text=(
+                    f"{emoji.emojize(':warning:')} Image generation is not configured."
+                ),
+            )
+            return ConversationHandler.END
+
+        scene = bot.resolve_scene(context.args)
+        if scene is None:
+            available = ", ".join(scene_names(DEFAULT_SCENES))
+            await update.effective_message.reply_text(
+                text=(
+                    f"{emoji.emojize(':warning:')} Unknown scene. Available "
+                    f"scenes: {available}."
+                ),
+            )
+            return ConversationHandler.END
+
+        loop = asyncio.get_running_loop()
+        request = await loop.run_in_executor(None, bot.build_imagine, scene)
+        prompt_tokens = estimate_prompt_tokens(request.prompt)
+        await update.effective_message.reply_html(
+            text=(
+                f"{emoji.emojize(':artist_palette:')} <b>Scene:</b> "
+                f"{scene.name} &middot; {scene.aspect_ratio} &middot; "
+                f"~{prompt_tokens}/{MAX_PROMPT_TOKENS} tokens\n"
+                f"<pre>{html.escape(request.prompt)}</pre>"
+            ),
+        )
+
+        await context.bot.send_chat_action(
+            chat_id=update.effective_message.chat_id,
+            action=ChatAction.TYPING,
+        )
+        image_bytes = await loop.run_in_executor(None, bot.render_imagine, request)
+        await update.effective_message.reply_photo(
+            photo=image_bytes,
+            caption=request.caption,
+        )
+
+        log.info(
+            "Imagine report sent",
+            extra={
+                "user_id": user.id,
+                "scene": scene.name,
+                "model": bot._image_client.model,
+                "aspect_ratio": scene.aspect_ratio,
+                "prompt_chars": len(request.prompt),
+                "prompt_tokens_estimate": prompt_tokens,
+                "image_bytes": len(image_bytes),
+            },
+        )
+    except Exception as exc:
+        log.warning(
+            "Failed to handle imagine command", exc_info=exc, extra={"user_id": user.id}
+        )
+        await update.effective_message.reply_text(
+            text=f"{emoji.emojize(':warning:')} Could not generate image: {exc}"
+        )
+    return ConversationHandler.END
+
+
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Echo user-supplied text verbatim (no parse mode)."""
     if update.effective_message is None or update.effective_message.text is None:
@@ -521,6 +621,23 @@ class TelegramBot(AppThread, Closable):
         self._token = _get_telegram_token(creds_obj)
         self._bms_summary = BmsSummaryBuffer()
         self._weather = WeatherBuffer()
+        self._switch_stats = SwitchStatsBuffer()
+        self._load_warning_w = app_config.getint(
+            "alert_thresholds", "load_warning_w", fallback=DEFAULT_LOAD_WARNING_W
+        )
+        self._load_shed_w = app_config.getint(
+            "alert_thresholds", "load_shed_w", fallback=self._load_warning_w
+        )
+        # image generation is optional: a missing Gemini credential must not
+        # stop the rest of the bot from working
+        self._image_client: GeminiImageClient | None = None
+        try:
+            self._image_client = GeminiImageClient(creds_obj)
+        except Exception:
+            log.warning(
+                "Gemini image generation is unavailable; /imagine is disabled",
+                exc_info=True,
+            )
         self._inverter_query = inverter_query
         self._receiver_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -547,6 +664,8 @@ class TelegramBot(AppThread, Closable):
                     self._bms_summary.update(bms_summary)
                 elif point_name == "weather" and isinstance(point_items, dict):
                     self._weather.update(point_items)
+                elif point_name == "switches" and isinstance(point_items, dict):
+                    self._switch_stats.update(point_items)
                 elif point_name in ("switch_event", "load_alert") and isinstance(
                     point_items, dict
                 ):
@@ -677,6 +796,61 @@ class TelegramBot(AppThread, Closable):
             },
         )
 
+    # -- /imagine helpers ------------------------------------------------------
+
+    def resolve_scene(self, args: list[str] | None) -> SceneConfig | None:
+        """Resolve the requested scene, randomly selecting one when unnamed."""
+        if not args:
+            return select_scene(DEFAULT_SCENES)
+        return find_scene(DEFAULT_SCENES, args[0])
+
+    def build_imagine(self, scene: SceneConfig) -> ImaginePrompt:
+        """Blocking: snapshot telemetry and compose the image prompt."""
+        inverter = None
+        if self._inverter_query is not None:
+            try:
+                inverter = self._inverter_query()
+            except Exception:
+                log.warning("Live inverter query failed for /imagine", exc_info=True)
+        weather = self._weather.summary()
+        switches = self._switch_stats.summary()
+        prompt = build_image_prompt(
+            inverter=inverter,
+            bms=self._bms_summary.summary(),
+            weather=weather,
+            switches=switches,
+            scene=scene,
+            load_warning_w=self._load_warning_w,
+            load_shed_w=self._load_shed_w,
+        )
+        caption = build_imagine_caption(
+            inverter,
+            weather,
+            switches,
+            load_warning_w=self._load_warning_w,
+            load_shed_w=self._load_shed_w,
+        )
+        log.debug(
+            "Composed image prompt",
+            extra={
+                "scene": scene.name,
+                "prompt": prompt,
+                "prompt_chars": len(prompt),
+                "prompt_tokens_estimate": estimate_prompt_tokens(prompt),
+            },
+        )
+        return ImaginePrompt(prompt=prompt, caption=caption, scene=scene)
+
+    def render_imagine(self, request: ImaginePrompt) -> bytes:
+        """Blocking: generate the image for a composed prompt."""
+        if self._image_client is None:
+            raise RuntimeError("image generation is not configured")
+        return self._image_client.generate_image(
+            request.prompt,
+            aspect_ratio=request.scene.aspect_ratio,
+            image_size=request.scene.image_size,
+        )
+
     def run(self) -> None:
         """Start ZMQ receiver, asyncio loop, Telegram bot, and terminator."""
         log.info("Starting Telegram bot listener")
@@ -705,6 +879,7 @@ class TelegramBot(AppThread, Closable):
             CommandHandler("history", history),
             CommandHandler("battery", battery),
             CommandHandler("cell", cell),
+            CommandHandler("imagine", imagine),
         ]
         for handler in command_handlers:
             application.add_handler(handler)

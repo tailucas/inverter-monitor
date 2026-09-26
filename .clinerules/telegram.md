@@ -479,7 +479,9 @@ Rules:
 - Producers emit notification-only payloads: `{"switch_event": {...}}` and
   `{"load_alert": {...}}`. They are never exported as metrics.
 - The receiver also caches the latest `weather` sample (`WeatherBuffer`) so
-  `/status` can show the last cloudiness reading.
+  `/status` can show the last cloudiness reading, and the latest switch-bank
+  stats (`SwitchStatsBuffer`) so `/imagine` can show the active rationing
+  reason.
 - The receiver thread only parses ZMQ payloads and enqueues them; it never
   touches asyncio directly. `_enqueue_notification()` puts the payload on a
   `queue.Queue` and wakes the dispatcher with
@@ -519,11 +521,24 @@ Current commands (registered as simple `CommandHandler`s in `app/bot.py`
 - `/cell [hours]` — per-cell voltages with a balancing recommendation
   (thresholds `CELL_BALANCED_MV` = 30 mV and `CELL_MONITOR_MV` = 80 mV in
   `app/telegram_bot.py`).
+- `/imagine [scene]` — Gemini-generated picture of the inverter's current
+  state. The composed prompt is replied to the user first (HTML `<pre>`
+  block), then the image follows as a photo with a plain-text caption.
+  `SceneConfig` presets (portrait aspect ratio, 1K image size, narrative
+  style/lighting/camera/lens clauses) live in `app/image_prompts.py`; an
+  unnamed command picks a random scene and an unknown name lists the
+  options. Prompts stay inside `MAX_PROMPT_TOKENS`/`MAX_PROMPT_CHARS`, are
+  token-counted by `app/gemini_image.py` before the request, and the
+  client's own error message is relayed verbatim (plain text, never
+  Markdown-parsed).
 
 Conventions:
 
 - Hours arguments parse through the shared `_parse_hours` helper (1–720,
   default `DEFAULT_HISTORY_HOURS`).
+- Image generation also runs in `loop.run_in_executor(...)`, and the
+  `typing` chat action is sent before both the prompt and the image are
+  produced.
 - Prometheus fetch + matplotlib rendering always run in
   `loop.run_in_executor(...)` so the asyncio loop stays responsive.
 - Chart messages are photos with plain-text captions (see §4f); the no-data
