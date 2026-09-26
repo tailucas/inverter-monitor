@@ -9,7 +9,6 @@ Pure helper functions and data structures are in `app.telegram_bot`.
 """
 
 import asyncio
-import html
 import queue
 import threading
 from asyncio import AbstractEventLoop
@@ -66,6 +65,7 @@ from app.telegram_bot import (
     build_cell_recommendation,
     build_history_caption,
     build_imagine_caption,
+    build_imagine_prompt_message,
     build_notification_message,
     format_status_message,
     render_battery_chart,
@@ -501,11 +501,12 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         request = await loop.run_in_executor(None, bot.build_imagine, scene)
         prompt_tokens = estimate_prompt_tokens(request.prompt)
         await update.effective_message.reply_html(
-            text=(
-                f"{emoji.emojize(':artist_palette:')} <b>Scene:</b> "
-                f"{scene.name} &middot; {scene.aspect_ratio} &middot; "
-                f"~{prompt_tokens}/{MAX_PROMPT_TOKENS} tokens\n"
-                f"<pre>{html.escape(request.prompt)}</pre>"
+            text=build_imagine_prompt_message(
+                scene.name,
+                scene.aspect_ratio,
+                request.prompt,
+                prompt_tokens,
+                MAX_PROMPT_TOKENS,
             ),
         )
 

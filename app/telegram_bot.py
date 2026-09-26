@@ -473,6 +473,28 @@ def build_imagine_caption(
     return f"Inverter imagination -- {', '.join(details)}"
 
 
+def build_imagine_prompt_message(
+    scene_name: str,
+    aspect_ratio: str,
+    prompt: str,
+    prompt_tokens: int,
+    max_prompt_tokens: int,
+) -> str:
+    """Build the HTML message that shows the composed /imagine prompt.
+
+    Telegram's HTML parse mode understands only the named entities ``&lt;``,
+    ``&gt;``, ``&amp;`` and ``&quot;``; every other character is sent as
+    itself (the middle dots below are real ``\\u00b7`` characters so they
+    render correctly).
+    """
+    return (
+        f"{emoji.emojize(':artist_palette:')} <b>Scene:</b> "
+        f"{html.escape(scene_name)} \u00b7 {html.escape(aspect_ratio)} \u00b7 "
+        f"~{prompt_tokens}/{max_prompt_tokens} tokens\n"
+        f"<pre>{html.escape(prompt)}</pre>"
+    )
+
+
 # -- cell plot + recommendation (plain-text caption) ---------------------------
 
 # Recommendations are based on the latest observed per-cell delta

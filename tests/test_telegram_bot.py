@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Unit tests for the Telegram bot module — pure functions only."""
 
+import re
 from typing import Any
 
 import pandas as pd
@@ -21,6 +22,7 @@ from app.telegram_bot import (
     build_cell_recommendation,
     build_history_caption,
     build_imagine_caption,
+    build_imagine_prompt_message,
     build_notification_message,
     format_load_recovery_message,
     format_load_warning_message,
@@ -130,6 +132,19 @@ def test_build_imagine_caption_uses_ratio_threshold() -> None:
     """The battery-ration latch forces the shedding wording."""
     caption = build_imagine_caption(None, None, {"battery_ration": 1})
     assert "load shedding active" in caption
+
+
+def test_build_imagine_prompt_message_uses_telegram_html() -> None:
+    """Only Telegram-supported entities appear and the prompt is escaped."""
+    message = build_imagine_prompt_message(
+        "orbital_station", "9:16", "A <b>bold</b> & risky prompt", 350, 480
+    )
+    assert "<b>Scene:</b> orbital_station" in message
+    assert "\u00b7 9:16 \u00b7 ~350/480 tokens" in message
+    assert "<pre>A &lt;b&gt;bold&lt;/b&gt; &amp; risky prompt</pre>" in message
+    assert "&middot;" not in message
+    entities = set(re.findall(r"&[a-zA-Z]+;", message))
+    assert entities <= {"&lt;", "&gt;", "&amp;", "&quot;"}
 
 
 def test_build_bms_summary() -> None:
