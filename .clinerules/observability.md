@@ -23,6 +23,9 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
   `<point_name>_<metric_key>`.
 - **Attributes** are derived from the per-point label set — e.g. `bms_addr`,
   `cell`, etc. — and passed as `attributes={...}` to `gauge.set()`.
+- Notification-only points (`switch_event`, `load_alert`) are fanned out to
+  consumers and never create gauges. The load-shed latch is visible as the
+  `switches_load_shed` gauge via the switch stats point.
 - **Timing gauges** are created at module scope using
   `OTEL_METER.create_gauge(...)` and named with `_duration_seconds` or
   `_seconds` suffixes. Each holds the latest measured duration value,
@@ -37,8 +40,9 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
   tracking the ratio of cycle time to sample interval (> 1.0 = overrun).
 - Log-only metrics (configured via `[metrics] debug_csv`) are discarded after
   debug-logging; they never become OTEL gauges.
-- InfluxDB writes remain feature-flagged (`local-influxdb`) and are written
-  alongside the gauge update.
+- `EventProcessor` has no time-series database writer today: telemetry is
+  exported as OTEL gauges and fanned out to the MQTT/Telegram/load-alert
+  consumers only.
 
 ## Traces
 
@@ -57,6 +61,8 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
   the trace across the messaging boundary.
 - A helper `format_traceparent(span)` constructs the string from the span's
   `SpanContext`.
+- MQTT *control* publishes are change-gated: an unchanged switch state
+  produces no publish, no span, and no `traceparent`.
 
 ## Logs
 
@@ -69,17 +75,22 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
 | Level | Where |
 |---|---|
 | DEBUG | Per-poll/per-sample/frame tracing, gauge updates (including timing data), "Inverter is delivering power to consumers…" supporting data |
-| INFO | Startup/lifecycle events, MQTT publishes (with `traceparent` in `extra`), PagerDuty triggers & resolves, recoverable warnings (socket timeouts, implausible samples, PD trigger/resolve failures, InfluxDB write failures) |
-| WARNING | PagerDuty client not configured, missing switch-bank config, reader disabled at startup |
+| INFO | Startup/lifecycle events, MQTT publishes (with `traceparent` in `extra`), switch-bank notifications, load warning/recovery events, PagerDuty triggers & resolves, recoverable warnings (socket timeouts, implausible samples, PD trigger/resolve failures) |
+| WARNING | PagerDuty client not configured, missing switch-bank config, reader or Telegram bot disabled at startup |
 | ERROR | Lost connections (serial, MQTT), unreadable mappings |
 | CRITICAL | Reserved |
 
 ## PagerDuty Lifecycle
 
-- Two dedup-key classes: `bms_heartbeat` (data-loss timeout) and `bms_count`
-  (minimum BMS count violation).
-- Alert state is **seeded as triggered at startup** so any previously-open
-  incidents auto-resolve on first data.
+- Three dedup-key classes: `bms_heartbeat` (data-loss timeout), `bms_count`
+  (minimum BMS count violation), and `load_high` (overall load above the
+  critical threshold).
+- `load_high` trips on a single sample above `load_critical_w` and resolves
+  after the load has held at or below it for `load_critical_resolve_seconds`.
+  It is seeded stale-pending at startup so a previously-open incident
+  auto-resolves, while a high sample at startup still raises the incident.
+- Alert state is **seeded at startup** so any previously-open incidents
+  auto-resolve on first data.
 - Trigger and resolve calls log the `dedup_key` as a structured field.
 - Trigger/resolve *failures* log at INFO (recoverable via retry); only
   "client not configured" messages stay at WARNING.
@@ -89,3 +100,6 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
 - `tailucas_pylib.tracing.shutdown()` is called in the `finally` block of
   `main()` (via `die()` → `zmq_term()` currently; ensure OTEL providers are
   flushed before exit).
+- ZMQ consumers close their sockets in a `finally` block (`try_close`), and
+  the Telegram notification dispatcher task is cancelled by the bot's PTB
+  `post_stop` hook.

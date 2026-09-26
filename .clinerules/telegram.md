@@ -7,7 +7,7 @@ paths:
 
 # Python Telegram Bot & asyncio Project Conventions
 
-This project follows the `tailucas_pylib` framework pattern used across multiple Telegram bot implementations (e.g., `net-tool`, `investec-my-charges`). All new bot implementations MUST adhere to these conventions.
+This project follows the `tailucas_pylib` framework pattern used across multiple Telegram bot implementations (e.g., `net-tool`, `investec-my-charges`), adapted to this app's multi-threaded architecture (Section 1). All new bot code MUST adhere to these conventions.
 
 > **Logging:** all logging in this project is structured (static message +
 > `extra` fields). Interpolated log messages are banned — see
@@ -15,48 +15,32 @@ This project follows the `tailucas_pylib` framework pattern used across multiple
 
 ---
 
-## 1. Project Entry Point (`app/__main__.py`)
+## 1. Application Integration (`app/__main__.py` + `app/bot.py`)
 
-### Mandatory Boot Sequence
+Telegram support runs as an `AppThread` alongside the other workers — there
+is no standalone bot process and no database bootstrap. In `main()`:
 
-Every `main()` function must follow this exact order:
+1. Validate credentials (`Creds().validate_creds()`) and reduce Sentry noise
+   (`ignore_logger` on `telegram.ext.Updater`, `telegram.ext._updater`,
+   `asyncio`).
+2. Load configuration, field mappings, and telemetry clients before starting
+   any thread.
+3. Build `TelegramBot(creds_obj=..., inverter_query=logger_reader.query_now)`
+   only when `is_flag_enabled("telegram-bot")`; otherwise log a structured
+   WARNING that the bot is disabled.
+4. Start the `AppThread`s in dependency order (EventProcessor first, then the
+   load alert monitor, readers, MQTT subscriber, Telegram bot), then the
+   nanny; park in `threads.interruptable_sleep.wait()` and shut down through
+   `die()` / `tracing.shutdown()` / `zmq_term()` / `bye()`.
 
-```python
-def main() -> None:
-    # 1. Validate credentials FIRST
-    creds = Creds()
-    creds.validate_creds()
+`TelegramBot` (`app/bot.py`) owns:
 
-    # 2. Reduce Sentry noise immediately
-    ignore_logger("telegram.ext.Updater")
-    ignore_logger("telegram.ext._updater")
-    ignore_logger("asyncio")
-
-    # 3. Set log level to DEBUG
-    log.setLevel(logging.DEBUG)
-
-    # 4. Init database as first async operation
-    asyncio.run(db_startup())
-
-    # 5. Extract credentials from cred store BEFORE event loop
-    # (Pull all needed creds into local variables)
-
-    # 6. Configure metrics/subsystems BEFORE Application
-    metrics_configure(url=..., user=..., token=...)
-
-    # 7. Build and configure Application
-    application = Application.builder().token(...).build()
-    # register handlers, add error handler
-
-    # 8. Run polling inside try/finally
-    try:
-        application.run_polling()
-    except TimedOut:
-        log.warning("Telegram client error.", exc_info=True)
-    finally:
-        die()
-    bye()
-```
+- a PULL socket bound to `inproc://telegram` (`URL_WORKER_TELEGRAM`) consumed
+  by a background receiver thread, shared with the `EventProcessor` and
+  `LoadAlertMonitor` fan-outs;
+- its own `asyncio` event loop, `Application`, and a `terminator` thread that
+  waits on `threads.interruptable_sleep` and stops the loop (see below);
+- the bot token from `Creds` (`Telegram/<APP_NAME>/token`).
 
 ### Graceful Shutdown
 
@@ -196,7 +180,12 @@ from telegram.ext import (
 
 ## 3. ConversationHandler: Multi-Step Dialogs
 
-Multi-step dialogs (e.g., settings forms, confirmation flows) use `ConversationHandler` with `CallbackQueryHandler` fallbacks for inline button interactions. **Getting the wiring wrong silently breaks all button interactions inside the conversation.** This section captures the three interacting parts: action constants, the bot-side dialog logic, and the main-side wiring.
+> **Conditional:** only relevant when a dialog is added. The current bot
+> registers plain `CommandHandler`s plus an echo `MessageHandler`;
+> `ConversationHandler` exists only as the `END` sentinel. Wire any dialog in
+> `app/bot.py` `run()`, not in `app/__main__.py`.
+
+Multi-step dialogs (e.g., settings forms, confirmation flows) use `ConversationHandler` with `CallbackQueryHandler` fallbacks for inline button interactions. **Getting the wiring wrong silently breaks all button interactions inside the conversation.** This section captures the three interacting parts: action constants, the bot-side dialog logic, and the wiring.
 
 ### 3a. Integer Action Constants
 
@@ -213,7 +202,7 @@ ACTION_SETTINGS_PAY_DAY = 21
 ACTION_SETTINGS_RESET = 23
 ```
 
-### 3b. Conversation Wiring Pattern (in `__main__.py`)
+### 3b. Conversation Wiring Pattern (in `app/bot.py` `run()`)
 
 The `ConversationHandler` must be constructed with `fallbacks` that include **all** `CallbackQueryHandler` instances that can fire from buttons within the conversation. The `ConversationHandler` itself must be registered **before** the individual `command_handlers`.
 
@@ -355,6 +344,9 @@ Reference implementation: `investec-my-charges` `app/bot.py` (see `validate`, `c
 | Echo of user-supplied text | `reply_text(update.message.text)` | none — **never parse user input** |
 | Rejection of invalid user input | `reply_markdown(text=..., reply_to_message_id=update.message.id)` | `MARKDOWN` |
 
+See **Section 5** for the fan-out/dispatcher mechanics behind bot-initiated
+messages.
+
 ### 4b. Rule 1 — Default to Markdown via Explicit `parse_mode`
 
 The usual case for a user-facing reply (from `validate`):
@@ -464,3 +456,47 @@ await update.message.reply_text(text=user_text, parse_mode=ParseMode.MARKDOWN)
 # BANNED: keyboard attached to a Markdown/plain send — use reply_html
 await update.message.reply_markdown(text=text, reply_markup=reply_markup)
 ```
+
+---
+
+## 5. Bot-Initiated Notifications (Fan-Out)
+
+The bot also pushes unsolicited alerts to every allowlisted chat:
+
+```
+app/__main__.py producers              app/bot.py consumer
+MqttSubscriber (switch_event) ─┐
+                               ├─ ZMQ PUSH ─▶ PULL (inproc://telegram)
+LoadAlertMonitor (load_alert) ─┘                 │ receiver thread
+                                                 ▼
+                                       queue.Queue (thread-safe)
+                                                 ▼
+                    asyncio dispatcher (post_init) ─▶ bot.send_message
+```
+
+Rules:
+
+- Producers emit notification-only payloads: `{"switch_event": {...}}` and
+  `{"load_alert": {...}}`. They are never exported as metrics.
+- The receiver thread only parses ZMQ payloads and enqueues them; it never
+  touches asyncio directly. `_enqueue_notification()` puts the payload on a
+  `queue.Queue` and wakes the dispatcher with
+  `loop.call_soon_threadsafe(event.set)`.
+- The dispatcher task is created in PTB's `post_init` (after `initialize()`,
+  before polling starts) with `asyncio.create_task` — `Application.create_task`
+  would not await it because the application is not yet `running`. It drains
+  the queue and sends to every `enabled_users_csv` user with
+  `application.bot.send_message(chat_id=..., text=..., parse_mode=ParseMode.HTML)`,
+  and is cancelled in PTB's `post_stop`.
+- Notifications received before PTB is initialized are buffered in the queue
+  and drained on start; a missed wake-up is recovered by the drain loop's
+  periodic timeout.
+- Message text is built by pure HTML formatters in `app/telegram_bot.py`
+  (`build_notification_message`, `format_switch_event_message`,
+  `format_load_warning_message`, `format_load_recovery_message`). Escape
+  external strings with `html.escape`; never compose messages in the
+  dispatcher.
+- A formatter or per-user send failure must never kill the dispatcher: log it
+  (structured fields only) and continue with the remaining users.
+- Log only structured fields (`kind`, `reason`, `switch_banks`,
+  `recipient_count`); never log the rendered message body.

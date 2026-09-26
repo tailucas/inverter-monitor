@@ -57,11 +57,11 @@ log.info(message.format("RabbitMQ control"))                    # .format()
    (`header_bytes`, `frame_hex`, `control_code`, `response_bytes`) so failures
    are debuggable from logs alone.
 4. **PagerDuty lifecycle** logs always carry `dedup_key`; trigger/resolve
-   failures are INFO (recoverable — retried on next cycle); "client not
-   configured" messages stay WARNING.
+   failures are INFO (recoverable — retried on the next sample cycle);
+   "client not configured" messages stay WARNING.
 5. **No secrets** in logs (API keys, tokens, passwords).
-6. **Hot loops:** sample chatty debug logs (see the `randint(0, 1000)`
-   guards in the ADC sampling loop) and gate expensive field construction on
+6. **Hot loops:** sample chatty per-sample debug logs, and gate expensive
+   field construction (e.g. `inverter_supporting_fields`) on
    `log.level == logging.DEBUG`.
 7. **MQTT traceparent injection:** Every MQTT publish is wrapped in an OTEL
    span (`mqtt.publish`, `SpanKind.PRODUCER`). The generated traceparent is
@@ -82,13 +82,17 @@ log.info(message.format("RabbitMQ control"))                    # .format()
 
 8. **Tests** must assert on structured fields (`caplog.records` attributes) or
    static message text, never interpolated content.
+9. **Bot notifications:** log only structured fields (`kind`, `reason`,
+   `switch_banks`, `recipient_count`); never log the rendered user-facing
+   message. Message composition belongs to the pure formatters in
+   `app/telegram_bot.py`.
 
 ## Levels
 
 | Level | Use here |
 |---|---|
 | DEBUG | per-sample/chunk/frame tracing, gauge updates, "Inverter is delivering power to consumers from backup…" supporting data (always, not conditional) |
-| INFO | reader lifecycle, switch state changes, MQTT publishes, PagerDuty triggers & resolves, startup, recoverable warnings (timeouts, implausible samples, PD trigger/resolve failures, InfluxDB write failures) |
-| WARNING | non-recoverable config gaps (PagerDuty client not configured, missing switch-bank config, reader disabled) |
+| INFO | reader lifecycle, switch state changes and switch-bank notifications, load warning/recovery events, MQTT publishes, PagerDuty triggers & resolves, startup, recoverable warnings (timeouts, implausible samples, PD trigger/resolve failures) |
+| WARNING | non-recoverable config gaps (PagerDuty client not configured, missing switch-bank config, reader or Telegram bot disabled) |
 | ERROR | lost connections (serial, MQTT), unreadable mappings |
 | CRITICAL | reserved |

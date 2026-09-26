@@ -737,12 +737,12 @@ class BmsReader(AppThread):
                                     severity="warning",
                                 )
                                 self.pd_alert_triggered = True
-                                log.warning(
+                                log.info(
                                     "PagerDuty alert triggered for BMS data loss",
                                     extra={"dedup_key": self.pd_dedup_key},
                                 )
                             except Exception:
-                                log.warning("PagerDuty trigger failed.", exc_info=True)
+                                log.info("PagerDuty trigger failed.", exc_info=True)
                         else:
                             log.warning(
                                 "PagerDuty not configured; cannot trigger"
@@ -789,9 +789,12 @@ class BmsReader(AppThread):
                                     dedup_key=self.pd_dedup_key,
                                 )
                             self.pd_alert_triggered = False
-                            log.info("PagerDuty heartbeat incident resolved.")
+                            log.info(
+                                "PagerDuty heartbeat incident resolved.",
+                                extra={"dedup_key": self.pd_dedup_key},
+                            )
                         except Exception:
-                            log.warning(
+                            log.info(
                                 "PagerDuty heartbeat resolve failed.", exc_info=True
                             )
                     else:
@@ -809,11 +812,10 @@ class BmsReader(AppThread):
                             self.pd_count_alert_triggered = False
                             log.info(
                                 "PagerDuty count incident resolved (data restored).",
+                                extra={"dedup_key": self.pd_count_dedup_key},
                             )
                         except Exception:
-                            log.warning(
-                                "PagerDuty count resolve failed.", exc_info=True
-                            )
+                            log.info("PagerDuty count resolve failed.", exc_info=True)
 
                 # Log newly detected packs
                 if addr not in seen_addresses:
@@ -900,14 +902,12 @@ class BmsReader(AppThread):
                                 severity="warning",
                             )
                             self.pd_count_alert_triggered = True
-                            log.warning(
+                            log.info(
                                 "PagerDuty alert triggered for low BMS count",
                                 extra={"dedup_key": self.pd_count_dedup_key},
                             )
                         except Exception:
-                            log.warning(
-                                "PagerDuty count trigger failed.", exc_info=True
-                            )
+                            log.info("PagerDuty count trigger failed.", exc_info=True)
                     else:
                         log.warning(
                             "PagerDuty not configured; cannot trigger"
@@ -924,11 +924,12 @@ class BmsReader(AppThread):
                                     dedup_key=self.pd_count_dedup_key,
                                 )
                             self.pd_count_alert_triggered = False
-                            log.info("PagerDuty count incident resolved.")
-                        except Exception:
-                            log.warning(
-                                "PagerDuty count resolve failed.", exc_info=True
+                            log.info(
+                                "PagerDuty count incident resolved.",
+                                extra={"dedup_key": self.pd_count_dedup_key},
                             )
+                        except Exception:
+                            log.info("PagerDuty count resolve failed.", exc_info=True)
                     else:
                         log.warning(
                             "PagerDuty not configured; cannot resolve"
