@@ -118,7 +118,7 @@ def test_build_imagine_caption_reports_load_shedding() -> None:
     assert "load shedding active" in caption
     assert "battery 61 %" in caption
     assert "load 7,240 W" in caption
-    assert "cloud 100 %" in caption
+    assert "cloud cover 100 %" in caption
 
 
 def test_build_imagine_caption_without_data() -> None:

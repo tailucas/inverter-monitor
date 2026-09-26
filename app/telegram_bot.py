@@ -469,7 +469,7 @@ def build_imagine_caption(
         details.append(f"load {load_w:,.0f} W")
     cloudiness_pct = numeric_value(weather.get("cloudiness_pct"))
     if cloudiness_pct is not None:
-        details.append(f"cloud {cloudiness_pct:.0f} %")
+        details.append(f"cloud cover {cloudiness_pct:.0f} %")
     return f"Inverter imagination -- {', '.join(details)}"
 
 
