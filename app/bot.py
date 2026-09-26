@@ -9,6 +9,7 @@ Pure helper functions and data structures are in `app.telegram_bot`.
 """
 
 import asyncio
+import queue
 import threading
 from asyncio import AbstractEventLoop
 from collections.abc import Callable
@@ -45,6 +46,7 @@ from app.telegram_bot import (
     _get_telegram_token,
     build_bms_summary,
     build_history_caption,
+    build_notification_message,
     format_status_message,
     render_battery_chart,
     render_power_chart,
@@ -402,6 +404,10 @@ class TelegramBot(AppThread, Closable):
         self._inverter_query = inverter_query
         self._receiver_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._application: Application | None = None
+        self._notify_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._notify_event: asyncio.Event | None = None
+        self._notify_task: asyncio.Task | None = None
 
     def _receiver(self) -> None:
         """Background thread: bind PULL socket and ingest telemetry events."""
@@ -419,11 +425,135 @@ class TelegramBot(AppThread, Closable):
                 if point_name == "battery" and isinstance(point_items, list):
                     bms_summary = build_bms_summary(point_items)
                     self._bms_summary.update(bms_summary)
+                elif point_name in ("switch_event", "load_alert") and isinstance(
+                    point_items, dict
+                ):
+                    self._enqueue_notification({point_name: point_items})
         log.info("Telegram receiver thread finished")
         try:
             pull_socket.close()
         except Exception:
             pass
+
+    # -- notification dispatch (bot-initiated messages) -----------------------
+
+    def _enqueue_notification(self, payload: dict[str, Any]) -> None:
+        """Queue a notification and wake the asyncio dispatcher, if ready."""
+        self._notify_queue.put(payload)
+        loop = self._loop
+        notify_event = self._notify_event
+        if loop is not None and notify_event is not None:
+            try:
+                loop.call_soon_threadsafe(notify_event.set)
+            except RuntimeError:
+                # the event loop is already shutting down
+                pass
+
+    async def _post_init(self, application: Application) -> None:
+        """Start the notification dispatcher once PTB is initialized."""
+        self._application = application
+        self._loop = asyncio.get_running_loop()
+        self._notify_event = asyncio.Event()
+        self._notify_task = asyncio.create_task(
+            self._drain_notifications(), name="telegram-notifications"
+        )
+        # drain anything queued before initialization
+        self._notify_event.set()
+        log.info("Telegram notification dispatcher started")
+
+    async def _post_stop(self, application: Application) -> None:
+        """Cancel the notification dispatcher during shutdown."""
+        task = self._notify_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        log.info("Telegram notification dispatcher stopped")
+
+    async def _drain_notifications(self) -> None:
+        """Send queued notifications to allowlisted users."""
+        while not threads.shutting_down:
+            notify_event = self._notify_event
+            if notify_event is None:
+                return
+            try:
+                await asyncio.wait_for(notify_event.wait(), timeout=5)
+            except TimeoutError:
+                # fall through: drain anything queued without a wake-up
+                pass
+            notify_event.clear()
+            while True:
+                try:
+                    payload = self._notify_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    await self._send_notification(payload)
+                except Exception:
+                    log.warning(
+                        "Notification dispatch failed",
+                        exc_info=True,
+                        extra={"payload_keys": sorted(payload.keys())},
+                    )
+
+    async def _send_notification(self, payload: dict[str, Any]) -> None:
+        """Send one notification message to every allowlisted user."""
+        application = self._application
+        payload_keys = sorted(payload.keys())
+        if application is None:
+            log.warning(
+                "Telegram application is not ready; dropping notification",
+                extra={"payload_keys": payload_keys},
+            )
+            return
+        text = None
+        try:
+            text = build_notification_message(payload)
+        except Exception:
+            log.warning(
+                "Failed to format notification",
+                exc_info=True,
+                extra={"payload_keys": payload_keys},
+            )
+            return
+        if text is None:
+            log.warning(
+                "Unsupported notification payload",
+                extra={"payload_keys": payload_keys},
+            )
+            return
+        recipient_count = 0
+        for user_id in app_config.get("telegram", "enabled_users_csv").split(","):
+            try:
+                chat_id = int(user_id)
+            except ValueError:
+                log.warning(
+                    "Ignoring non-numeric Telegram user id",
+                    extra={"user_id": user_id},
+                )
+                continue
+            try:
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                )
+                recipient_count += 1
+            except Exception as exc:
+                log.warning(
+                    "Failed to send Telegram notification",
+                    exc_info=exc,
+                    extra={"user_id": user_id, "payload_keys": payload_keys},
+                )
+        log.info(
+            "Telegram notification dispatched",
+            extra={
+                "recipient_count": recipient_count,
+                "payload_keys": payload_keys,
+            },
+        )
 
     def run(self) -> None:
         """Start ZMQ receiver, asyncio loop, Telegram bot, and terminator."""
@@ -437,7 +567,13 @@ class TelegramBot(AppThread, Closable):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
-        application = Application.builder().token(self._token).build()
+        application = (
+            Application.builder()
+            .token(self._token)
+            .post_init(self._post_init)
+            .post_stop(self._post_stop)
+            .build()
+        )
         application.bot_data["telegram_bot"] = self
 
         command_handlers = [

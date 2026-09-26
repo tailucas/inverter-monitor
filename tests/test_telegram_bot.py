@@ -16,7 +16,11 @@ from app.telegram_bot import (
     BmsSummaryBuffer,
     build_bms_summary,
     build_history_caption,
+    build_notification_message,
+    format_load_recovery_message,
+    format_load_warning_message,
     format_status_message,
+    format_switch_event_message,
     render_battery_chart,
     render_power_chart,
 )
@@ -270,6 +274,111 @@ def test_build_history_caption_empty() -> None:
     caption = build_history_caption(pd.DataFrame(), pd.DataFrame(), hours=12)
     assert "History" in caption
     assert "12 h" in caption
+
+
+def test_format_switch_event_message_shed() -> None:
+    """Switch event formatter renders the action, reason and supporting data."""
+    msg = format_switch_event_message(
+        {
+            "switch_banks": ["bank1"],
+            "state": 0,
+            "reason": "load_shed",
+            "load_w": 7240.0,
+            "battery_power_w": 2900.0,
+            "pv_power_w": 4200.0,
+            "grid_voltage_v": 0.0,
+            "battery_soc_pct": 61.0,
+        }
+    )
+    assert "Switch bank shed (OFF)" in msg
+    assert "high load (load shed)" in msg
+    assert "7,240 W" in msg
+    assert "61 %" in msg
+
+
+def test_format_switch_event_message_restore() -> None:
+    """Switch event formatter renders a restore with multiple banks."""
+    msg = format_switch_event_message(
+        {"switch_banks": ["bank1", "bank2"], "state": 1, "reason": "all_clear"}
+    )
+    assert "Switch bank restored (ON)" in msg
+    assert "conditions normal" in msg
+    assert "<code>bank1</code>, <code>bank2</code>" in msg
+
+
+def test_format_switch_event_message_escapes_bank_name() -> None:
+    """Bank names from MQTT topics are HTML-escaped in the notification."""
+    msg = format_switch_event_message(
+        {"switch_banks": ["<b>evil</b>"], "state": 0, "reason": "load_shed"}
+    )
+    assert "&lt;b&gt;evil&lt;/b&gt;" in msg
+    assert "<b>evil</b>" not in msg
+
+
+def test_format_load_warning_message() -> None:
+    """Load warning formatter renders the load, threshold and details."""
+    msg = format_load_warning_message(
+        {
+            "kind": "load_warning",
+            "load_w": 7240.0,
+            "threshold_w": 7000.0,
+            "cooldown_secs": 600.0,
+            "battery_soc_pct": 61.0,
+            "battery_power_w": 2900.0,
+            "pv_power_w": 4200.0,
+            "grid_voltage_v": 0.0,
+        }
+    )
+    assert "Load warning" in msg
+    assert "7,240 W" in msg
+    assert "7,000 W" in msg
+    assert "SoC: <code>61 %</code>" in msg
+
+
+def test_format_load_recovery_message() -> None:
+    """Load recovery formatter reports the cooldown-aligned release."""
+    msg = format_load_recovery_message(
+        {
+            "kind": "load_recovery",
+            "load_w": 6400.0,
+            "threshold_w": 7000.0,
+            "cooldown_secs": 600.0,
+        }
+    )
+    assert "Load recovered" in msg
+    assert "600 s" in msg
+    assert "load-shed released" in msg
+
+
+def test_build_notification_message_dispatch() -> None:
+    """The dispatcher routes notification payloads and rejects others."""
+    warning = build_notification_message(
+        {
+            "load_alert": {
+                "kind": "load_warning",
+                "load_w": 7240.0,
+                "threshold_w": 7000.0,
+            }
+        }
+    )
+    assert warning is not None
+    assert "Load warning" in warning
+
+    switch = build_notification_message(
+        {
+            "switch_event": {
+                "switch_banks": ["bank1"],
+                "state": 0,
+                "reason": "load_shed",
+            }
+        }
+    )
+    assert switch is not None
+    assert "Switch bank shed (OFF)" in switch
+
+    assert build_notification_message({}) is None
+    assert build_notification_message({"battery": []}) is None
+    assert build_notification_message({"load_alert": {"kind": "other"}}) is None
 
 
 if __name__ == "__main__":

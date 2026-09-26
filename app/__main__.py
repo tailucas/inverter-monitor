@@ -28,9 +28,10 @@ from tailucas_pylib.flags import is_flag_enabled
 from tailucas_pylib.handler import exception_handler
 from tailucas_pylib.process import SignalHandler
 from tailucas_pylib.threads import bye, die, thread_nanny
-from tailucas_pylib.zmq import URL_WORKER_APP, Closable, zmq_term
+from tailucas_pylib.zmq import URL_WORKER_APP, Closable, try_close, zmq_socket, zmq_term
 from zmq.error import ContextTerminated, ZMQError
 
+from app.load_alerts import LoadAlertEvaluator, LoadShedLatch
 from app.metrics import configure as metrics_configure
 from app.serial_reader import SerialPortReader
 from app.single_flight import SingleFlight
@@ -40,6 +41,12 @@ creds: Creds | None = None
 debug_metrics = app_config.get("metrics", "debug_csv").split(",")
 
 URL_WORKER_MQTT_PUBLISH = "inproc://mqtt-publish"
+URL_WORKER_LOAD_MONITOR = "inproc://load-monitor"
+
+# Points that carry notifications only and are never exported as metrics
+NOTIFICATION_ONLY_POINTS = {"switch_event", "load_alert"}
+# Points forwarded to the Telegram bot fan-out
+TELEGRAM_FANOUT_POINTS = {"battery", "switch_event", "load_alert"}
 
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 60
 ERROR_RETRY_INTERVAL_SECONDS = 5
@@ -51,6 +58,13 @@ BATTERY_CRITICAL_PCT = 40
 BATTERY_MAJOR_DRAW_W = 500
 # BMS serial data loss timeout
 BMS_DATA_LOSS_TIMEOUT = 600
+# overall-load alerting defaults (optional [alert_thresholds] overrides)
+DEFAULT_LOAD_WARNING_W = 7000
+DEFAULT_LOAD_CRITICAL_W = 7500
+DEFAULT_LOAD_CRITICAL_RESOLVE_SECONDS = 60
+DEFAULT_LOAD_SHED_COOLDOWN_SECONDS = 600
+# PagerDuty dedup key for the high-load incident class
+PD_LOAD_DEDUP_KEY = "load_high"
 
 # OpenTelemetry meter and tracer (module-level, shared across all threads)
 OTEL_METER = metrics.get_meter(APP_NAME)
@@ -101,6 +115,37 @@ def twos_complement_hex(hexval):
     if val & (1 << (bits - 1)):
         val -= 1 << bits
     return val
+
+
+def numeric_field(value: object) -> float | None:
+    """Coerce a telemetry value to a rounded float, or None if unusable."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return round(float(value), 2)
+
+
+def inverter_supporting_fields(inverter_data: dict) -> dict:
+    """Extract load/battery/PV/grid values for alert detail payloads."""
+    pv1 = numeric_field(inverter_data.get("pv1_power_w"))
+    pv2 = numeric_field(inverter_data.get("pv2_power_w"))
+    l1 = numeric_field(inverter_data.get("inverter_l1_power_w"))
+    l2 = numeric_field(inverter_data.get("inverter_l2_power_w"))
+    g1 = numeric_field(inverter_data.get("grid_voltage_l1_v"))
+    g2 = numeric_field(inverter_data.get("grid_voltage_l2_v"))
+    return {
+        "load_w": numeric_field(inverter_data.get("total_load_power_w")),
+        "battery_soc_pct": numeric_field(inverter_data.get("battery_soc_pct")),
+        "battery_power_w": numeric_field(inverter_data.get("battery_power_w")),
+        "pv_power_w": (
+            round(pv1 + pv2, 2) if pv1 is not None and pv2 is not None else None
+        ),
+        "inverter_power_w": (
+            round(l1 + l2, 2) if l1 is not None and l2 is not None else None
+        ),
+        "grid_voltage_v": (
+            round(max(g1, g2), 2) if g1 is not None and g2 is not None else None
+        ),
+    }
 
 
 class LoggerReader(AppThread):
@@ -411,9 +456,7 @@ class LoggerReader(AppThread):
                 # stop for the remainder of the sampling interval
                 operation_time = time.time() - operation_start_time
                 INVERTER_CYCLE_DURATION.set(operation_time)
-                INVERTER_CADENCE_RATIO.set(
-                    operation_time / self.sample_interval_secs
-                )
+                INVERTER_CADENCE_RATIO.set(operation_time / self.sample_interval_secs)
                 sample_delay = self.sample_interval_secs - operation_time
                 if sample_delay < 0:
                     normalized_sample_delay = min(
@@ -912,6 +955,21 @@ class MqttSubscriber(AppThread, Closable):
 
         self._power_generation_history: deque[float] = deque(maxlen=5)
 
+        load_warning_w = app_config.getint(
+            "alert_thresholds", "load_warning_w", fallback=DEFAULT_LOAD_WARNING_W
+        )
+        self._load_shed_w = app_config.getint(
+            "alert_thresholds", "load_shed_w", fallback=load_warning_w
+        )
+        self._load_shed_latch = LoadShedLatch(
+            threshold_w=self._load_shed_w,
+            cooldown_secs=app_config.getint(
+                "alert_thresholds",
+                "load_shed_cooldown_seconds",
+                fallback=DEFAULT_LOAD_SHED_COOLDOWN_SECONDS,
+            ),
+        )
+
     def close(self):
         Closable.close(self)
         try:
@@ -972,6 +1030,8 @@ class MqttSubscriber(AppThread, Closable):
             self._switch_state[switch_bank] = new_state
 
     def set_switch_state(self, switch_state=1):
+        """Set every configured bank and return the banks that changed."""
+        changed_banks = []
         for switch_bank in self._switch_state.keys():
             if switch_bank not in self._mqtt_switch_devices:
                 log.warning(
@@ -1023,6 +1083,40 @@ class MqttSubscriber(AppThread, Closable):
                 )
                 _mqtt_publish_duration = time.time() - _mqtt_publish_start
                 MQTT_PUBLISH_DURATION.set(_mqtt_publish_duration)
+            changed_banks.append(switch_bank)
+        return changed_banks
+
+    def _notify_switch_change(
+        self,
+        app_socket,
+        changed_banks,
+        switch_state,
+        reason,
+        inverter_data,
+        now,
+    ):
+        """Fan out a switch-bank notification for the Telegram bot."""
+        if not changed_banks:
+            return
+        event = {
+            "switch_banks": list(changed_banks),
+            "state": int(switch_state),
+            "reason": reason,
+            "timestamp": round(now, 3),
+        }
+        supporting = inverter_supporting_fields(inverter_data)
+        event.update(
+            {key: value for key, value in supporting.items() if value is not None}
+        )
+        app_socket.send_pyobj({"switch_event": event})
+        log.info(
+            "Switch bank notification queued",
+            extra={
+                "switch_banks": list(changed_banks),
+                "switch_state": switch_state,
+                "reason": reason,
+            },
+        )
 
     def get_power_generation_avg(self, value):
         self._power_generation_history.append(value)
@@ -1078,11 +1172,43 @@ class MqttSubscriber(AppThread, Closable):
                 ):
                     continue
                 switch_state = 1
+                switch_stats["load_shed"] = 0
                 switch_stats["surplus_ration"] = 0
                 switch_stats["battery_ration"] = 0
-                if int(inverter_data["alert"]) == 1:
-                    # do not load shed during an alert condition
-                    self.set_switch_state()
+                now = time.time()
+                load_field = inverter_data.get("total_load_power_w")
+                if isinstance(load_field, bool) or not isinstance(
+                    load_field, (int, float)
+                ):
+                    load_shed_active = self._load_shed_latch.active
+                    log.debug(
+                        "Load value missing; retaining load-shed state",
+                        extra={
+                            "load_value": repr(load_field),
+                            "load_shed": int(load_shed_active),
+                        },
+                    )
+                else:
+                    load_shed_active = self._load_shed_latch.update(
+                        float(load_field), now
+                    )
+                # check 0 (top priority): overall load shedding with cooldown
+                if load_shed_active:
+                    switch_state = 0
+                    switch_stats["load_shed"] = 1
+                if int(inverter_data["alert"]) == 1 and not load_shed_active:
+                    # do not load shed during an alert condition; a latched
+                    # high-load condition takes priority over this guard
+                    changed_banks = self.set_switch_state()
+                    self._notify_switch_change(
+                        app_socket=app_socket,
+                        changed_banks=changed_banks,
+                        switch_state=1,
+                        reason="alert_restore",
+                        inverter_data=inverter_data,
+                        now=now,
+                    )
+                    app_socket.send_pyobj({"switches": switch_stats})
                     continue
                 # check 1: calculate surplus as a function of PV reported *usage*
                 # and how much the batteries are supplying
@@ -1137,11 +1263,28 @@ class MqttSubscriber(AppThread, Closable):
                     "battery_power_w": round(battery_power_w, 2),
                     "battery_soc_pct": battery_soc_pct,
                     "grid_voltage_v": grid_voltage,
+                    "load_w": numeric_field(load_field),
+                    "load_shed": switch_stats["load_shed"],
                     "switch_state": switch_state,
                 }
                 log.debug(log_msg, extra=log_fields)
+                reason = "all_clear"
+                if switch_stats["load_shed"]:
+                    reason = "load_shed"
+                elif switch_stats["surplus_ration"]:
+                    reason = "surplus_ration"
+                elif switch_stats["battery_ration"]:
+                    reason = "battery_ration"
                 # update switches
-                self.set_switch_state(switch_state=switch_state)
+                changed_banks = self.set_switch_state(switch_state=switch_state)
+                self._notify_switch_change(
+                    app_socket=app_socket,
+                    changed_banks=changed_banks,
+                    switch_state=switch_state,
+                    reason=reason,
+                    inverter_data=inverter_data,
+                    now=now,
+                )
                 # post stats
                 switch_stats["switch_state"] = switch_state
                 app_socket.send_pyobj({"switches": switch_stats})
@@ -1177,6 +1320,216 @@ class MqttSubscriber(AppThread, Closable):
         self.close()
 
 
+class LoadAlertMonitor(AppThread, Closable):
+    """Evaluate overall-load samples for Telegram warnings and PagerDuty.
+
+    Consumes every inverter sample fanned out by EventProcessor and:
+    - warns over Telegram once per upward crossing of the warning threshold
+      and confirms recovery once the load has held below it for the shed
+      cooldown (the same clock as the switch load-shed release);
+    - triggers a PagerDuty incident on a single sample above the critical
+      threshold and resolves it after the load has held below it for the
+      resolve window.
+    """
+
+    def __init__(self, telegram_enabled=False):
+        AppThread.__init__(self, name=self.__class__.__name__)
+        Closable.__init__(self, connect_url=URL_WORKER_LOAD_MONITOR)
+        self._telegram_enabled = telegram_enabled
+
+        self._load_warning_w = app_config.getint(
+            "alert_thresholds", "load_warning_w", fallback=DEFAULT_LOAD_WARNING_W
+        )
+        self._load_critical_w = app_config.getint(
+            "alert_thresholds", "load_critical_w", fallback=DEFAULT_LOAD_CRITICAL_W
+        )
+        self._load_shed_cooldown_secs = app_config.getint(
+            "alert_thresholds",
+            "load_shed_cooldown_seconds",
+            fallback=DEFAULT_LOAD_SHED_COOLDOWN_SECONDS,
+        )
+        self._evaluator = LoadAlertEvaluator(
+            warning_w=self._load_warning_w,
+            critical_w=self._load_critical_w,
+            resolve_secs=app_config.getint(
+                "alert_thresholds",
+                "load_critical_resolve_seconds",
+                fallback=DEFAULT_LOAD_CRITICAL_RESOLVE_SECONDS,
+            ),
+            cooldown_secs=self._load_shed_cooldown_secs,
+        )
+
+        self.pd_client: EventsApiV2Client | None = None
+        if app_config.getboolean("app", "paging_enabled"):
+            if creds is None:
+                raise RuntimeError("Credentials not initialized")
+            self.pd_client = EventsApiV2Client(
+                routing_key=creds.get_creds("PagerDuty.inverter-monitor/routing_key")
+            )
+        # Seed the dedup key so a stale incident from a previous run resolves
+        self.pd_dedup_key: str | None = PD_LOAD_DEDUP_KEY
+
+    def _notify_telegram(self, telegram_socket, alert):
+        if telegram_socket is None:
+            log.info(
+                "Telegram bot disabled; load alert not sent",
+                extra={"alert_kind": alert.get("kind")},
+            )
+            return
+        telegram_socket.send_pyobj({"load_alert": alert})
+
+    def _trigger_pd(self, load_w, details):
+        if self.pd_client is None:
+            # Configuration gap is logged at startup; keep the state clean
+            self._evaluator.pd_trigger_succeeded()
+            return
+        try:
+            self.pd_dedup_key = self.pd_client.trigger(
+                dedup_key=PD_LOAD_DEDUP_KEY,
+                summary=(
+                    f"High load on {DEVICE_NAME_BASE}: {load_w:,.0f} W exceeds "
+                    f"{self._load_critical_w} W"
+                ),
+                source=str(DEVICE_NAME_BASE),
+                severity="warning",
+                custom_details={
+                    "load_w": round(load_w, 2),
+                    "threshold_w": self._load_critical_w,
+                    **{
+                        key: value
+                        for key, value in details.items()
+                        if key != "timestamp"
+                    },
+                },
+            )
+            self._evaluator.pd_trigger_succeeded()
+            log.info(
+                "PagerDuty alert triggered for high load",
+                extra={
+                    "dedup_key": self.pd_dedup_key,
+                    "load_w": round(load_w, 2),
+                    "threshold_w": self._load_critical_w,
+                },
+            )
+        except Exception:
+            self._evaluator.pd_trigger_failed()
+            log.info("PagerDuty load trigger failed; will retry.", exc_info=True)
+
+    def _resolve_pd(self, load_w):
+        if self.pd_client is None:
+            self._evaluator.pd_resolve_succeeded()
+            return
+        try:
+            if self.pd_dedup_key is not None:
+                self.pd_client.resolve(dedup_key=self.pd_dedup_key)
+            self._evaluator.pd_resolve_succeeded()
+            log.info(
+                "PagerDuty load incident resolved",
+                extra={
+                    "dedup_key": self.pd_dedup_key,
+                    "load_w": round(load_w, 2),
+                },
+            )
+        except Exception:
+            self._evaluator.pd_resolve_failed()
+            log.info("PagerDuty load resolve failed; will retry.", exc_info=True)
+
+    # noinspection PyBroadException
+    def run(self):
+        log.info(
+            "Starting load alert monitor",
+            extra={
+                "load_warning_w": self._load_warning_w,
+                "load_critical_w": self._load_critical_w,
+                "load_shed_cooldown_secs": self._load_shed_cooldown_secs,
+                "paging_enabled": self.pd_client is not None,
+                "telegram_enabled": self._telegram_enabled,
+            },
+        )
+        if self.pd_client is None:
+            log.warning(
+                "PagerDuty not configured; high-load alerts will not page.",
+                extra={"load_critical_w": self._load_critical_w},
+            )
+        telegram_socket = None
+        if self._telegram_enabled:
+            telegram_socket = zmq_socket(socket_type=zmq.PUSH)
+            telegram_socket.connect(URL_WORKER_TELEGRAM)
+        my_socket = self.get_socket()
+        try:
+            while not threads.shutting_down:
+                try:
+                    inverter_data = my_socket.recv_pyobj()
+                except ContextTerminated, ZMQError:
+                    break
+                if not isinstance(inverter_data, dict):
+                    continue
+                load_field = inverter_data.get("total_load_power_w")
+                if isinstance(load_field, bool) or not isinstance(
+                    load_field, (int, float)
+                ):
+                    log.debug(
+                        "Skipping load evaluation without a numeric load",
+                        extra={"load_value": repr(load_field)},
+                    )
+                    continue
+                load_w = float(load_field)
+                now = time.time()
+                decision = self._evaluator.evaluate(load_w, now)
+                details = {
+                    key: value
+                    for key, value in inverter_supporting_fields(inverter_data).items()
+                    if value is not None
+                }
+                details["timestamp"] = round(now, 3)
+                if decision.warning:
+                    log.info(
+                        "Load exceeded warning threshold",
+                        extra={
+                            "load_w": round(load_w, 2),
+                            "threshold_w": self._load_warning_w,
+                            "cooldown_secs": self._load_shed_cooldown_secs,
+                        },
+                    )
+                    self._notify_telegram(
+                        telegram_socket,
+                        {
+                            "kind": "load_warning",
+                            "load_w": round(load_w, 2),
+                            "threshold_w": self._load_warning_w,
+                            "cooldown_secs": self._load_shed_cooldown_secs,
+                            **details,
+                        },
+                    )
+                if decision.recovery:
+                    log.info(
+                        "Load recovered below warning threshold",
+                        extra={
+                            "load_w": round(load_w, 2),
+                            "threshold_w": self._load_warning_w,
+                            "cooldown_secs": self._load_shed_cooldown_secs,
+                        },
+                    )
+                    self._notify_telegram(
+                        telegram_socket,
+                        {
+                            "kind": "load_recovery",
+                            "load_w": round(load_w, 2),
+                            "threshold_w": self._load_warning_w,
+                            "cooldown_secs": self._load_shed_cooldown_secs,
+                            **details,
+                        },
+                    )
+                if decision.pd_trigger:
+                    self._trigger_pd(load_w, details)
+                if decision.pd_resolve:
+                    self._resolve_pd(load_w)
+        finally:
+            if telegram_socket is not None:
+                try_close(telegram_socket)
+            self.close()
+
+
 class EventProcessor(AppThread, Closable):
     def __init__(self, debug_metrics, telegram_enabled=False):
         AppThread.__init__(self, name=self.__class__.__name__)
@@ -1195,11 +1548,12 @@ class EventProcessor(AppThread, Closable):
         # Set up Telegram bot fan-out PUSH socket
         telegram_socket = None
         if self._telegram_enabled:
-            from tailucas_pylib.zmq import try_close, zmq_socket
-
             telegram_socket = zmq_socket(socket_type=zmq.PUSH)
             telegram_socket.connect(URL_WORKER_TELEGRAM)
             log.info("Telegram bot fan-out enabled")
+        # Fan every inverter sample out to the load alert monitor
+        load_socket = zmq_socket(socket_type=zmq.PUSH)
+        load_socket.connect(URL_WORKER_LOAD_MONITOR)
         with exception_handler(
             connect_url=URL_WORKER_MQTT_PUBLISH, and_raise=False, shutdown_on_error=True
         ) as mqtt_socket:
@@ -1210,7 +1564,10 @@ class EventProcessor(AppThread, Closable):
                 if isinstance(event, dict):
                     for point_name in list(event):
                         point_items = event[point_name]
-                        if isinstance(point_items, list):
+                        if point_name in NOTIFICATION_ONLY_POINTS:
+                            # notification payloads are forwarded, never gauged
+                            pass
+                        elif isinstance(point_items, list):
                             # Labeled format: list of
                             # {"labels": {...}, "metrics": {...}}
                             for entry in point_items:
@@ -1316,18 +1673,23 @@ class EventProcessor(AppThread, Closable):
                                     "point_items_type": str(type(point_items)),
                                 },
                             )
-                        if point_name == "inverter" and point_name not in debug_metrics:
-                            mqtt_socket.send_pyobj(point_items)
-                        # Forward battery to Telegram bot when enabled
-                        if telegram_socket is not None:
-                            if point_name == "battery" and isinstance(
-                                point_items, list
-                            ):
-                                telegram_socket.send_pyobj({"battery": point_items})
+                        if point_name == "inverter":
+                            # always fan out for load alert evaluation, even
+                            # when the inverter point is a debug-only metric
+                            load_socket.send_pyobj(point_items)
+                            if point_name not in debug_metrics:
+                                mqtt_socket.send_pyobj(point_items)
+                        # Forward telemetry and notifications to the Telegram bot
+                        if (
+                            telegram_socket is not None
+                            and point_name in TELEGRAM_FANOUT_POINTS
+                        ):
+                            telegram_socket.send_pyobj({point_name: point_items})
                 _event_process_duration = time.time() - _event_process_start
                 EVENT_PROCESS_DURATION.set(_event_process_duration)
         if telegram_socket is not None:
             try_close(telegram_socket)
+        try_close(load_socket)
         self.close()
 
 
@@ -1391,6 +1753,7 @@ def main():
         debug_metrics=debug_metrics,
         telegram_enabled=telegram_enabled,
     )
+    load_alert_monitor = LoadAlertMonitor(telegram_enabled=telegram_enabled)
     logger_reader: LoggerReader | None = None
     if app_config.getboolean("inverter", "logging_enabled"):
         logger_reader = LoggerReader(
@@ -1432,6 +1795,7 @@ def main():
     try:
         log.info("Starting application threads", extra={"app_name": APP_NAME})
         event_processor.start()
+        load_alert_monitor.start()
         if logger_reader is not None:
             logger_reader.start()
         else:

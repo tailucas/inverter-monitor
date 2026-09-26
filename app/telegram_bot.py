@@ -6,13 +6,16 @@ and plain-text caption builder. No Telegram library imports, no async
 handlers, no AppThread -- those live in `app.bot`.
 """
 
+import html
 import io
+from collections.abc import Callable
 from threading import Lock
 from typing import Any
 
+import emoji
 import matplotlib
 import pandas as pd
-from tailucas_pylib import APP_NAME, app_config
+from tailucas_pylib import APP_NAME, DEVICE_NAME_BASE, app_config
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -132,6 +135,136 @@ def format_status_message(inverter: dict[str, Any], bms_summary: dict[str, Any])
         )
 
     return "\n".join(lines)
+
+
+# -- notification formatters (HTML, bot-initiated messages) --------------------
+
+
+_SWITCH_REASON_TEXT = {
+    "load_shed": "high load (load shed)",
+    "surplus_ration": "low solar surplus",
+    "battery_ration": "battery rationing",
+    "alert_restore": "inverter alert",
+    "all_clear": "conditions normal",
+}
+
+
+def _fmt_watts(value: float) -> str:
+    return f"{value:,.0f} W"
+
+
+def _fmt_volts(value: float) -> str:
+    return f"{value:,.1f} V"
+
+
+def _fmt_pct(value: float) -> str:
+    return f"{value:,.0f} %"
+
+
+def _fmt_secs(value: float) -> str:
+    return f"{value:,.0f} s"
+
+
+def _format_value(value: Any, formatter: Callable[[float], str]) -> str:
+    """Render a numeric payload value, or an em dash placeholder."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "\u2014"
+    return formatter(float(value))
+
+
+_DETAIL_FIELDS = (
+    ("Battery", "battery_power_w", _fmt_watts),
+    ("PV", "pv_power_w", _fmt_watts),
+    ("Grid", "grid_voltage_v", _fmt_volts),
+    ("SoC", "battery_soc_pct", _fmt_pct),
+)
+
+
+def _detail_line(payload: dict[str, Any], include_load: bool = False) -> str | None:
+    """Build one HTML line of supporting telemetry, if any values exist."""
+    fields = _DETAIL_FIELDS
+    if include_load:
+        fields = (("Load", "load_w", _fmt_watts),) + _DETAIL_FIELDS
+    parts = []
+    for label, key, formatter in fields:
+        value = payload.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        parts.append(f"{label}: <code>{formatter(float(value))}</code>")
+    if not parts:
+        return None
+    return " \u00b7 ".join(parts)
+
+
+def format_switch_event_message(event: dict[str, Any]) -> str:
+    """Build an HTML notification for a switch-bank state change."""
+    banks = [str(bank) for bank in event.get("switch_banks", [])]
+    bank_text = ", ".join(f"<code>{html.escape(bank)}</code>" for bank in banks)
+    reason = str(event.get("reason", "unknown"))
+    reason_text = _SWITCH_REASON_TEXT.get(reason, reason)
+    if event.get("state") == 0:
+        headline = f"{emoji.emojize(':warning:')} <b>Switch bank shed (OFF)</b>"
+    else:
+        headline = f"{emoji.emojize(':check_mark:')} <b>Switch bank restored (ON)</b>"
+    lines = [
+        f"{headline}: {bank_text or '<code>unknown</code>'}",
+        f"Reason: <code>{html.escape(reason_text)}</code>",
+    ]
+    details = _detail_line(event, include_load=True)
+    if details:
+        lines.append(details)
+    return "\n".join(lines)
+
+
+def format_load_warning_message(alert: dict[str, Any]) -> str:
+    """Build an HTML notification for a warning threshold crossing."""
+    lines = [
+        (
+            f"{emoji.emojize(':warning:')} <b>Load warning</b> for "
+            f"<code>{html.escape(str(DEVICE_NAME_BASE))}</code>: "
+            f"<b>{_format_value(alert.get('load_w'), _fmt_watts)}</b> exceeds "
+            f"{_format_value(alert.get('threshold_w'), _fmt_watts)}"
+        ),
+    ]
+    details = _detail_line(alert)
+    if details:
+        lines.append(details)
+    return "\n".join(lines)
+
+
+def format_load_recovery_message(alert: dict[str, Any]) -> str:
+    """Build an HTML notification for recovery below the warning threshold."""
+    lines = [
+        (
+            f"{emoji.emojize(':check_mark:')} <b>Load recovered</b> for "
+            f"<code>{html.escape(str(DEVICE_NAME_BASE))}</code>: held below "
+            f"{_format_value(alert.get('threshold_w'), _fmt_watts)} for "
+            f"{_format_value(alert.get('cooldown_secs'), _fmt_secs)}; "
+            f"load-shed released"
+        ),
+    ]
+    details = _detail_line(alert)
+    if details:
+        lines.append(details)
+    return "\n".join(lines)
+
+
+def build_notification_message(payload: dict[str, Any]) -> str | None:
+    """Build an HTML notification from a Telegram fan-out payload.
+
+    Returns None for payloads that carry no notification content.
+    """
+    switch_event = payload.get("switch_event")
+    if isinstance(switch_event, dict):
+        return format_switch_event_message(switch_event)
+    load_alert = payload.get("load_alert")
+    if isinstance(load_alert, dict):
+        kind = load_alert.get("kind")
+        if kind == "load_warning":
+            return format_load_warning_message(load_alert)
+        if kind == "load_recovery":
+            return format_load_recovery_message(load_alert)
+    return None
 
 
 # -- chart rendering (matplotlib) ---------------------------------------------
