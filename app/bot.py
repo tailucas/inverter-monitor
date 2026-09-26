@@ -36,6 +36,7 @@ from telegram.ext import (
 
 from app.metrics import (
     BATTERY_QUERIES,
+    CELL_QUERIES,
     POWER_QUERIES,
     fetch_metrics,
 )
@@ -43,12 +44,16 @@ from app.telegram_bot import (
     DEFAULT_HISTORY_HOURS,
     URL_WORKER_TELEGRAM,
     BmsSummaryBuffer,
+    WeatherBuffer,
     _get_telegram_token,
+    build_battery_caption,
     build_bms_summary,
+    build_cell_recommendation,
     build_history_caption,
     build_notification_message,
     format_status_message,
     render_battery_chart,
+    render_cell_chart,
     render_power_chart,
 )
 
@@ -139,8 +144,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"Hello {user.first_name}! "
                 f"I report on your inverter system.\n\n"
                 f"Commands:\n"
-                f"/status -- current inverter and battery status\n"
-                f"/history [hours] -- charts of power and battery\n"
+                f"/status -- current inverter, weather and battery status\n"
+                f"/history [hours] -- power time-series chart\n"
+                f"/battery [hours] -- battery time-series chart\n"
+                f"/cell [hours] -- per-cell voltages and balancing advice\n"
                 f"/help -- this message"
             ),
             disable_web_page_preview=True,
@@ -164,8 +171,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.effective_message.reply_text(
             text=(
                 f"{emoji.emojize(':light_bulb:')} **Commands**\n\n"
-                f"/status -- live snapshot of solar, load, grid, battery, BMS\n"
-                f"/history [hours] \u2014 time-series charts of power and battery\n\n"
+                f"/status -- live snapshot: inverter, battery, weather\n"
+                f"/history [hours] \u2014 power time-series chart\n"
+                f"/battery [hours] \u2014 battery time-series chart\n"
+                f"/cell [hours] \u2014 per-cell voltages and balancing advice\n\n"
                 f"Examples:\n"
                 f"/history 12 \u2014 last 12 hours\n"
                 f"/history \u2014 default ({DEFAULT_HISTORY_HOURS} hours)"
@@ -215,6 +224,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             live_msg = format_status_message(
                 inverter=fresh,
                 bms_summary=bot._bms_summary.summary(),
+                weather=bot._weather.summary(),
             )
             log.debug(
                 "Replying to status request (live)",
@@ -250,6 +260,18 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+def _parse_hours(context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Parse the optional hours argument, falling back to the default."""
+    if context.args:
+        try:
+            hours = int(context.args[0])
+            if 1 <= hours <= 720:
+                return hours
+        except ValueError, IndexError:
+            pass
+    return DEFAULT_HISTORY_HOURS
+
+
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle /history [hours] -- fetch Prometheus metrics and render charts."""
     if update.effective_message is None:
@@ -267,24 +289,18 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             action=ChatAction.TYPING,
         )
 
-        hours = DEFAULT_HISTORY_HOURS
-        if context.args:
-            try:
-                hours = int(context.args[0])
-                if hours < 1 or hours > 720:
-                    hours = DEFAULT_HISTORY_HOURS
-            except ValueError, IndexError:
-                hours = DEFAULT_HISTORY_HOURS
+        hours = _parse_hours(context)
 
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _fetch_and_render, hours)
-        df_power, df_battery, img_power, img_battery = result
-        caption = build_history_caption(df_power, df_battery, hours)
+        df_power, img_power = await loop.run_in_executor(
+            None, _fetch_and_render_power, hours
+        )
+        caption = build_history_caption(df_power, hours)
 
-        if not img_power and not img_battery:
+        if not img_power:
             await update.effective_message.reply_text(
                 text=(
-                    f"{emoji.emojize(':warning:')} No history found in "
+                    f"{emoji.emojize(':warning:')} No power history found in "
                     f"Prometheus / Grafana Cloud."
                 ),
                 disable_web_page_preview=True,
@@ -292,30 +308,14 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
             return ConversationHandler.END
 
-        if img_power:
-            await update.effective_message.reply_photo(
-                photo=img_power,
-                caption=caption,
-            )
-        else:
-            await update.effective_message.reply_text(
-                text=caption,
-            )
-
-        if img_battery:
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=img_battery,
-            )
+        await update.effective_message.reply_photo(
+            photo=img_power,
+            caption=caption,
+        )
 
         log.info(
             "History report sent",
-            extra={
-                "user_id": user.id,
-                "hours": hours,
-                "has_power_chart": bool(img_power),
-                "has_battery_chart": bool(img_battery),
-            },
+            extra={"user_id": user.id, "hours": hours},
         )
     except Exception as exc:
         log.warning(
@@ -324,6 +324,116 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.effective_message.reply_text(
             text=(
                 f"{emoji.emojize(':warning:')} Could not generate history report: {exc}"
+            ),
+            disable_web_page_preview=True,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    return ConversationHandler.END
+
+
+async def battery(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /battery [hours] -- battery time-series chart."""
+    if update.effective_message is None:
+        return ConversationHandler.END
+    user = await validate("battery", update)
+    if user is None:
+        return ConversationHandler.END
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_message.chat_id,
+            action=ChatAction.TYPING,
+        )
+
+        hours = _parse_hours(context)
+
+        loop = asyncio.get_running_loop()
+        df_battery, img_battery = await loop.run_in_executor(
+            None, _fetch_and_render_battery, hours
+        )
+        caption = build_battery_caption(df_battery, hours)
+
+        if not img_battery:
+            await update.effective_message.reply_text(
+                text=(
+                    f"{emoji.emojize(':warning:')} No battery history found in "
+                    f"Prometheus / Grafana Cloud."
+                ),
+                disable_web_page_preview=True,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ConversationHandler.END
+
+        await update.effective_message.reply_photo(
+            photo=img_battery,
+            caption=caption,
+        )
+
+        log.info(
+            "Battery report sent",
+            extra={"user_id": user.id, "hours": hours},
+        )
+    except Exception as exc:
+        log.warning(
+            "Failed to handle battery command", exc_info=exc, extra={"user_id": user.id}
+        )
+        await update.effective_message.reply_text(
+            text=(
+                f"{emoji.emojize(':warning:')} Could not generate battery report: {exc}"
+            ),
+            disable_web_page_preview=True,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    return ConversationHandler.END
+
+
+async def cell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /cell [hours] -- per-cell voltages and balancing advice."""
+    if update.effective_message is None:
+        return ConversationHandler.END
+    user = await validate("cell", update)
+    if user is None:
+        return ConversationHandler.END
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_message.chat_id,
+            action=ChatAction.TYPING,
+        )
+
+        hours = _parse_hours(context)
+
+        loop = asyncio.get_running_loop()
+        df_cells, img_cells = await loop.run_in_executor(
+            None, _fetch_and_render_cells, hours
+        )
+        caption = build_cell_recommendation(df_cells)
+
+        if not img_cells:
+            await update.effective_message.reply_text(
+                text=(
+                    f"{emoji.emojize(':warning:')} No cell history found in "
+                    f"Prometheus / Grafana Cloud.\n\n{caption}"
+                ),
+                disable_web_page_preview=True,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ConversationHandler.END
+
+        await update.effective_message.reply_photo(
+            photo=img_cells,
+            caption=caption,
+        )
+
+        log.info(
+            "Cell report sent",
+            extra={"user_id": user.id, "hours": hours},
+        )
+    except Exception as exc:
+        log.warning(
+            "Failed to handle cell command", exc_info=exc, extra={"user_id": user.id}
+        )
+        await update.effective_message.reply_text(
+            text=(
+                f"{emoji.emojize(':warning:')} Could not generate cell report: {exc}"
             ),
             disable_web_page_preview=True,
             parse_mode=ParseMode.MARKDOWN,
@@ -353,37 +463,46 @@ async def telegram_error_handler(
 # -- AppThread -----------------------------------------------------------------
 
 
-def _fetch_and_render(
-    hours: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, bytes, bytes]:
-    """Blocking call: fetch Prometheus metrics and render charts."""
-    power_results = fetch_metrics(hours=hours, query_set=POWER_QUERIES)
-    battery_results = fetch_metrics(hours=hours, query_set=BATTERY_QUERIES)
+def _to_df(results: list[Any], use_labels: bool = False) -> pd.DataFrame:
+    """Pivot Prometheus DTOs into a DataFrame, one column per series."""
+    if not results:
+        return pd.DataFrame()
+    rows: dict[float, dict[str, Any]] = {}
+    for r in results:
+        ts_key = r.ts_ms
+        if ts_key not in rows:
+            rows[ts_key] = {"_time": pd.Timestamp(ts_key, unit="ms")}
+        if use_labels:
+            labels = getattr(r, "labels", {}) or {}
+            column = f"{labels.get('bms_addr', '?')} c{labels.get('cell', '?')}"
+        else:
+            column = r.metric_name
+        rows[ts_key][column] = r.value
+    df = pd.DataFrame(list(rows.values()))
+    if "_time" in df.columns:
+        df = df.sort_values(by="_time")
+    return df
 
-    # Build DataFrames from PrometheusMetricDTO lists.
-    # _to_df pivots on metric_name so each series becomes a column.
-    def _to_df(
-        results: list[Any],
-    ) -> pd.DataFrame:
-        if not results:
-            return pd.DataFrame()
-        rows: dict[float, dict[str, float]] = {}
-        for r in results:
-            ts_key = r.ts_ms
-            if ts_key not in rows:
-                rows[ts_key] = {"_time": pd.Timestamp(ts_key, unit="ms")}
-            rows[ts_key][r.metric_name] = r.value
-        df = pd.DataFrame(list(rows.values()))
-        if "_time" in df.columns:
-            df = df.sort_values(by="_time")
-        return df
 
-    df_power = _to_df(power_results)
-    df_battery = _to_df(battery_results)
+def _fetch_and_render_power(hours: int) -> tuple[pd.DataFrame, bytes]:
+    """Blocking call: fetch power metrics and render the chart."""
+    results = fetch_metrics(hours=hours, query_set=POWER_QUERIES)
+    df = _to_df(results)
+    return df, render_power_chart(df)
 
-    img_power = render_power_chart(df_power)
-    img_battery = render_battery_chart(df_battery)
-    return df_power, df_battery, img_power, img_battery
+
+def _fetch_and_render_battery(hours: int) -> tuple[pd.DataFrame, bytes]:
+    """Blocking call: fetch battery metrics and render the chart."""
+    results = fetch_metrics(hours=hours, query_set=BATTERY_QUERIES)
+    df = _to_df(results)
+    return df, render_battery_chart(df)
+
+
+def _fetch_and_render_cells(hours: int) -> tuple[pd.DataFrame, bytes]:
+    """Blocking call: fetch per-cell voltages and render the chart."""
+    results = fetch_metrics(hours=hours, query_set=CELL_QUERIES, step="1m")
+    df = _to_df(results, use_labels=True)
+    return df, render_cell_chart(df)
 
 
 class TelegramBot(AppThread, Closable):
@@ -401,6 +520,7 @@ class TelegramBot(AppThread, Closable):
         self._creds = creds_obj
         self._token = _get_telegram_token(creds_obj)
         self._bms_summary = BmsSummaryBuffer()
+        self._weather = WeatherBuffer()
         self._inverter_query = inverter_query
         self._receiver_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -425,6 +545,8 @@ class TelegramBot(AppThread, Closable):
                 if point_name == "battery" and isinstance(point_items, list):
                     bms_summary = build_bms_summary(point_items)
                     self._bms_summary.update(bms_summary)
+                elif point_name == "weather" and isinstance(point_items, dict):
+                    self._weather.update(point_items)
                 elif point_name in ("switch_event", "load_alert") and isinstance(
                     point_items, dict
                 ):
@@ -581,6 +703,8 @@ class TelegramBot(AppThread, Closable):
             CommandHandler("help", help_command),
             CommandHandler("status", status),
             CommandHandler("history", history),
+            CommandHandler("battery", battery),
+            CommandHandler("cell", cell),
         ]
         for handler in command_handlers:
             application.add_handler(handler)

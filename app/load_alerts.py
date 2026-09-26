@@ -6,41 +6,75 @@ per inverter sample by the application threads and are fully unit-tested in
 ``tests/test_load_alerts.py``.
 """
 
+from collections import deque
 from dataclasses import dataclass
 
 
-class LoadShedLatch:
-    """Latched high-load trip with a self-extending cooldown.
+class CooldownLatch:
+    """Latched trip condition with a self-extending cooldown.
 
-    Trips while ``load_w`` is above ``threshold_w`` and releases only after
-    ``cooldown_secs`` have elapsed with no above-threshold sample.  Every
-    above-threshold sample refreshes the cooldown (extends the release).
+    Trips while the evaluated value meets the condition (``> threshold``, or
+    ``>= threshold`` when ``inclusive`` is set) and releases only after
+    ``cooldown_secs`` have elapsed with no tripping sample.  Every tripping
+    sample refreshes the cooldown (extends the release).
     """
 
-    def __init__(self, threshold_w: float, cooldown_secs: float) -> None:
-        self.threshold_w = threshold_w
+    def __init__(
+        self, threshold: float, cooldown_secs: float, inclusive: bool = False
+    ) -> None:
+        self.threshold = threshold
         self.cooldown_secs = cooldown_secs
+        self.inclusive = inclusive
         self._active = False
-        self._last_above: float | None = None
+        self._last_trip: float | None = None
 
     @property
     def active(self) -> bool:
         """Current latch state without consuming a sample."""
         return self._active
 
-    def update(self, load_w: float, now: float) -> bool:
-        """Evaluate one load sample; return the (possibly updated) state."""
-        if load_w > self.threshold_w:
+    def _trips(self, value: float) -> bool:
+        if self.inclusive:
+            return value >= self.threshold
+        return value > self.threshold
+
+    def update(self, value: float, now: float) -> bool:
+        """Evaluate one sample; return the (possibly updated) state."""
+        if self._trips(value):
             self._active = True
-            self._last_above = now
+            self._last_trip = now
         elif (
             self._active
-            and self._last_above is not None
-            and now - self._last_above > self.cooldown_secs
+            and self._last_trip is not None
+            and now - self._last_trip > self.cooldown_secs
         ):
             self._active = False
-            self._last_above = None
+            self._last_trip = None
         return self._active
+
+
+class TimeWindowAverage:
+    """Mean of samples retained within a rolling time window.
+
+    Samples older than ``window_secs`` relative to the newest sample are
+    discarded, so every sample contributes equally for exactly the window
+    duration regardless of sampling rate.
+    """
+
+    def __init__(self, window_secs: float) -> None:
+        self.window_secs = window_secs
+        self._samples: deque[tuple[float, float]] = deque()
+
+    def add(self, value: float, now: float) -> float:
+        """Add a sample and return the mean over the retained window."""
+        self._samples.append((now, value))
+        cutoff = now - self.window_secs
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+        total = 0.0
+        for _, sample in self._samples:
+            total += sample
+        return total / len(self._samples)
 
 
 @dataclass
@@ -79,9 +113,7 @@ class LoadAlertEvaluator:
         self.critical_w = critical_w
         self.resolve_secs = resolve_secs
         self.cooldown_secs = cooldown_secs
-        self._warning = LoadShedLatch(
-            threshold_w=warning_w, cooldown_secs=cooldown_secs
-        )
+        self._warning = CooldownLatch(threshold=warning_w, cooldown_secs=cooldown_secs)
         self._warning_sent = False
         self._pd_triggered = False
         self._pd_stale_pending = True

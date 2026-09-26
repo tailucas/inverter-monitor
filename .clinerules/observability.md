@@ -24,20 +24,23 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
 - **Attributes** are derived from the per-point label set — e.g. `bms_addr`,
   `cell`, etc. — and passed as `attributes={...}` to `gauge.set()`.
 - Notification-only points (`switch_event`, `load_alert`) are fanned out to
-  consumers and never create gauges. The load-shed latch is visible as the
-  `switches_load_shed` gauge via the switch stats point.
+  consumers and never create gauges. The load-shed and overcast latches are
+  visible as the `switches_load_shed` and `switches_overcast` gauges via the
+  switch stats point.
 - **Timing gauges** are created at module scope using
   `OTEL_METER.create_gauge(...)` and named with `_duration_seconds` or
   `_seconds` suffixes. Each holds the latest measured duration value,
   updated at every sample cycle via `.set(duration)`. Current timing gauges:
-  - `inverter_query_duration_seconds` — TCP socket round-trip + parse
+  - `inverter_query_duration_seconds` — every fetch attempt (socket round-trip + parse), including failures
   - `inverter_cycle_duration_seconds` — full cycle (query + plausibility + publish)
   - `weather_fetch_duration_seconds` — OpenWeather API HTTP round-trip
   - `bms_frame_process_duration_seconds` — from frame receipt to ZMQ publish
   - `mqtt_publish_duration_seconds` — traceparent injection + client.publish
   - `event_process_duration_seconds` — InfluxDB + OTEL gauge + fan-out per event
-- The cadence gauge `inverter_sample_cadence_ratio` is a synchronous Gauge
-  tracking the ratio of cycle time to sample interval (> 1.0 = overrun).
+- The cadence gauge `inverter_poll_backoff_seconds` is a synchronous Gauge
+  holding the current poll backoff applied by the inverter reader (the base
+  value after a successful poll, doubled up to 60 s after failures or
+  implausible samples).
 - Log-only metrics (configured via `[metrics] debug_csv`) are discarded after
   debug-logging; they never become OTEL gauges.
 - `EventProcessor` has no time-series database writer today: telemetry is
@@ -76,7 +79,7 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
 |---|---|
 | DEBUG | Per-poll/per-sample/frame tracing, gauge updates (including timing data), "Inverter is delivering power to consumers…" supporting data |
 | INFO | Startup/lifecycle events, MQTT publishes (with `traceparent` in `extra`), switch-bank notifications, load warning/recovery events, PagerDuty triggers & resolves, recoverable warnings (socket timeouts, implausible samples, PD trigger/resolve failures) |
-| WARNING | PagerDuty client not configured, missing switch-bank config, reader or Telegram bot disabled at startup |
+| WARNING | Inverter/weather fetch failures (resolution, connect/send/receive, empty responses, malformed payloads), implausible samples, poll backoff, PagerDuty client not configured, missing switch-bank config, readers or Telegram bot disabled at startup |
 | ERROR | Lost connections (serial, MQTT), unreadable mappings |
 | CRITICAL | Reserved |
 

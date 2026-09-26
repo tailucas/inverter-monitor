@@ -478,6 +478,8 @@ Rules:
 
 - Producers emit notification-only payloads: `{"switch_event": {...}}` and
   `{"load_alert": {...}}`. They are never exported as metrics.
+- The receiver also caches the latest `weather` sample (`WeatherBuffer`) so
+  `/status` can show the last cloudiness reading.
 - The receiver thread only parses ZMQ payloads and enqueues them; it never
   touches asyncio directly. `_enqueue_notification()` puts the payload on a
   `queue.Queue` and wakes the dispatcher with
@@ -500,3 +502,32 @@ Rules:
   (structured fields only) and continue with the remaining users.
 - Log only structured fields (`kind`, `reason`, `switch_banks`,
   `recipient_count`); never log the rendered message body.
+
+---
+
+## 6. Command Set & Patterns (inverter-monitor)
+
+Current commands (registered as simple `CommandHandler`s in `app/bot.py`
+`run()`):
+
+- `/status` — live inverter query (via `logger_reader.query_now`) plus cached
+  BMS and weather summaries. Cloudiness appears as a whole-number percentage
+  with no space and no decimals (value wrapped in backticks; em dash when no
+  weather sample has arrived yet).
+- `/history [hours]` — power time-series chart (power queries only).
+- `/battery [hours]` — battery time-series chart.
+- `/cell [hours]` — per-cell voltages with a balancing recommendation
+  (thresholds `CELL_BALANCED_MV` = 30 mV and `CELL_MONITOR_MV` = 80 mV in
+  `app/telegram_bot.py`).
+
+Conventions:
+
+- Hours arguments parse through the shared `_parse_hours` helper (1–720,
+  default `DEFAULT_HISTORY_HOURS`).
+- Prometheus fetch + matplotlib rendering always run in
+  `loop.run_in_executor(...)` so the asyncio loop stays responsive.
+- Chart messages are photos with plain-text captions (see §4f); the no-data
+  and error paths reply with Markdown text.
+- Prometheus series labels (e.g. `bms_addr`, `cell`) become DataFrame columns
+  through `_to_df(..., use_labels=True)`; unlabeled queries key on the
+  friendly metric name.

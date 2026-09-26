@@ -14,7 +14,10 @@ from app.metrics import (
 )
 from app.telegram_bot import (
     BmsSummaryBuffer,
+    WeatherBuffer,
+    build_battery_caption,
     build_bms_summary,
+    build_cell_recommendation,
     build_history_caption,
     build_notification_message,
     format_load_recovery_message,
@@ -22,6 +25,7 @@ from app.telegram_bot import (
     format_status_message,
     format_switch_event_message,
     render_battery_chart,
+    render_cell_chart,
     render_power_chart,
 )
 
@@ -74,6 +78,18 @@ def test_bms_summary_buffer_store_and_copy() -> None:
     # Verify copy semantics: mutating the returned dict does not affect buffer
     result["active_count"] = 99
     assert buf.summary()["active_count"] == 2
+
+
+def test_weather_buffer_store_and_copy() -> None:
+    """Verify WeatherBuffer stores keys and returns a copy on read."""
+    buf = WeatherBuffer()
+    assert buf.summary() == {}
+    data = {"cloudiness_pct": 62, "midday_pct": 40}
+    buf.update(data)
+    result = buf.summary()
+    assert result == data
+    result["cloudiness_pct"] = 100
+    assert buf.summary()["cloudiness_pct"] == 62
 
 
 def test_build_bms_summary() -> None:
@@ -145,6 +161,32 @@ def test_format_status_message_with_bms(
     assert "Delta: `70` mV" in msg
 
 
+def test_format_status_message_with_weather(
+    sample_inverter: dict[str, Any],
+) -> None:
+    """Verify the latest cloudiness is decorated in the status message."""
+    msg = format_status_message(
+        inverter=sample_inverter,
+        bms_summary={},
+        weather={"cloudiness_pct": 62, "midday_pct": 40},
+    )
+    assert "Cloudiness: `62%`" in msg
+    overcast = format_status_message(
+        inverter=sample_inverter,
+        bms_summary={},
+        weather={"cloudiness_pct": 100},
+    )
+    assert "Cloudiness: `100%`" in overcast
+
+
+def test_format_status_message_without_weather(
+    sample_inverter: dict[str, Any],
+) -> None:
+    """Missing weather data renders the em dash placeholder."""
+    msg = format_status_message(inverter=sample_inverter, bms_summary={})
+    assert "Cloudiness: `\u2014`" in msg
+
+
 def test_metrics_configure_and_query(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify _query_range builds correct URL, params, auth, parses response."""
     import requests
@@ -189,6 +231,8 @@ def test_metrics_configure_and_query(monkeypatch: pytest.MonkeyPatch) -> None:
     assert results[2].value == 1950.0
     # Timestamps are in order
     assert results[2].ts_ms > results[1].ts_ms
+    # Series labels are captured (dropping __name__)
+    assert results[0].labels == {"bms_addr": "BMS01", "cell": "01"}
 
 
 def _fake_prometheus_response():
@@ -206,7 +250,11 @@ def _fake_prometheus_response():
                 "data": {
                     "result": [
                         {
-                            "metric": {},
+                            "metric": {
+                                "__name__": "inverter_total_power_w",
+                                "bms_addr": "BMS01",
+                                "cell": "01",
+                            },
                             "values": [
                                 [1700000000.0, "2000.0"],
                                 [1700000300.0, "NaN"],
@@ -248,7 +296,7 @@ def test_render_battery_chart_empty() -> None:
 
 
 def test_build_history_caption() -> None:
-    """Verify caption contains expected sections."""
+    """Verify the power caption contains the expected averages."""
     df_power = pd.DataFrame(
         {
             "_time": pd.date_range("2026-09-03", periods=3, freq="h"),
@@ -256,24 +304,77 @@ def test_build_history_caption() -> None:
             "total_load_power_w": [950.0, 970.0, 930.0],
         }
     )
+    caption = build_history_caption(df_power, hours=24)
+    assert "Power history" in caption
+    assert "24 h" in caption
+    assert "total_power_w: 2000.0" in caption
+
+
+def test_build_battery_caption() -> None:
+    """Verify the battery caption contains the expected averages."""
     df_battery = pd.DataFrame(
         {
             "_time": pd.date_range("2026-09-03", periods=3, freq="h"),
             "battery_soc_pct": [72.0, 71.0, 70.5],
         }
     )
-    caption = build_history_caption(df_power, df_battery, hours=24)
-    assert "History" in caption
-    assert "24 h" in caption
-    assert "Power averages" in caption
-    assert "Battery averages" in caption
-
-
-def test_build_history_caption_empty() -> None:
-    """Empty DataFrames produce a minimal caption."""
-    caption = build_history_caption(pd.DataFrame(), pd.DataFrame(), hours=12)
-    assert "History" in caption
+    caption = build_battery_caption(df_battery, hours=12)
+    assert "Battery history" in caption
     assert "12 h" in caption
+    assert "battery_soc_pct: 71.2" in caption
+
+
+def test_build_captions_empty() -> None:
+    """Empty DataFrames produce a minimal caption."""
+    history = build_history_caption(pd.DataFrame(), hours=12)
+    assert "Power history" in history
+    assert "12 h" in history
+    battery = build_battery_caption(pd.DataFrame(), hours=6)
+    assert "Battery history" in battery
+
+
+def _cell_frame(delta_mv: float) -> pd.DataFrame:
+    """Build a two-series cell DataFrame separated by delta_mv."""
+    return pd.DataFrame(
+        {
+            "_time": pd.date_range("2026-09-26", periods=3, freq="h"),
+            "BMS01 c01": [3.300, 3.300, 3.300],
+            "BMS01 c02": [3.300, 3.300, 3.300 + delta_mv / 1000.0],
+        }
+    )
+
+
+def test_build_cell_recommendation_balanced() -> None:
+    """A small delta recommends no action."""
+    caption = build_cell_recommendation(_cell_frame(20.0))
+    assert "Cells: 2" in caption
+    assert "Weakest: BMS01 c01 3.300 V" in caption
+    assert "Delta: 20 mV" in caption
+    assert "cells are well balanced" in caption
+
+
+def test_build_cell_recommendation_monitor() -> None:
+    """A moderate delta recommends monitoring."""
+    caption = build_cell_recommendation(_cell_frame(50.0))
+    assert "Delta: 50 mV" in caption
+    assert "monitor" in caption
+
+
+def test_build_cell_recommendation_action() -> None:
+    """A large delta recommends action."""
+    caption = build_cell_recommendation(_cell_frame(120.0))
+    assert "Delta: 120 mV" in caption
+    assert "action required" in caption
+
+
+def test_build_cell_recommendation_no_data() -> None:
+    """Empty cell data yields a clear fallback caption."""
+    assert "No cell data available" in build_cell_recommendation(pd.DataFrame())
+
+
+def test_render_cell_chart_empty() -> None:
+    """Empty cell DataFrame produces empty bytes."""
+    assert render_cell_chart(pd.DataFrame()) == b""
 
 
 def test_format_switch_event_message_shed() -> None:

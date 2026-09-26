@@ -29,7 +29,13 @@ log.debug(
 )
 log.warning(
     "Socket receive timeout",
-    extra={"error": str(msg)},
+    extra={
+        "logger_ip": self.logger_ip,
+        "logger_port": self.logger_port,
+        "logger_sn": self.logger_sn,
+        "chunk_number": chunks,
+        "error": str(msg),
+    },
 )
 logger.info(
     "Connected to serial port",
@@ -55,7 +61,12 @@ log.info(message.format("RabbitMQ control"))                    # .format()
    `"error": str(e)` when no traceback is attached.
 3. **Protocol diagnostics** keep the raw supporting data as fields
    (`header_bytes`, `frame_hex`, `control_code`, `response_bytes`) so failures
-   are debuggable from logs alone.
+   are debuggable from logs alone. Every inverter fetch failure logs at
+   WARNING with the logger context (`logger_ip`, `logger_port`, `logger_sn`)
+   plus `chunk_number` and the specific detail (`error`, `response_bytes`, or
+   a bounded `response_hex` excerpt). Unclassified fetch errors are logged as
+   `"Unexpected error while querying inverter"` with `exc_info=True` and
+   return `None` — there are no silent failure returns.
 4. **PagerDuty lifecycle** logs always carry `dedup_key`; trigger/resolve
    failures are INFO (recoverable — retried on the next sample cycle);
    "client not configured" messages stay WARNING.
@@ -92,7 +103,7 @@ log.info(message.format("RabbitMQ control"))                    # .format()
 | Level | Use here |
 |---|---|
 | DEBUG | per-sample/chunk/frame tracing, gauge updates, "Inverter is delivering power to consumers from backup…" supporting data (always, not conditional) |
-| INFO | reader lifecycle, switch state changes and switch-bank notifications, load warning/recovery events, MQTT publishes, PagerDuty triggers & resolves, startup, recoverable warnings (timeouts, implausible samples, PD trigger/resolve failures) |
-| WARNING | non-recoverable config gaps (PagerDuty client not configured, missing switch-bank config, reader or Telegram bot disabled) |
+| INFO | reader lifecycle, switch state changes and switch-bank notifications, load warning/recovery events, MQTT publishes, PagerDuty triggers & resolves, startup, recoverable warnings (PD trigger/resolve failures) |
+| WARNING | inverter/weather fetch failures (address resolution, connect/send/receive timeouts and errors, empty responses, malformed frames or payloads), implausible samples, poll backoff, non-recoverable config gaps (PagerDuty client not configured, missing switch-bank config, reader or Telegram bot disabled) |
 | ERROR | lost connections (serial, MQTT), unreadable mappings |
 | CRITICAL | reserved |

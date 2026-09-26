@@ -17,6 +17,9 @@ switch banks via MQTT.
 
 - Hardware-facing code must be defensive: timeouts, retries, plausibility
   checks, and PagerDuty alerting for data loss are first-class concerns.
+- No silent failures: every inverter fetch failure returns `None` **and**
+  logs a WARNING with the logger context (`logger_ip`, `logger_port`,
+  `logger_sn`) and the specific failure detail.
 - Built on the `tailucas_pylib` framework (`AppThread`, `exception_handler`,
   `thread_nanny`, `die()`/`bye()` shutdown). Follow pylib's standards.
 
@@ -27,16 +30,26 @@ One `AppThread` per concern, wired over ZMQ inproc (`URL_WORKER_APP`,
 
 - `LoggerReader`: polls the inverter Wi-Fi logger (chunked binary protocol,
   CRC16-MODBUS validation via `libscrc`, field mappings from
-  `config/field_mappings.txt`). On-demand queries from the Telegram bot go
-  through `query_now()` (`app/single_flight.py`) so ad-hoc and scheduled
-  polls never hit the logger socket concurrently.
+  `config/field_mappings.txt`). Polls continuously with a 1 s base backoff
+  (`poll_backoff_seconds`), doubling exponentially to 60 s after failed or
+  implausible samples. On-demand queries from the Telegram bot go through
+  `query_now()` (`app/single_flight.py`) so ad-hoc and scheduled polls never
+  hit the logger socket concurrently. Fetch errors never propagate:
+  `get_logger_data()` logs unexpected exceptions as a WARNING with traceback
+  and returns `None`, which the poll loop turns into a backoff. Request frames
+  byte-swap the logger serial from an 8-hex-digit zero-padded value
+  (`f"{self.logger_sn:08x}"`) so short or leading-zero serials stay valid.
 - `BmsReader`: consumes decoded BMS frames from `SerialPortReader`
   (`app/serial_reader.py`); assigns friendly BMS names, derives scalars,
   manages PagerDuty heartbeat/count incidents.
-- `WeatherReader`: OpenWeather sampling correlated with inverter data.
-- `MqttSubscriber`: consumes EventProcessor-forwarded inverter samples,
-  subscribes to `{topic_prefix}/state/#`, applies the rationing checks
-  (high load, surplus, battery SoC, grid fallback) and controls switch banks.
+- `WeatherReader`: OpenWeather sampling correlated with inverter data; polls
+  at `[weather] poll_interval_seconds` (default 60 s), HTTP requests time out
+  after 10 s, and failed or malformed fetches back off exponentially (up to
+  600 s) and reset on success.
+- `MqttSubscriber`: consumes EventProcessor-forwarded inverter samples and
+  caches forwarded weather samples (overcast rationing); subscribes to
+  `{topic_prefix}/state/#`, applies the rationing checks (high load,
+  overcast, surplus, battery SoC, grid fallback) and controls switch banks.
 - `LoadAlertMonitor`: consumes forwarded inverter samples; raises Telegram
   load warnings/recoveries and the `load_high` PagerDuty incident. Its
   load-shed state machine is pure logic in `app/load_alerts.py`.
@@ -85,6 +98,15 @@ Rules:
   only after `load_shed_cooldown_seconds` with no above-threshold sample, and
   every above-threshold sample extends the cooldown; missing load data
   retains the latch.
+- Overcast rationing: `switch_stats["overcast"]` trips while the latest
+  weather sample reports 100 % cloudiness, with the same self-extending
+  cooldown (`overcast_cooldown_seconds`, default 3600 s); the inverter-alert
+  restore guard still wins over it. Weather older than ~180 s is treated as
+  unknown and retains the latch.
+- The surplus rationing check averages
+  `pv1_power_w + pv2_power_w - battery_power_w` over
+  `generation_average_seconds` (default 300 s) so the decision smoothing is
+  independent of the inverter poll rate.
 - OTEL synchronous gauges are named `<point_name>_<metric_key>` with
   attributes from the metrics payload's label set; log-only metrics are
   configured via `[metrics] debug_csv`. Notification-only points
@@ -106,8 +128,9 @@ Rules:
 
 - `uv run pytest tests/` must pass. Decoder tests (`tests/test_decoder.py`)
   are the safety net for protocol changes; alert state machines
-  (`tests/test_load_alerts.py`) and message formatters
-  (`tests/test_telegram_bot.py`) are the safety net for behavioural changes.
+  (`tests/test_load_alerts.py`), message formatters
+  (`tests/test_telegram_bot.py`), and Telegram data helpers
+  (`tests/test_bot_helpers.py`) are the safety net for behavioural changes.
 - Ruff config selects F/E/W/B/I/UP without a custom line length; keep new
   code under 88 columns to avoid adding E501 noise (the file carries
   pre-existing long lines; do not grow that set).

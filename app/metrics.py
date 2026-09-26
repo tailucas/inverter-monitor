@@ -6,7 +6,7 @@ from main() before the event loop, typed DTO return from fetch_metrics().
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 from tailucas_pylib import log
@@ -19,6 +19,7 @@ class PrometheusMetricDTO:
     ts_ms: float
     value: float
     metric_name: str
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 # Module-level globals populated by configure()
@@ -41,6 +42,11 @@ BATTERY_QUERIES = {
     "battery_soc_pct": "inverter_battery_soc_pct",
     "battery_voltage_v": "inverter_battery_voltage_v",
     "battery_current_a": "inverter_battery_current_a",
+}
+
+# Per-cell BMS voltages are labeled series (bms_addr, cell)
+CELL_QUERIES = {
+    "cell_voltage_v": "bms_cell_voltage_v",
 }
 
 
@@ -108,6 +114,11 @@ def _query_range(
     results: list[PrometheusMetricDTO] = []
     result_list = data.get("data", {}).get("result", [])
     for item in result_list:
+        labels = {
+            str(key): str(value)
+            for key, value in item.get("metric", {}).items()
+            if key != "__name__"
+        }
         values = item.get("values", [])
         for ts_val in values:
             ts = float(ts_val[0])
@@ -117,6 +128,7 @@ def _query_range(
                     ts_ms=ts * 1000.0,
                     value=val,
                     metric_name=metric_name,
+                    labels=labels,
                 )
             )
     return results
@@ -125,6 +137,7 @@ def _query_range(
 def fetch_metrics(
     hours: int = 24,
     query_set: dict[str, str] | None = None,
+    step: str = "5m",
 ) -> list[PrometheusMetricDTO]:
     """Fetch time-series metrics from Prometheus for the given hours.
 
@@ -132,6 +145,7 @@ def fetch_metrics(
         hours: Number of hours to look back.
         query_set: Dict of {friendly_name: PromQL_metric_name}.
             Defaults to POWER_QUERIES | BATTERY_QUERIES.
+        step: Prometheus range-query step (e.g. ``5m``, ``1m``).
 
     Returns:
         List of PrometheusMetricDTO sorted by timestamp.
@@ -150,6 +164,7 @@ def fetch_metrics(
                 promql=promql,
                 start=start_time,
                 end=end_time,
+                step=step,
             )
             all_results.extend(results)
         except Exception as exc:

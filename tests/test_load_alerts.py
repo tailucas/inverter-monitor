@@ -1,7 +1,12 @@
 #!/usr/bin/env python
 """Unit tests for the pure load-alert state machines."""
 
-from app.load_alerts import LoadAlertDecision, LoadAlertEvaluator, LoadShedLatch
+from app.load_alerts import (
+    CooldownLatch,
+    LoadAlertDecision,
+    LoadAlertEvaluator,
+    TimeWindowAverage,
+)
 
 WARNING_W = 7000.0
 CRITICAL_W = 7500.0
@@ -19,38 +24,74 @@ def make_evaluator() -> LoadAlertEvaluator:
     )
 
 
-class TestLoadShedLatch:
-    """Load shed latch: trip, self-extending cooldown, release."""
+class TestCooldownLatch:
+    """Cooldown latch: trip, self-extending cooldown, release."""
 
     def test_inactive_until_threshold_exceeded(self) -> None:
-        latch = LoadShedLatch(threshold_w=WARNING_W, cooldown_secs=COOLDOWN_SECS)
+        latch = CooldownLatch(threshold=WARNING_W, cooldown_secs=COOLDOWN_SECS)
         assert latch.active is False
         # exactly at the threshold is not "above"
-        assert latch.update(load_w=WARNING_W, now=0.0) is False
-        assert latch.update(load_w=WARNING_W - 1, now=1.0) is False
+        assert latch.update(value=WARNING_W, now=0.0) is False
+        assert latch.update(value=WARNING_W - 1, now=1.0) is False
         assert latch.active is False
 
+    def test_inclusive_threshold_trips_at_boundary(self) -> None:
+        latch = CooldownLatch(
+            threshold=100.0, cooldown_secs=COOLDOWN_SECS, inclusive=True
+        )
+        assert latch.update(value=99.0, now=0.0) is False
+        assert latch.update(value=100.0, now=1.0) is True
+        assert latch.active is True
+
     def test_trips_on_single_high_sample(self) -> None:
-        latch = LoadShedLatch(threshold_w=WARNING_W, cooldown_secs=COOLDOWN_SECS)
-        assert latch.update(load_w=WARNING_W + 1, now=0.0) is True
+        latch = CooldownLatch(threshold=WARNING_W, cooldown_secs=COOLDOWN_SECS)
+        assert latch.update(value=WARNING_W + 1, now=0.0) is True
         assert latch.active is True
 
     def test_latches_through_cooldown(self) -> None:
-        latch = LoadShedLatch(threshold_w=WARNING_W, cooldown_secs=COOLDOWN_SECS)
-        latch.update(load_w=WARNING_W + 1, now=0.0)
-        assert latch.update(load_w=WARNING_W - 100, now=COOLDOWN_SECS) is True
-        assert latch.update(load_w=WARNING_W - 100, now=COOLDOWN_SECS + 1) is False
+        latch = CooldownLatch(threshold=WARNING_W, cooldown_secs=COOLDOWN_SECS)
+        latch.update(value=WARNING_W + 1, now=0.0)
+        assert latch.update(value=WARNING_W - 100, now=COOLDOWN_SECS) is True
+        assert latch.update(value=WARNING_W - 100, now=COOLDOWN_SECS + 1) is False
         assert latch.active is False
 
     def test_continued_high_samples_extend_cooldown(self) -> None:
-        latch = LoadShedLatch(threshold_w=WARNING_W, cooldown_secs=COOLDOWN_SECS)
-        assert latch.update(load_w=WARNING_W + 1, now=0.0) is True
+        latch = CooldownLatch(threshold=WARNING_W, cooldown_secs=COOLDOWN_SECS)
+        assert latch.update(value=WARNING_W + 1, now=0.0) is True
         # continued evaluation of the condition extends the cooldown
-        assert latch.update(load_w=WARNING_W + 1, now=400.0) is True
+        assert latch.update(value=WARNING_W + 1, now=400.0) is True
         # 500 s since the last high sample: still latched
-        assert latch.update(load_w=WARNING_W - 1, now=900.0) is True
+        assert latch.update(value=WARNING_W - 1, now=900.0) is True
         # more than the cooldown since the last high sample: released
-        assert latch.update(load_w=WARNING_W - 1, now=1001.0) is False
+        assert latch.update(value=WARNING_W - 1, now=1001.0) is False
+
+
+class TestTimeWindowAverage:
+    """Rolling time-window average used for the surplus decision."""
+
+    def test_single_sample(self) -> None:
+        average = TimeWindowAverage(window_secs=300.0)
+        assert average.add(value=1200.0, now=0.0) == 1200.0
+
+    def test_mean_of_retained_samples(self) -> None:
+        average = TimeWindowAverage(window_secs=300.0)
+        average.add(value=1000.0, now=0.0)
+        average.add(value=2000.0, now=10.0)
+        assert average.add(value=3000.0, now=20.0) == 2000.0
+
+    def test_expired_samples_are_discarded(self) -> None:
+        average = TimeWindowAverage(window_secs=300.0)
+        average.add(value=1000.0, now=0.0)
+        average.add(value=5000.0, now=100.0)
+        # the t=0 sample falls outside the 300 s window at t=400
+        assert average.add(value=3000.0, now=400.0) == 4000.0
+
+    def test_window_slides_with_newest_sample(self) -> None:
+        average = TimeWindowAverage(window_secs=300.0)
+        average.add(value=100.0, now=0.0)
+        average.add(value=200.0, now=250.0)
+        # at t=500 only the t=250 and t=500 samples remain
+        assert average.add(value=300.0, now=500.0) == 250.0
 
 
 class TestLoadAlertEvaluator:

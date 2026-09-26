@@ -56,6 +56,27 @@ class BmsSummaryBuffer:
             return self._data.copy()
 
 
+# -- weather buffer (thread-safe) ----------------------------------------------
+
+
+class WeatherBuffer:
+    """Thread-safe buffer holding the latest weather sample."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._data: dict[str, Any] = {}
+
+    def update(self, data: dict[str, Any]) -> None:
+        """Store the latest weather sample (copy semantics)."""
+        with self._lock:
+            self._data = data.copy()
+
+    def summary(self) -> dict[str, Any]:
+        """Return a copy of the current weather sample."""
+        with self._lock:
+            return self._data.copy()
+
+
 # -- BMS summary derivation helper --------------------------------------------
 
 
@@ -82,13 +103,26 @@ def build_bms_summary(battery_items: list[dict[str, Any]]) -> dict[str, Any]:
 # -- status formatter (Markdown output) ----------------------------------------
 
 
-def format_status_message(inverter: dict[str, Any], bms_summary: dict[str, Any]) -> str:
-    """Build a compact Markdown status message from inverter data and BMS summary.
+def _format_cloudiness(weather: dict[str, Any]) -> str:
+    """Render the latest cloudiness percentage for the status message."""
+    value = weather.get("cloudiness_pct")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "\u2014"
+    return f"{float(value):.0f}%"
+
+
+def format_status_message(
+    inverter: dict[str, Any],
+    bms_summary: dict[str, Any],
+    weather: dict[str, Any] | None = None,
+) -> str:
+    """Build a compact Markdown status message from live telemetry.
 
     Args:
         inverter: A dict of scalar inverter telemetry fields.
         bms_summary: A dict of BMS summary fields (e.g. ``active_count``,
             ``voltage_v``, ``min_cell_v``, ``max_cell_v``, ``cell_diff_mv``).
+        weather: The latest weather sample (e.g. ``cloudiness_pct``).
 
     Returns:
         A Markdown-formatted status string.
@@ -119,6 +153,7 @@ def format_status_message(inverter: dict[str, Any], bms_summary: dict[str, Any])
         f"Load: `{_get('daily_load_consumption_kwh', 'kWh')}`",
         f"Work mode: `{inverter.get('work_mode', '\u2014')}`   "
         f"Alert: `{inverter.get('alert', '\u2014')}`",
+        f"Cloudiness: `{_format_cloudiness(weather or {})}`",
     ]
 
     if bms:
@@ -142,6 +177,7 @@ def format_status_message(inverter: dict[str, Any], bms_summary: dict[str, Any])
 
 _SWITCH_REASON_TEXT = {
     "load_shed": "high load (load shed)",
+    "overcast": "overcast (100 % cloud)",
     "surplus_ration": "low solar surplus",
     "battery_ration": "battery rationing",
     "alert_restore": "inverter alert",
@@ -274,6 +310,8 @@ def _render_line_chart(
     df: pd.DataFrame,
     title: str,
     ylabel: str,
+    legend_ncols: int = 1,
+    legend_fontsize: str = "medium",
 ) -> bytes:
     """Render a line chart from a DataFrame with '_time' and numeric columns.
 
@@ -303,7 +341,7 @@ def _render_line_chart(
     ax.set_title(title)
     ax.set_xlabel("Time")
     ax.set_ylabel(ylabel)
-    ax.legend()
+    ax.legend(ncols=legend_ncols, fontsize=legend_fontsize)
     ax.grid(True)
     plt.xticks(rotation=45)
     plt.tight_layout()
@@ -326,34 +364,100 @@ def render_battery_chart(df: pd.DataFrame) -> bytes:
     return _render_line_chart(df, "Battery Status", "Value")
 
 
+def render_cell_chart(df: pd.DataFrame) -> bytes:
+    """Render a per-cell voltage line chart as PNG bytes via matplotlib."""
+    return _render_line_chart(
+        df,
+        "Cell Voltages",
+        "Volts",
+        legend_ncols=4,
+        legend_fontsize="small",
+    )
+
+
 # -- caption builder ----------------------------------------------------------
 
 
-def build_history_caption(
-    df_power: pd.DataFrame,
-    df_battery: pd.DataFrame,
-    hours: int,
-) -> str:
-    """Build a short plain-text summary caption from the queried DataFrames.
+def _build_caption(label: str, df: pd.DataFrame, hours: int) -> str:
+    """Build a short plain-text summary caption from a queried DataFrame.
 
     This is a plain-text caption (no parse_mode) because it appears on
     photo messages.  Any markup would be rendered literally.
     """
-    parts: list[str] = [f"History -- last {hours} h"]
-    for df, label in [(df_power, "Power"), (df_battery, "Battery")]:
-        if df.empty:
-            continue
-        numeric_cols = [
-            c
-            for c in df.columns
-            if c != "_time" and df[c].dtype in ("float64", "int64")
-        ]
-        if not numeric_cols:
-            continue
-        means = {c: df[c].mean() for c in numeric_cols}
-        parts.append(f"\n{label} averages:")
-        parts.append(
-            "  "
-            + "  ".join(f"{k}: {v:.1f}" for k, v in means.items() if not pd.isna(v))
-        )
+    parts: list[str] = [f"{label} -- last {hours} h"]
+    if df.empty:
+        return "\n".join(parts)
+    numeric_cols = [
+        c for c in df.columns if c != "_time" and df[c].dtype in ("float64", "int64")
+    ]
+    if not numeric_cols:
+        return "\n".join(parts)
+    means = {c: df[c].mean() for c in numeric_cols}
+    parts.append("Averages:")
+    parts.append(
+        "  " + "  ".join(f"{k}: {v:.1f}" for k, v in means.items() if not pd.isna(v))
+    )
     return "\n".join(parts)
+
+
+def build_history_caption(df_power: pd.DataFrame, hours: int) -> str:
+    """Build a plain-text caption for the power history chart."""
+    return _build_caption("Power history", df_power, hours)
+
+
+def build_battery_caption(df_battery: pd.DataFrame, hours: int) -> str:
+    """Build a plain-text caption for the battery history chart."""
+    return _build_caption("Battery history", df_battery, hours)
+
+
+# -- cell plot + recommendation (plain-text caption) ---------------------------
+
+# Recommendations are based on the latest observed per-cell delta
+CELL_BALANCED_MV = 30.0
+CELL_MONITOR_MV = 80.0
+
+
+def build_cell_recommendation(df: pd.DataFrame) -> str:
+    """Summarise the latest cell voltages and recommend an action.
+
+    Uses the last observed value of every cell series, so gaps in individual
+    Prometheus series do not blank out the recommendation.
+
+    Returns:
+        A plain-text caption for the /cell photo.
+    """
+    if df.empty:
+        return "No cell data available."
+    numeric_cols = [
+        c for c in df.columns if c != "_time" and df[c].dtype in ("float64", "int64")
+    ]
+    if not numeric_cols:
+        return "No cell data available."
+    values: dict[str, float] = {}
+    for column in numeric_cols:
+        series = df[column].dropna()
+        if not series.empty:
+            values[column] = float(series.iloc[-1])
+    if not values:
+        return "No cell data available."
+    min_cell = min(values, key=lambda cell: values[cell])
+    max_cell = max(values, key=lambda cell: values[cell])
+    delta_mv = (values[max_cell] - values[min_cell]) * 1000.0
+    lines = [
+        f"Cells: {len(values)}  Weakest: {min_cell} {values[min_cell]:.3f} V  "
+        f"Strongest: {max_cell} {values[max_cell]:.3f} V",
+        f"Delta: {delta_mv:.0f} mV",
+    ]
+    if delta_mv <= CELL_BALANCED_MV:
+        lines.append("Recommendation: cells are well balanced.")
+    elif delta_mv <= CELL_MONITOR_MV:
+        lines.append(
+            f"Recommendation: monitor -- plan a balance charge "
+            f"({delta_mv:.0f} mV > {CELL_BALANCED_MV:.0f} mV)."
+        )
+    else:
+        lines.append(
+            f"Recommendation: action required -- balance charge and inspect "
+            f"connections ({delta_mv:.0f} mV > {CELL_MONITOR_MV:.0f} mV)."
+        )
+    return "\n".join(lines)

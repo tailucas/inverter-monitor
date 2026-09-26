@@ -5,7 +5,6 @@ import re
 import socket
 import threading
 import time
-from collections import deque
 from pathlib import Path
 
 import libscrc
@@ -31,7 +30,7 @@ from tailucas_pylib.threads import bye, die, thread_nanny
 from tailucas_pylib.zmq import URL_WORKER_APP, Closable, try_close, zmq_socket, zmq_term
 from zmq.error import ContextTerminated, ZMQError
 
-from app.load_alerts import LoadAlertEvaluator, LoadShedLatch
+from app.load_alerts import CooldownLatch, LoadAlertEvaluator, TimeWindowAverage
 from app.metrics import configure as metrics_configure
 from app.serial_reader import SerialPortReader
 from app.single_flight import SingleFlight
@@ -46,10 +45,25 @@ URL_WORKER_LOAD_MONITOR = "inproc://load-monitor"
 # Points that carry notifications only and are never exported as metrics
 NOTIFICATION_ONLY_POINTS = {"switch_event", "load_alert"}
 # Points forwarded to the Telegram bot fan-out
-TELEGRAM_FANOUT_POINTS = {"battery", "switch_event", "load_alert"}
+TELEGRAM_FANOUT_POINTS = {"battery", "weather", "switch_event", "load_alert"}
 
-DEFAULT_SAMPLE_INTERVAL_SECONDS = 60
-ERROR_RETRY_INTERVAL_SECONDS = 5
+# inverter polling: poll quickly and back off exponentially after failures
+DEFAULT_POLL_BACKOFF_SECONDS = 1.0
+MAX_POLL_BACKOFF_SECONDS = 60.0
+# generous time bound for detecting implausible SoC steps between polls
+IMPLAUSIBLE_SOC_WINDOW_SECONDS = 120
+# weather: 60 s poll cadence with a bounded HTTP request timeout and
+# exponential backoff (up to 600 s) when a fetch fails
+DEFAULT_WEATHER_POLL_INTERVAL_SECONDS = 60
+MAX_WEATHER_BACKOFF_SECONDS = 600
+WEATHER_REQUEST_TIMEOUT_SECONDS = 10
+# rolling window for the surplus generation average
+DEFAULT_GENERATION_AVERAGE_SECONDS = 300
+# overcast switch reason: 100 % cloud with a self-extending cooldown
+OVERCAST_CLOUDINESS_PCT = 100
+DEFAULT_OVERCAST_COOLDOWN_SECONDS = 3600
+# cloudiness older than this is treated as unknown for overcast rationing
+CLOUDINESS_STALE_SECONDS = 180
 IMPLAUSIBLE_CHANGE_PERCENTAGE = 5
 BATTERY_LOW_PCT = 45
 # assuming CFE drop-out at 30%
@@ -78,9 +92,9 @@ INVERTER_CYCLE_DURATION = OTEL_METER.create_gauge(
     name="inverter_cycle_duration_seconds",
     description="Full inverter sampling cycle (query + plausibility retries + publish)",
 )
-INVERTER_CADENCE_RATIO = OTEL_METER.create_gauge(
-    name="inverter_sample_cadence_ratio",
-    description="Ratio of cycle duration to sample interval; values > 1.0 mean overrun",
+INVERTER_POLL_BACKOFF = OTEL_METER.create_gauge(
+    name="inverter_poll_backoff_seconds",
+    description="Current inverter poll backoff after the last poll outcome",
 )
 WEATHER_FETCH_DURATION = OTEL_METER.create_gauge(
     name="weather_fetch_duration_seconds",
@@ -155,17 +169,44 @@ class LoggerReader(AppThread):
         logger_sn,
         logger_ip,
         logger_port,
-        sample_interval_secs=DEFAULT_SAMPLE_INTERVAL_SECONDS,
+        poll_backoff_seconds=DEFAULT_POLL_BACKOFF_SECONDS,
+        max_poll_backoff_seconds=MAX_POLL_BACKOFF_SECONDS,
     ):
         AppThread.__init__(self, name=self.__class__.__name__)
         self.field_mappings = field_mappings
         self.logger_sn = logger_sn
         self.logger_ip = logger_ip
         self.logger_port = logger_port
-        self.sample_interval_secs = sample_interval_secs
+        self.poll_backoff_seconds = poll_backoff_seconds
+        self.max_poll_backoff_seconds = max_poll_backoff_seconds
+        self._poll_backoff = poll_backoff_seconds
         self._query_flight = SingleFlight()
 
+    def _log_context(self) -> dict:
+        """Structured context shared by inverter fetch failure logs."""
+        return {
+            "logger_ip": self.logger_ip,
+            "logger_port": self.logger_port,
+            "logger_sn": self.logger_sn,
+        }
+
     def get_logger_data(self):
+        """Query the inverter, timing every attempt (success or failure)."""
+        _query_start = time.time()
+        try:
+            return self._read_logger_data()
+        except Exception:
+            # every fetch failure must be visible with logger context
+            log.warning(
+                "Unexpected error while querying inverter",
+                exc_info=True,
+                extra=self._log_context(),
+            )
+            return None
+        finally:
+            INVERTER_QUERY_DURATION.set(time.time() - _query_start)
+
+    def _read_logger_data(self):
         _query_start = time.time()
         output = {}
 
@@ -193,11 +234,12 @@ class LoggerReader(AppThread):
             checksum_placeholder = binascii.unhexlify("00")  # checksum F2
             endCode = binascii.unhexlify("15")
 
+            logger_sn_hex = f"{self.logger_sn:08x}"
             inverter_sn2 = bytearray.fromhex(
-                hex(self.logger_sn)[8:10]
-                + hex(self.logger_sn)[6:8]
-                + hex(self.logger_sn)[4:6]
-                + hex(self.logger_sn)[2:4]
+                logger_sn_hex[6:8]
+                + logger_sn_hex[4:6]
+                + logger_sn_hex[2:4]
+                + logger_sn_hex[0:2]
             )
             frame = bytearray(
                 start
@@ -227,19 +269,37 @@ class LoggerReader(AppThread):
                     "logger_port": self.logger_port,
                 },
             )
-            for res in socket.getaddrinfo(
-                self.logger_ip, self.logger_port, socket.AF_INET, socket.SOCK_STREAM
-            ):
+            try:
+                address_info = socket.getaddrinfo(
+                    self.logger_ip,
+                    self.logger_port,
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                )
+            except OSError as msg:
+                log.warning(
+                    "Unable to resolve inverter logger address",
+                    extra={**self._log_context(), "error": str(msg)},
+                )
+                return None
+            for res in address_info:
                 family, socktype, proto, canonname, sockadress = res
                 try:
                     client_socket = socket.socket(family, socktype, proto)
                     client_socket.settimeout(10)
                     client_socket.connect(sockadress)
                 except OSError as msg:
-                    log.warning("Socket connect error", extra={"error": str(msg)})
+                    log.warning(
+                        "Socket connect error",
+                        extra={**self._log_context(), "error": str(msg)},
+                    )
                     return None
 
             if client_socket is None:
+                log.warning(
+                    "No usable socket address for inverter logger",
+                    extra=self._log_context(),
+                )
                 return None
 
             # SEND DATA
@@ -247,23 +307,70 @@ class LoggerReader(AppThread):
                 "Sending data frame",
                 extra={"frame_bytes": len(frame_bytes), "chunk_number": chunks},
             )
-            client_socket.sendall(frame_bytes)
+            try:
+                client_socket.sendall(frame_bytes)
+            except OSError as msg:
+                log.warning(
+                    "Socket send error",
+                    extra={
+                        **self._log_context(),
+                        "chunk_number": chunks,
+                        "frame_bytes": len(frame_bytes),
+                        "error": str(msg),
+                    },
+                )
+                try:
+                    client_socket.close()
+                except OSError:
+                    log.debug("Ignoring socket close error", exc_info=True)
+                return None
 
             # RECEIVE RESPONSE
             data = None
             try:
                 data = client_socket.recv(1024)
-                if data is None:
-                    log.warning("No response data.")
-                    return None
             except TimeoutError as msg:
-                log.warning("Socket receive timeout", extra={"error": str(msg)})
+                log.warning(
+                    "Socket receive timeout",
+                    extra={
+                        **self._log_context(),
+                        "chunk_number": chunks,
+                        "error": str(msg),
+                    },
+                )
+                return None
+            except OSError as msg:
+                log.warning(
+                    "Socket receive error",
+                    extra={
+                        **self._log_context(),
+                        "chunk_number": chunks,
+                        "error": str(msg),
+                    },
+                )
                 return None
             finally:
                 try:
                     client_socket.close()
                 except OSError as msg:
-                    log.warning("Socket close error", extra={"error": str(msg)})
+                    log.warning(
+                        "Socket close error",
+                        extra={
+                            **self._log_context(),
+                            "chunk_number": chunks,
+                            "error": str(msg),
+                        },
+                    )
+            if not data:
+                log.warning(
+                    "Empty response from inverter logger",
+                    extra={
+                        **self._log_context(),
+                        "chunk_number": chunks,
+                        "response_bytes": 0 if data is None else len(data),
+                    },
+                )
+                return None
 
             log.debug(
                 "Received chunk",
@@ -290,7 +397,13 @@ class LoggerReader(AppThread):
                     log.warning(
                         "Discarding byte response",
                         exc_info=True,
-                        extra={"response_bytes": len(data)},
+                        extra={
+                            **self._log_context(),
+                            "chunk_number": chunks,
+                            "register": "0x" + str(hex(a + pini)[2:].zfill(4)).upper(),
+                            "response_bytes": len(data),
+                            "response_hex": data[:64].hex(),
+                        },
                     )
                     return None
                 hexpos = "0x" + str(hex(a + pini)[2:].zfill(4)).upper()
@@ -327,7 +440,6 @@ class LoggerReader(AppThread):
             pfin = 195
             chunks += 1
         _query_duration = time.time() - _query_start
-        INVERTER_QUERY_DURATION.set(_query_duration)
         log.debug(
             "Fetched fields",
             extra={
@@ -364,38 +476,36 @@ class LoggerReader(AppThread):
             prev_battery_soc_set = time.time()
             while not threads.shutting_down:
                 operation_start_time = time.time()
-                tries = 1
-                logger_data = None
-                # try within the time budget to get a plausible value,
-                # relative to the previous
-                while (
-                    time.time() - operation_start_time
-                    < DEFAULT_SAMPLE_INTERVAL_SECONDS / 2
-                ):
-                    tries += 1
-                    now = time.time()
+                now = operation_start_time
+                try:
                     logger_data = self.query_now()
-                    if isinstance(logger_data, dict):
-                        if "battery_soc_pct" in logger_data.keys():
-                            battery_soc = logger_data["battery_soc_pct"]
-                            battery_voltage = logger_data["battery_voltage_v"]
-                            # implausible battery state
-                            if battery_soc == 0 and battery_voltage == 0:
-                                log.warning(
-                                    "Treating inverter output as implausible",
-                                    extra={
-                                        "battery_soc_pct": battery_soc,
-                                        "battery_voltage_v": battery_voltage,
-                                        "logger_data": str(logger_data),
-                                    },
-                                )
-                                continue
-                            # no previous to compare
-                            if prev_battery_soc is None:
-                                prev_battery_soc = battery_soc
-                                prev_battery_soc_set = now
-                                # current dict is good enough, break the try loop
-                                break
+                except Exception:
+                    log.warning(
+                        "Inverter query raised an unexpected error",
+                        exc_info=True,
+                        extra=self._log_context(),
+                    )
+                    logger_data = None
+                accepted = False
+                if isinstance(logger_data, dict):
+                    if "battery_soc_pct" in logger_data.keys():
+                        battery_soc = logger_data["battery_soc_pct"]
+                        battery_voltage = logger_data["battery_voltage_v"]
+                        # implausible battery state
+                        if battery_soc == 0 and battery_voltage == 0:
+                            log.warning(
+                                "Treating inverter output as implausible",
+                                extra={
+                                    "battery_soc_pct": battery_soc,
+                                    "battery_voltage_v": battery_voltage,
+                                    "logger_data": str(logger_data),
+                                },
+                            )
+                        elif prev_battery_soc is None:
+                            prev_battery_soc = battery_soc
+                            prev_battery_soc_set = now
+                            accepted = True
+                        else:
                             soc_delta_pct = int(battery_soc - prev_battery_soc)
                             prev_battery_soc_last_set = now - prev_battery_soc_set
                             log.debug(
@@ -409,12 +519,11 @@ class LoggerReader(AppThread):
                                     "battery_soc": battery_soc,
                                 },
                             )
-                            # check for an implausible negative change within
-                            # some time bound
+                            # check for an implausible change within a time bound
                             if (
                                 abs(soc_delta_pct) >= IMPLAUSIBLE_CHANGE_PERCENTAGE
                                 and prev_battery_soc_last_set
-                                < DEFAULT_SAMPLE_INTERVAL_SECONDS * 2
+                                < IMPLAUSIBLE_SOC_WINDOW_SECONDS
                             ):
                                 log.warning(
                                     "Treating battery_soc_pct change as implausible",
@@ -429,54 +538,40 @@ class LoggerReader(AppThread):
                                 # accept the new value as good
                                 prev_battery_soc = battery_soc
                                 prev_battery_soc_set = now
-                                # control field change is plausible
-                                break
-                    log.warning(
-                        "Waiting after unsuccessful tries",
-                        extra={
-                            "retry_interval_secs": ERROR_RETRY_INTERVAL_SECONDS,
-                            "tries": tries,
-                        },
-                    )
-                    threads.interruptable_sleep.wait(ERROR_RETRY_INTERVAL_SECONDS)
-                if logger_data is not None and len(logger_data) > 0:
+                                accepted = True
+                if accepted and logger_data is not None and len(logger_data) > 0:
                     log.debug(
                         "Sending fields for publication",
                         extra={"field_count": len(logger_data)},
                     )
                     app_socket.send_pyobj({"inverter": logger_data})
+                    poll_delay = self.poll_backoff_seconds
+                    self._poll_backoff = self.poll_backoff_seconds
                 else:
+                    # exponential back-off on failed or implausible polls
+                    poll_delay = self._poll_backoff
+                    self._poll_backoff = min(
+                        poll_delay * 2, self.max_poll_backoff_seconds
+                    )
                     log.warning(
-                        "Unable to fetch any valid data",
+                        "Inverter poll failed; backing off",
                         extra={
-                            "tries": tries,
-                            "interval_secs": DEFAULT_SAMPLE_INTERVAL_SECONDS,
+                            "poll_backoff_secs": round(poll_delay, 2),
+                            "next_backoff_secs": round(self._poll_backoff, 2),
+                            "max_backoff_secs": self.max_poll_backoff_seconds,
                         },
                     )
-                # stop for the remainder of the sampling interval
                 operation_time = time.time() - operation_start_time
                 INVERTER_CYCLE_DURATION.set(operation_time)
-                INVERTER_CADENCE_RATIO.set(operation_time / self.sample_interval_secs)
-                sample_delay = self.sample_interval_secs - operation_time
-                if sample_delay < 0:
-                    normalized_sample_delay = min(
-                        operation_time, self.sample_interval_secs
-                    )
-                    log.warning(
-                        "Sample interval is too short. Resetting delay",
-                        extra={
-                            "sample_interval_secs": self.sample_interval_secs,
-                            "implied_wait_secs": round(sample_delay, 2),
-                            "normalized_delay_secs": round(normalized_sample_delay, 2),
-                        },
-                    )
-                    # don't use 0: never spin
-                    sample_delay = normalized_sample_delay
+                INVERTER_POLL_BACKOFF.set(poll_delay)
                 log.debug(
-                    "Waiting until the next sample",
-                    extra={"sample_delay_secs": round(sample_delay, 2)},
+                    "Waiting before the next poll",
+                    extra={
+                        "poll_delay_secs": round(poll_delay, 2),
+                        "cycle_secs": round(operation_time, 2),
+                    },
                 )
-                threads.interruptable_sleep.wait(sample_delay)
+                threads.interruptable_sleep.wait(poll_delay)
 
 
 class WeatherReader(AppThread):
@@ -489,6 +584,13 @@ class WeatherReader(AppThread):
         self.lat, self.lon = tuple(
             app_config.get("weather", "coord_lat_lon").split(",")
         )
+        self.poll_interval_seconds = app_config.getint(
+            "weather",
+            "poll_interval_seconds",
+            fallback=DEFAULT_WEATHER_POLL_INTERVAL_SECONDS,
+        )
+        self.max_backoff_seconds = MAX_WEATHER_BACKOFF_SECONDS
+        self._poll_backoff = self.poll_interval_seconds
 
     def get_weather_data(self):
         _weather_start = time.time()
@@ -501,6 +603,7 @@ class WeatherReader(AppThread):
                     "lon": self.lon,
                     "appid": self.api_key,
                 },
+                timeout=WEATHER_REQUEST_TIMEOUT_SECONDS,
             )
             try:
                 output = json.loads(r.content)
@@ -509,13 +612,25 @@ class WeatherReader(AppThread):
                 log.warning(
                     "JSON parse error of weather response",
                     exc_info=True,
-                    extra={"response_content": repr(r.content)},
+                    extra={
+                        "lat": self.lat,
+                        "lon": self.lon,
+                        "response_content": repr(r.content)[:512],
+                    },
                 )
                 _weather_duration = time.time() - _weather_start
                 WEATHER_FETCH_DURATION.set(_weather_duration)
                 return None
         except OSError, ConnectionError, RequestException:
-            log.warning("Problem getting weather data.", exc_info=True)
+            log.warning(
+                "Problem getting weather data.",
+                exc_info=True,
+                extra={
+                    "lat": self.lat,
+                    "lon": self.lon,
+                    "timeout_secs": WEATHER_REQUEST_TIMEOUT_SECONDS,
+                },
+            )
             _weather_duration = time.time() - _weather_start
             WEATHER_FETCH_DURATION.set(_weather_duration)
             return None
@@ -535,52 +650,93 @@ class WeatherReader(AppThread):
             while not threads.shutting_down:
                 wd = self.get_weather_data()
                 log.debug("Received weather data", extra={"weather_data": wd})
+                weather = None
                 if wd is not None and len(wd) > 0:
-                    weather = dict()
-                    weather["cloudiness_pct"] = wd["clouds"]["all"]
-                    date_value = int(wd["dt"])
-                    sunrise = int(wd["sys"]["sunrise"])
-                    sunset = int(wd["sys"]["sunset"])
-                    sun_output = 0
-                    # calculate theoretical sun output
-                    if date_value > sunrise and date_value < sunset:
-                        # normalize and divide
-                        midday_secs = (sunset - sunrise) / 2
-                        secs_from_dark = min(date_value - sunrise, sunset - date_value)
-                        sun_output = int((secs_from_dark / midday_secs) * 100)
-                        log.debug(
-                            "Derived sun output",
+                    try:
+                        weather = self._derive_weather(wd)
+                    except Exception:
+                        log.warning(
+                            "Unexpected error processing weather data",
+                            exc_info=True,
                             extra={
-                                "sun_output_pct": sun_output,
-                                "sunrise": sunrise,
-                                "date_value": date_value,
-                                "sunset": sunset,
-                                "midday_secs": midday_secs,
-                                "secs_from_dark": secs_from_dark,
+                                "lat": self.lat,
+                                "lon": self.lon,
+                                "weather_keys": sorted(wd.keys())
+                                if isinstance(wd, dict)
+                                else str(type(wd)),
                             },
                         )
-                    else:
-                        log.debug(
-                            "Using sun output",
-                            extra={
-                                "sun_output_pct": sun_output,
-                                "sunrise": sunrise,
-                                "date_value": date_value,
-                                "sunset": sunset,
-                            },
-                        )
-                    country = wd["sys"]["country"]
-                    weather["midday_pct"] = sun_output
+                if weather is not None:
                     log.debug(
                         "Sending weather fields for publication",
-                        extra={
-                            "country": country,
-                            "field_count": len(weather),
-                            "weather": weather,
-                        },
+                        extra={"field_count": len(weather), "weather": weather},
                     )
                     app_socket.send_pyobj({"weather": weather})
-                threads.interruptable_sleep.wait(DEFAULT_SAMPLE_INTERVAL_SECONDS)
+                    poll_delay = self.poll_interval_seconds
+                    self._poll_backoff = self.poll_interval_seconds
+                else:
+                    # exponential back-off on failed or malformed fetches
+                    poll_delay = self._poll_backoff
+                    self._poll_backoff = min(poll_delay * 2, self.max_backoff_seconds)
+                    log.warning(
+                        "Weather fetch failed; backing off",
+                        extra={
+                            "poll_backoff_secs": round(poll_delay, 2),
+                            "next_backoff_secs": round(self._poll_backoff, 2),
+                            "max_backoff_secs": self.max_backoff_seconds,
+                        },
+                    )
+                log.debug(
+                    "Waiting before the next weather poll",
+                    extra={"poll_delay_secs": round(poll_delay, 2)},
+                )
+                threads.interruptable_sleep.wait(poll_delay)
+
+    def _derive_weather(self, wd: dict) -> dict:
+        """Derive the published weather fields from an OpenWeather payload."""
+        weather = dict()
+        weather["cloudiness_pct"] = wd["clouds"]["all"]
+        date_value = int(wd["dt"])
+        sunrise = int(wd["sys"]["sunrise"])
+        sunset = int(wd["sys"]["sunset"])
+        sun_output = 0
+        # calculate theoretical sun output
+        if date_value > sunrise and date_value < sunset:
+            # normalize and divide
+            midday_secs = (sunset - sunrise) / 2
+            secs_from_dark = min(date_value - sunrise, sunset - date_value)
+            sun_output = int((secs_from_dark / midday_secs) * 100)
+            log.debug(
+                "Derived sun output",
+                extra={
+                    "sun_output_pct": sun_output,
+                    "sunrise": sunrise,
+                    "date_value": date_value,
+                    "sunset": sunset,
+                    "midday_secs": midday_secs,
+                    "secs_from_dark": secs_from_dark,
+                },
+            )
+        else:
+            log.debug(
+                "Using sun output",
+                extra={
+                    "sun_output_pct": sun_output,
+                    "sunrise": sunrise,
+                    "date_value": date_value,
+                    "sunset": sunset,
+                },
+            )
+        weather["midday_pct"] = sun_output
+        log.debug(
+            "Derived weather fields",
+            extra={
+                "country": wd["sys"]["country"],
+                "field_count": len(weather),
+                "weather": weather,
+            },
+        )
+        return weather
 
 
 class BmsReader(AppThread):
@@ -954,7 +1110,26 @@ class MqttSubscriber(AppThread, Closable):
 
         self._switch_state = dict()
 
-        self._power_generation_history: deque[float] = deque(maxlen=5)
+        generation_average_secs = app_config.getint(
+            "alert_thresholds",
+            "generation_average_seconds",
+            fallback=DEFAULT_GENERATION_AVERAGE_SECONDS,
+        )
+        self._generation_average = TimeWindowAverage(
+            window_secs=generation_average_secs
+        )
+        overcast_cooldown_secs = app_config.getint(
+            "alert_thresholds",
+            "overcast_cooldown_seconds",
+            fallback=DEFAULT_OVERCAST_COOLDOWN_SECONDS,
+        )
+        self._overcast_latch = CooldownLatch(
+            threshold=OVERCAST_CLOUDINESS_PCT,
+            cooldown_secs=overcast_cooldown_secs,
+            inclusive=True,
+        )
+        self._cloudiness_pct: float | None = None
+        self._cloudiness_set_at: float | None = None
 
         load_warning_w = app_config.getint(
             "alert_thresholds", "load_warning_w", fallback=DEFAULT_LOAD_WARNING_W
@@ -962,8 +1137,8 @@ class MqttSubscriber(AppThread, Closable):
         self._load_shed_w = app_config.getint(
             "alert_thresholds", "load_shed_w", fallback=load_warning_w
         )
-        self._load_shed_latch = LoadShedLatch(
-            threshold_w=self._load_shed_w,
+        self._load_shed_latch = CooldownLatch(
+            threshold=self._load_shed_w,
             cooldown_secs=app_config.getint(
                 "alert_thresholds",
                 "load_shed_cooldown_seconds",
@@ -1119,12 +1294,8 @@ class MqttSubscriber(AppThread, Closable):
             },
         )
 
-    def get_power_generation_avg(self, value):
-        self._power_generation_history.append(value)
-        total: float = 0.0
-        for sample in self._power_generation_history:
-            total += sample
-        return total / len(self._power_generation_history)
+    def get_power_generation_avg(self, value, now):
+        return self._generation_average.add(value, now)
 
     # noinspection PyBroadException
     def run(self):
@@ -1161,6 +1332,17 @@ class MqttSubscriber(AppThread, Closable):
                     continue
                 if not isinstance(inverter_data, dict):
                     continue
+                if "cloudiness_pct" in inverter_data:
+                    # weather fan-out feeding the overcast rationing reason
+                    self._cloudiness_pct = numeric_field(
+                        inverter_data.get("cloudiness_pct")
+                    )
+                    self._cloudiness_set_at = time.time()
+                    log.debug(
+                        "Weather sample received for overcast rationing",
+                        extra={"cloudiness_pct": self._cloudiness_pct},
+                    )
+                    continue
                 # check for required fields
                 if not all(
                     field in inverter_data.keys()
@@ -1174,6 +1356,7 @@ class MqttSubscriber(AppThread, Closable):
                     continue
                 switch_state = 1
                 switch_stats["load_shed"] = 0
+                switch_stats["overcast"] = 0
                 switch_stats["surplus_ration"] = 0
                 switch_stats["battery_ration"] = 0
                 now = time.time()
@@ -1197,7 +1380,37 @@ class MqttSubscriber(AppThread, Closable):
                 if load_shed_active:
                     switch_state = 0
                     switch_stats["load_shed"] = 1
-                if int(inverter_data["alert"]) == 1 and not load_shed_active:
+                # check 0b: overcast rationing (100 % cloudiness)
+                cloudiness_age = None
+                if self._cloudiness_set_at is not None:
+                    cloudiness_age = now - self._cloudiness_set_at
+                if (
+                    self._cloudiness_pct is not None
+                    and cloudiness_age is not None
+                    and cloudiness_age <= CLOUDINESS_STALE_SECONDS
+                ):
+                    overcast_active = self._overcast_latch.update(
+                        self._cloudiness_pct, now
+                    )
+                else:
+                    overcast_active = self._overcast_latch.active
+                    if self._cloudiness_pct is not None:
+                        log.debug(
+                            "Ignoring stale weather; retaining overcast state",
+                            extra={
+                                "cloudiness_pct": self._cloudiness_pct,
+                                "cloudiness_age_secs": round(cloudiness_age or 0.0, 1),
+                                "overcast": int(overcast_active),
+                            },
+                        )
+                if overcast_active:
+                    switch_state = 0
+                    switch_stats["overcast"] = 1
+                if (
+                    int(inverter_data["alert"]) == 1
+                    and not load_shed_active
+                    and not overcast_active
+                ):
                     # do not load shed during an alert condition; a latched
                     # high-load condition takes priority over this guard
                     changed_banks = self.set_switch_state()
@@ -1217,7 +1430,8 @@ class MqttSubscriber(AppThread, Closable):
                 pv2_power_w = float(inverter_data["pv2_power_w"])
                 battery_power_w = float(inverter_data["battery_power_w"])
                 power_generation_w_avg = self.get_power_generation_avg(
-                    value=pv1_power_w + pv2_power_w - battery_power_w
+                    value=pv1_power_w + pv2_power_w - battery_power_w,
+                    now=now,
                 )
                 # disable switch if battery is critically low without
                 # adequate surplus (i.e. not charging from solar)
@@ -1266,12 +1480,16 @@ class MqttSubscriber(AppThread, Closable):
                     "grid_voltage_v": grid_voltage,
                     "load_w": numeric_field(load_field),
                     "load_shed": switch_stats["load_shed"],
+                    "cloudiness_pct": self._cloudiness_pct,
+                    "overcast": switch_stats["overcast"],
                     "switch_state": switch_state,
                 }
                 log.debug(log_msg, extra=log_fields)
                 reason = "all_clear"
                 if switch_stats["load_shed"]:
                     reason = "load_shed"
+                elif switch_stats["overcast"]:
+                    reason = "overcast"
                 elif switch_stats["surplus_ration"]:
                     reason = "surplus_ration"
                 elif switch_stats["battery_ration"]:
@@ -1680,6 +1898,9 @@ class EventProcessor(AppThread, Closable):
                             load_socket.send_pyobj(point_items)
                             if point_name not in debug_metrics:
                                 mqtt_socket.send_pyobj(point_items)
+                        elif point_name == "weather":
+                            # latest cloudiness feeds the overcast reason
+                            mqtt_socket.send_pyobj(point_items)
                         # Forward telemetry and notifications to the Telegram bot
                         if (
                             telegram_socket is not None
@@ -1762,8 +1983,10 @@ def main():
             logger_sn=app_config.getint("inverter", "logger_sn"),
             logger_ip=app_config.get("inverter", "logger_address"),
             logger_port=app_config.getint("inverter", "logger_port"),
-            sample_interval_secs=app_config.getint(
-                "inverter", "logger_sample_interval_seconds"
+            poll_backoff_seconds=app_config.getfloat(
+                "inverter",
+                "poll_backoff_seconds",
+                fallback=DEFAULT_POLL_BACKOFF_SECONDS,
             ),
         )
     bms_reader: BmsReader | None = None
