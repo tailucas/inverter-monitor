@@ -9,6 +9,7 @@ Pure helper functions and data structures are in `app.telegram_bot`.
 """
 
 import asyncio
+import datetime
 import queue
 import threading
 from asyncio import AbstractEventLoop
@@ -24,7 +25,7 @@ from tailucas_pylib.zmq import Closable
 from telegram import Update
 from telegram import User as TelegramUser
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import TimedOut
+from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -108,14 +109,28 @@ async def validate(
     Returns the verified TelegramUser or None if the request should be discarded.
     """
     user: TelegramUser | None = update.effective_user
+    chat = update.effective_chat
+    # chat context makes it easy to discover the target room id
+    chat_context = {
+        "chat_id": chat.id if chat is not None else None,
+        "chat_type": str(chat.type) if chat is not None else None,
+        "chat_title": chat.title if chat is not None else None,
+    }
     if user is None or user.is_bot:
-        log.debug("Ignoring bot user", extra={"command": command_name})
+        log.debug(
+            "Ignoring bot user",
+            extra={"command": command_name, **chat_context},
+        )
         return None
     allowed = app_config.get("telegram", "enabled_users_csv").split(",")
     if str(user.id) not in allowed:
         log.info(
             "Ignoring user not in allowlist",
-            extra={"command": command_name, "user_id": user.id},
+            extra={
+                "command": command_name,
+                "user_id": user.id,
+                **chat_context,
+            },
         )
         help_url = app_config.get(
             "telegram",
@@ -138,6 +153,7 @@ async def validate(
             "command": command_name,
             "user_id": user.id,
             "language": user.language_code,
+            **chat_context,
         },
     )
     return user
@@ -606,6 +622,49 @@ def _fetch_and_render_cells(hours: int) -> tuple[pd.DataFrame, bytes]:
     return df, render_cell_chart(df)
 
 
+# -- notification helpers ------------------------------------------------------
+
+# Telegram rate-limit hints longer than this are logged but not waited out.
+MAX_TELEGRAM_RETRY_WAIT_SECONDS = 30
+
+
+def _is_permanent_recipient_error(exc: Exception) -> bool:
+    """True when a Telegram send failure cannot recover without user action.
+
+    ``Forbidden`` covers "bot can't initiate conversation with a user" and
+    "bot was blocked by the user"; ``BadRequest: chat not found`` means the
+    recipient never started the bot (or the ID is stale).
+    """
+    if isinstance(exc, Forbidden):
+        return True
+    if isinstance(exc, BadRequest):
+        return "chat not found" in str(exc).lower()
+    return False
+
+
+def _notification_chat_ids() -> list[str]:
+    """Chat IDs used for bot-initiated notifications.
+
+    A configured ``[telegram] chat_room_id`` (a group the bot has joined)
+    takes precedence: group rooms are an existing chat, so Telegram's
+    "bot can't initiate conversation with a user" restriction does not
+    apply. Without it, the allowlisted user IDs are used, each of which must
+    have started the bot.
+    """
+    chat_room_id = app_config.get("telegram", "chat_room_id", fallback="").strip()
+    if chat_room_id:
+        try:
+            int(chat_room_id)
+        except ValueError:
+            log.warning(
+                "Ignoring non-numeric Telegram chat room id",
+                extra={"chat_room_id": chat_room_id},
+            )
+        else:
+            return [chat_room_id]
+    return app_config.get("telegram", "enabled_users_csv").split(",")
+
+
 class TelegramBot(AppThread, Closable):
     """Runs the Telegram bot polling loop and manages the status buffer."""
 
@@ -646,6 +705,7 @@ class TelegramBot(AppThread, Closable):
         self._notify_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._notify_event: asyncio.Event | None = None
         self._notify_task: asyncio.Task | None = None
+        self._unreachable_users: set[int] = set()
 
     def _receiver(self) -> None:
         """Background thread: bind PULL socket and ingest telemetry events."""
@@ -701,6 +761,14 @@ class TelegramBot(AppThread, Closable):
         )
         # drain anything queued before initialization
         self._notify_event.set()
+        chat_room_id = app_config.get("telegram", "chat_room_id", fallback="").strip()
+        log.info(
+            "Telegram notification destinations resolved",
+            extra={
+                "chat_room_id": chat_room_id or None,
+                "recipient_count": len(_notification_chat_ids()),
+            },
+        )
         log.info("Telegram notification dispatcher started")
 
     async def _post_stop(self, application: Application) -> None:
@@ -766,33 +834,85 @@ class TelegramBot(AppThread, Closable):
                 extra={"payload_keys": payload_keys},
             )
             return
+
+        async def _send(chat_id: int) -> None:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+
         recipient_count = 0
-        for user_id in app_config.get("telegram", "enabled_users_csv").split(","):
+        unreachable_count = 0
+        for chat_id_field in _notification_chat_ids():
             try:
-                chat_id = int(user_id)
+                chat_id = int(chat_id_field)
             except ValueError:
                 log.warning(
-                    "Ignoring non-numeric Telegram user id",
-                    extra={"user_id": user_id},
+                    "Ignoring non-numeric Telegram chat id",
+                    extra={"chat_id": chat_id_field},
+                )
+                continue
+            if chat_id in self._unreachable_users:
+                unreachable_count += 1
+                log.debug(
+                    "Skipping unavailable Telegram recipient",
+                    extra={"chat_id": chat_id_field, "payload_keys": payload_keys},
                 )
                 continue
             try:
-                await application.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                )
+                try:
+                    await _send(chat_id)
+                except RetryAfter as exc:
+                    # rate limit: wait out the hint (bounded) and retry once
+                    retry_after = exc.retry_after
+                    retry_after_secs = (
+                        retry_after.total_seconds()
+                        if isinstance(retry_after, datetime.timedelta)
+                        else float(retry_after)
+                    )
+                    wait_secs = min(retry_after_secs, MAX_TELEGRAM_RETRY_WAIT_SECONDS)
+                    log.warning(
+                        "Telegram rate limit; deferring notification",
+                        extra={
+                            "chat_id": chat_id_field,
+                            "retry_after_seconds": retry_after_secs,
+                            "wait_seconds": wait_secs,
+                            "payload_keys": payload_keys,
+                        },
+                    )
+                    await asyncio.sleep(wait_secs)
+                    await _send(chat_id)
                 recipient_count += 1
             except Exception as exc:
+                error_type = f"{type(exc).__module__}.{type(exc).__name__}"
+                if _is_permanent_recipient_error(exc):
+                    # one actionable warning, then mute for this process
+                    self._unreachable_users.add(chat_id)
+                    log.warning(
+                        "Telegram recipient cannot receive notifications; muting",
+                        extra={
+                            "chat_id": chat_id_field,
+                            "error_type": error_type,
+                            "error": str(exc),
+                            "payload_keys": payload_keys,
+                        },
+                    )
+                    continue
                 log.warning(
                     "Failed to send Telegram notification",
                     exc_info=exc,
-                    extra={"user_id": user_id, "payload_keys": payload_keys},
+                    extra={
+                        "chat_id": chat_id_field,
+                        "error_type": error_type,
+                        "payload_keys": payload_keys,
+                    },
                 )
         log.info(
             "Telegram notification dispatched",
             extra={
                 "recipient_count": recipient_count,
+                "unreachable_count": unreachable_count,
                 "payload_keys": payload_keys,
             },
         )

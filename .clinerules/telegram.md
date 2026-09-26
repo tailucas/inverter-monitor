@@ -502,6 +502,22 @@ Rules:
   dispatcher.
 - A formatter or per-user send failure must never kill the dispatcher: log it
   (structured fields only) and continue with the remaining users.
+- Every ID in `enabled_users_csv` must have started the bot (`/start`) to
+  receive bot-initiated notifications — Telegram forbids a bot from
+  initiating a conversation with a user. A configured
+  `[telegram] chat_room_id` (provisioned as `TELEGRAM_CHAT_ROOM_ID`; a group
+  room the bot has joined) takes precedence over the per-user fan-out and
+  avoids that restriction entirely; a blank or non-numeric room id logs a
+  WARNING and falls back to the user list. The resolved destination is logged
+  once at startup (`"Telegram notification destinations resolved"`).
+  Permanent recipient failures (`Forbidden`, `BadRequest: chat not found`)
+  log one actionable WARNING per recipient (with `chat_id`, `error_type`, and
+  `error`) and mute that recipient for the remainder of the process;
+  transient failures keep the full WARNING with traceback. One recipient must
+  never abort the fan-out.
+- Telegram rate limits (`RetryAfter`) defer the affected recipient with a
+  bounded wait (at most 30 s) and retry the send once; a failed retry falls
+  back to the transient-failure WARNING.
 - Log only structured fields (`kind`, `reason`, `switch_banks`,
   `recipient_count`); never log the rendered message body.
 
@@ -534,6 +550,10 @@ Current commands (registered as simple `CommandHandler`s in `app/bot.py`
 
 Conventions:
 
+- Every command logs an INFO record (`"Telegram command"` for allowlisted
+  users, `"Ignoring user not in allowlist"` otherwise) carrying `command`,
+  `chat_id`, `chat_type`, `chat_title`, and `user_id` — send any command in
+  the target group to discover its chat ID for `TELEGRAM_CHAT_ROOM_ID`.
 - Hours arguments parse through the shared `_parse_hours` helper (1–720,
   default `DEFAULT_HISTORY_HOURS`).
 - Image generation also runs in `loop.run_in_executor(...)`, and the
