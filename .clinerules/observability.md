@@ -41,7 +41,8 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
 - The cadence gauge `inverter_poll_backoff_seconds` is a synchronous Gauge
   holding the current poll backoff applied by the inverter reader (the base
   value after a successful poll, doubled up to 60 s after failures or
-  implausible samples).
+  implausible samples). Reaching the 60 s maximum logs a single ERROR per
+  outage episode; staying latched at the maximum does not repeat it.
 - Log-only metrics (configured via `[metrics] debug_csv`) are discarded after
   debug-logging; they never become OTEL gauges.
 - `EventProcessor` has no time-series database writer today: telemetry is
@@ -78,10 +79,10 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
 
 | Level | Where |
 |---|---|
-| DEBUG | Per-poll/per-sample/frame tracing, gauge updates (including timing data), "Inverter is delivering power to consumers…" supporting data |
-| INFO | Startup/lifecycle events, MQTT publishes (with `traceparent` in `extra`), switch-bank notifications, load warning/recovery events, PagerDuty triggers & resolves, recoverable warnings (socket timeouts, implausible samples, PD trigger/resolve failures) |
-| WARNING | Inverter/weather fetch failures (resolution, connect/send/receive, empty responses, malformed payloads), implausible samples, poll backoff, PagerDuty client not configured, missing switch-bank config, readers or Telegram bot disabled at startup |
-| ERROR | Lost connections (serial, MQTT), unreadable mappings |
+| DEBUG | Per-poll/per-sample/frame tracing, gauge updates (including timing data), "Inverter is delivering power to consumers…" supporting data, inverter fetch failures (resolution, connect/send/receive, empty responses, malformed frames) and poll backoff detail |
+| INFO | Startup/lifecycle events, MQTT publishes (with `traceparent` in `extra`), switch-bank notifications, load warning/recovery events, PagerDuty triggers & resolves, recoverable failures (PD trigger/resolve failures, retried on the next sample cycle) |
+| WARNING | Weather fetch failures (resolution, connect/send/receive, empty responses, malformed payloads), implausible inverter samples, PagerDuty client not configured, missing switch-bank config, readers or Telegram bot disabled at startup |
+| ERROR | Lost connections (serial, MQTT), unreadable mappings, inverter poll backoff reaching its maximum (once per outage episode) |
 | CRITICAL | Reserved |
 
 ## PagerDuty Lifecycle

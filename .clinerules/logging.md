@@ -27,7 +27,7 @@ log.debug(
     "Received chunk",
     extra={"data_bytes": len(data), "chunk_number": chunks},
 )
-log.warning(
+log.debug(
     "Socket receive timeout",
     extra={
         "logger_ip": self.logger_ip,
@@ -57,16 +57,19 @@ log.info(message.format("RabbitMQ control"))                    # .format()
    `snake_case`; values JSON-friendly (coerce with `str()`, `repr()`,
    `.hex()`, `round(...)` where useful).
 2. **Exceptions:** `log.exception("Static message", extra={...})` inside
-   `except` blocks; `exc_info=True` to attach tracebacks to warnings. Include
-   `"error": str(e)` when no traceback is attached.
+   `except` blocks; `exc_info=True` to attach tracebacks to log records.
+   Include `"error": str(e)` when no traceback is attached.
 3. **Protocol diagnostics** keep the raw supporting data as fields
    (`header_bytes`, `frame_hex`, `control_code`, `response_bytes`) so failures
-   are debuggable from logs alone. Every inverter fetch failure logs at
-   WARNING with the logger context (`logger_ip`, `logger_port`, `logger_sn`)
-   plus `chunk_number` and the specific detail (`error`, `response_bytes`, or
-   a bounded `response_hex` excerpt). Unclassified fetch errors are logged as
+   are debuggable from logs alone. Every inverter fetch failure logs at DEBUG
+   with the logger context (`logger_ip`, `logger_port`, `logger_sn`) plus
+   `chunk_number` and the specific detail (`error`, `response_bytes`, or a
+   bounded `response_hex` excerpt). Unclassified fetch errors are logged as
    `"Unexpected error while querying inverter"` with `exc_info=True` and
-   return `None` — there are no silent failure returns.
+   return `None` — there are no silent failure returns. Sustained failure
+   escalates once: an ERROR (`"Inverter poll backoff reached the maximum"`)
+   when the poll backoff first reaches its maximum, re-armed by a successful
+   poll.
 4. **PagerDuty lifecycle** logs always carry `dedup_key`; trigger/resolve
    failures are INFO (recoverable — retried on the next sample cycle);
    "client not configured" messages stay WARNING.
@@ -102,8 +105,8 @@ log.info(message.format("RabbitMQ control"))                    # .format()
 
 | Level | Use here |
 |---|---|
-| DEBUG | per-sample/chunk/frame tracing, gauge updates, "Inverter is delivering power to consumers from backup…" supporting data (always, not conditional) |
+| DEBUG | per-sample/chunk/frame tracing, gauge updates, "Inverter is delivering power to consumers from backup…" supporting data (always, not conditional), inverter fetch failures (resolution, connect/send/receive, empty responses, malformed frames) and poll backoff detail |
 | INFO | reader lifecycle, switch state changes and switch-bank notifications, load warning/recovery events, MQTT publishes, PagerDuty triggers & resolves, startup, recoverable warnings (PD trigger/resolve failures) |
-| WARNING | inverter/weather fetch failures (address resolution, connect/send/receive timeouts and errors, empty responses, malformed frames or payloads), implausible samples, poll backoff, non-recoverable config gaps (PagerDuty client not configured, missing switch-bank config, reader or Telegram bot disabled) |
-| ERROR | lost connections (serial, MQTT), unreadable mappings |
+| WARNING | weather fetch failures (address resolution, connect/send/receive timeouts and errors, empty responses, malformed payloads), implausible inverter samples, non-recoverable config gaps (PagerDuty client not configured, missing switch-bank config, reader or Telegram bot disabled) |
+| ERROR | lost connections (serial, MQTT), unreadable mappings, inverter poll backoff reaching its maximum |
 | CRITICAL | reserved |

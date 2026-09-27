@@ -17,9 +17,11 @@ switch banks via MQTT.
 
 - Hardware-facing code must be defensive: timeouts, retries, plausibility
   checks, and PagerDuty alerting for data loss are first-class concerns.
-- No silent failures: every inverter fetch failure returns `None` **and**
-  logs a WARNING with the logger context (`logger_ip`, `logger_port`,
-  `logger_sn`) and the specific failure detail.
+- No silent failures: every inverter fetch failure returns `None` and logs
+  the detail at DEBUG with the logger context (`logger_ip`, `logger_port`,
+  `logger_sn`); sustained failure escalates to a single ERROR when the poll
+  backoff reaches its 60 s maximum (one per outage episode, re-armed by a
+  successful poll).
 - Built on the `tailucas_pylib` framework (`AppThread`, `exception_handler`,
   `thread_nanny`, `die()`/`bye()` shutdown). Follow pylib's standards.
 
@@ -30,13 +32,14 @@ One `AppThread` per concern, wired over ZMQ inproc (`URL_WORKER_APP`,
 
 - `LoggerReader`: polls the inverter Wi-Fi logger (chunked binary protocol,
   CRC16-MODBUS validation via `libscrc`, field mappings from
-  `config/field_mappings.txt`). Polls continuously with a 1 s base backoff
+  `config/field_mappings.txt`). Polls continuously with a 600 ms base backoff
   (`poll_backoff_seconds`), doubling exponentially to 60 s after failed or
   implausible samples. On-demand queries from the Telegram bot go through
   `query_now()` (`app/single_flight.py`) so ad-hoc and scheduled polls never
   hit the logger socket concurrently. Fetch errors never propagate:
-  `get_logger_data()` logs unexpected exceptions as a WARNING with traceback
-  and returns `None`, which the poll loop turns into a backoff. Request frames
+  `get_logger_data()` logs unexpected exceptions at DEBUG with traceback and
+  returns `None`, which the poll loop turns into a backoff (a run of failures
+  that reaches the 60 s maximum logs one ERROR). Request frames
   byte-swap the logger serial from an 8-hex-digit zero-padded value
   (`f"{self.logger_sn:08x}"`) so short or leading-zero serials stay valid.
 - `BmsReader`: consumes decoded BMS frames from `SerialPortReader`

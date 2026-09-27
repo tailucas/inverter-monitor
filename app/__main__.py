@@ -54,7 +54,7 @@ TELEGRAM_FANOUT_POINTS = {
 }
 
 # inverter polling: poll quickly and back off exponentially after failures
-DEFAULT_POLL_BACKOFF_SECONDS = 1.0
+DEFAULT_POLL_BACKOFF_SECONDS = 0.6
 MAX_POLL_BACKOFF_SECONDS = 60.0
 # generous time bound for detecting implausible SoC steps between polls
 IMPLAUSIBLE_SOC_WINDOW_SECONDS = 120
@@ -202,8 +202,9 @@ class LoggerReader(AppThread):
         try:
             return self._read_logger_data()
         except Exception:
-            # every fetch failure must be visible with logger context
-            log.warning(
+            # fetch failure detail is DEBUG; the poll loop escalates a run of
+            # failures that reaches the 60 s maximum to a single ERROR
+            log.debug(
                 "Unexpected error while querying inverter",
                 exc_info=True,
                 extra=self._log_context(),
@@ -283,7 +284,7 @@ class LoggerReader(AppThread):
                     socket.SOCK_STREAM,
                 )
             except OSError as msg:
-                log.warning(
+                log.debug(
                     "Unable to resolve inverter logger address",
                     extra={**self._log_context(), "error": str(msg)},
                 )
@@ -295,14 +296,14 @@ class LoggerReader(AppThread):
                     client_socket.settimeout(10)
                     client_socket.connect(sockadress)
                 except OSError as msg:
-                    log.warning(
+                    log.debug(
                         "Socket connect error",
                         extra={**self._log_context(), "error": str(msg)},
                     )
                     return None
 
             if client_socket is None:
-                log.warning(
+                log.debug(
                     "No usable socket address for inverter logger",
                     extra=self._log_context(),
                 )
@@ -316,7 +317,7 @@ class LoggerReader(AppThread):
             try:
                 client_socket.sendall(frame_bytes)
             except OSError as msg:
-                log.warning(
+                log.debug(
                     "Socket send error",
                     extra={
                         **self._log_context(),
@@ -336,7 +337,7 @@ class LoggerReader(AppThread):
             try:
                 data = client_socket.recv(1024)
             except TimeoutError as msg:
-                log.warning(
+                log.debug(
                     "Socket receive timeout",
                     extra={
                         **self._log_context(),
@@ -346,7 +347,7 @@ class LoggerReader(AppThread):
                 )
                 return None
             except OSError as msg:
-                log.warning(
+                log.debug(
                     "Socket receive error",
                     extra={
                         **self._log_context(),
@@ -359,7 +360,7 @@ class LoggerReader(AppThread):
                 try:
                     client_socket.close()
                 except OSError as msg:
-                    log.warning(
+                    log.debug(
                         "Socket close error",
                         extra={
                             **self._log_context(),
@@ -368,7 +369,7 @@ class LoggerReader(AppThread):
                         },
                     )
             if not data:
-                log.warning(
+                log.debug(
                     "Empty response from inverter logger",
                     extra={
                         **self._log_context(),
@@ -400,7 +401,7 @@ class LoggerReader(AppThread):
                         )[p1:p2]
                     )
                 except ValueError:
-                    log.warning(
+                    log.debug(
                         "Discarding byte response",
                         exc_info=True,
                         extra={
@@ -480,13 +481,14 @@ class LoggerReader(AppThread):
         ) as app_socket:
             prev_battery_soc = None
             prev_battery_soc_set = time.time()
+            consecutive_failures = 0
             while not threads.shutting_down:
                 operation_start_time = time.time()
                 now = operation_start_time
                 try:
                     logger_data = self.query_now()
                 except Exception:
-                    log.warning(
+                    log.debug(
                         "Inverter query raised an unexpected error",
                         exc_info=True,
                         extra=self._log_context(),
@@ -553,13 +555,29 @@ class LoggerReader(AppThread):
                     app_socket.send_pyobj({"inverter": logger_data})
                     poll_delay = self.poll_backoff_seconds
                     self._poll_backoff = self.poll_backoff_seconds
+                    consecutive_failures = 0
                 else:
                     # exponential back-off on failed or implausible polls
                     poll_delay = self._poll_backoff
                     self._poll_backoff = min(
                         poll_delay * 2, self.max_poll_backoff_seconds
                     )
-                    log.warning(
+                    consecutive_failures += 1
+                    if (
+                        self._poll_backoff >= self.max_poll_backoff_seconds
+                        and poll_delay < self.max_poll_backoff_seconds
+                    ):
+                        # one ERROR per outage episode that reaches the ceiling
+                        log.error(
+                            "Inverter poll backoff reached the maximum",
+                            extra={
+                                **self._log_context(),
+                                "consecutive_failures": consecutive_failures,
+                                "poll_backoff_secs": round(self._poll_backoff, 2),
+                                "max_backoff_secs": self.max_poll_backoff_seconds,
+                            },
+                        )
+                    log.debug(
                         "Inverter poll failed; backing off",
                         extra={
                             "poll_backoff_secs": round(poll_delay, 2),
