@@ -25,7 +25,7 @@ from tailucas_pylib.zmq import Closable
 from telegram import Update
 from telegram import User as TelegramUser
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,6 +34,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from app.gemini_image import GeminiImageClient
 from app.image_prompts import (
@@ -748,6 +749,14 @@ def _fetch_and_render_cells(hours: int) -> tuple[pd.DataFrame, bytes]:
 
 # Telegram rate-limit hints longer than this are logged but not waited out.
 MAX_TELEGRAM_RETRY_WAIT_SECONDS = 30
+# PTB's default request timeouts are 5 s, which a slow API round-trip can
+# exceed (a `TimedOut` send is otherwise dropped); the client is built with
+# explicit timeouts and a transient send failure is retried once.
+TELEGRAM_CONNECT_TIMEOUT_SECONDS = 10.0
+TELEGRAM_READ_TIMEOUT_SECONDS = 15.0
+TELEGRAM_WRITE_TIMEOUT_SECONDS = 15.0
+TELEGRAM_POOL_TIMEOUT_SECONDS = 2.0
+TELEGRAM_RETRY_DELAY_SECONDS = 2.0
 
 
 def _is_permanent_recipient_error(exc: Exception) -> bool:
@@ -941,7 +950,12 @@ class TelegramBot(AppThread, Closable):
                     )
 
     async def _send_notification(self, payload: dict[str, Any]) -> None:
-        """Send one notification message to every allowlisted user."""
+        """Send one notification message to every resolved destination.
+
+        Rate-limited sends are deferred (bounded) and retried once, as are
+        transient network failures such as ``TimedOut``; a permanent
+        recipient failure mutes that recipient for the process.
+        """
         application = self._application
         payload_keys = sorted(payload.keys())
         if application is None:
@@ -976,6 +990,7 @@ class TelegramBot(AppThread, Closable):
 
         recipient_count = 0
         unreachable_count = 0
+        failed_count = 0
         for chat_id_field in _notification_chat_ids():
             try:
                 chat_id = int(chat_id_field)
@@ -1015,9 +1030,26 @@ class TelegramBot(AppThread, Closable):
                     )
                     await asyncio.sleep(wait_secs)
                     await _send(chat_id)
+                except NetworkError as exc:
+                    # transient API/network failure (`TimedOut` included):
+                    # pause briefly and retry the send once
+                    error_type = f"{type(exc).__module__}.{type(exc).__name__}"
+                    log.info(
+                        "Retrying Telegram notification after network error",
+                        extra={
+                            "chat_id": chat_id_field,
+                            "error_type": error_type,
+                            "error": str(exc),
+                            "retry_delay_seconds": TELEGRAM_RETRY_DELAY_SECONDS,
+                            "payload_keys": payload_keys,
+                        },
+                    )
+                    await asyncio.sleep(TELEGRAM_RETRY_DELAY_SECONDS)
+                    await _send(chat_id)
                 recipient_count += 1
             except Exception as exc:
                 error_type = f"{type(exc).__module__}.{type(exc).__name__}"
+                failed_count += 1
                 if _is_permanent_recipient_error(exc):
                     # one actionable warning, then mute for this process
                     self._unreachable_users.add(chat_id)
@@ -1045,6 +1077,7 @@ class TelegramBot(AppThread, Closable):
             extra={
                 "recipient_count": recipient_count,
                 "unreachable_count": unreachable_count,
+                "failed_count": failed_count,
                 "payload_keys": payload_keys,
             },
         )
@@ -1140,9 +1173,26 @@ class TelegramBot(AppThread, Closable):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
+        # PTB's default 5 s request timeouts are too tight for a slow API
+        # round-trip; a notification that times out is retried once
+        request = HTTPXRequest(
+            connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=TELEGRAM_READ_TIMEOUT_SECONDS,
+            write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
+            pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
+        )
+        # the long poll must outlive the polling timeout
+        get_updates_request = HTTPXRequest(
+            connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=TELEGRAM_READ_TIMEOUT_SECONDS,
+            write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
+            pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
+        )
         application = (
             Application.builder()
             .token(self._token)
+            .request(request)
+            .get_updates_request(get_updates_request)
             .post_init(self._post_init)
             .post_stop(self._post_stop)
             .build()

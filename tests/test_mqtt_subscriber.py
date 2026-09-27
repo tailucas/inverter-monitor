@@ -13,6 +13,7 @@ import.
 import importlib
 import json
 import logging
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -270,3 +271,156 @@ class TestConfiguredBankParsing:
     def test_padded_bank_names_are_trimmed_and_blanks_dropped(self) -> None:
         subscriber = _new_subscriber(banks=[" bank1 ", "", " bank2 "])
         assert subscriber._mqtt_switch_devices == ["bank1", "bank2"]
+
+
+class TestSwitchCommandRetryGate:
+    """A command the bank has not followed is retried at a bounded rate."""
+
+    def _subscriber_with_bank_off(self) -> Any:
+        """A subscriber whose only bank reports both switches off."""
+        subscriber = _new_subscriber(banks=[BANK])
+        subscriber.on_message(None, None, _state_message(BANK, [0, 0]))
+        return subscriber
+
+    def test_same_command_is_published_once_then_deferred(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        subscriber = self._subscriber_with_bank_off()
+        with caplog.at_level(logging.DEBUG, logger=APP_NAME):
+            first = subscriber.set_switch_state(switch_state=1, reason="all_clear")
+            second = subscriber.set_switch_state(switch_state=1, reason="all_clear")
+            third = subscriber.set_switch_state(switch_state=1, reason="all_clear")
+
+        assert first == [BANK]
+        assert second == []
+        assert third == []
+        # only the first decision published (and logged) the control message
+        assert len(subscriber._mqtt_client.published) == 1
+        published = [
+            r
+            for r in caplog.records
+            if r.getMessage() == "Switch bank control message published"
+        ]
+        assert len(published) == 1
+        published_record: Any = published[0]
+        assert published_record.reported_state == [0, 0]
+        deferred = [
+            r
+            for r in caplog.records
+            if r.getMessage() == "Switch bank control retry deferred"
+        ]
+        assert len(deferred) == 2
+        deferred_record: Any = deferred[0]
+        assert deferred_record.retry_seconds == subscriber._switch_retry_seconds
+        assert deferred_record.reported_state == [0, 0]
+
+    def test_retry_after_the_window_warns_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        subscriber = self._subscriber_with_bank_off()
+        subscriber.set_switch_state(switch_state=1, reason="all_clear")
+        window = subscriber._switch_retry_seconds + 1
+        # pretend the retry interval has elapsed before each decision
+        subscriber._last_command_at[BANK] = time.time() - window
+        with caplog.at_level(logging.DEBUG, logger=APP_NAME):
+            retried = subscriber.set_switch_state(switch_state=1, reason="all_clear")
+            subscriber._last_command_at[BANK] = time.time() - window
+            again = subscriber.set_switch_state(switch_state=1, reason="all_clear")
+
+        # a retry publishes but is not an effective change to notify about
+        assert retried == []
+        assert again == []
+        assert len(subscriber._mqtt_client.published) == 3
+        retry_records = [
+            r
+            for r in caplog.records
+            if r.getMessage() == "Retrying switch bank control message"
+        ]
+        assert len(retry_records) == 2
+        retry_record: Any = retry_records[0]
+        assert retry_record.reported_state == [0, 0]
+        warnings = [
+            r
+            for r in caplog.records
+            if r.getMessage()
+            == "Switch controller did not acknowledge the commanded state"
+        ]
+        assert len(warnings) == 1
+        record: Any = warnings[0]
+        assert record.switch_bank == BANK
+        assert record.commanded_state == 1
+        assert record.reported_state == [0, 0]
+        assert record.reason == "all_clear"
+        assert record.retry_seconds == subscriber._switch_retry_seconds
+
+    def test_reported_change_re_asserts_immediately(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        subscriber = self._subscriber_with_bank_off()
+        subscriber.set_switch_state(switch_state=1, reason="all_clear")
+        # the bank moved to a different state while the command was pending
+        subscriber.on_message(None, None, _state_message(BANK, [1, 0]))
+        with caplog.at_level(logging.DEBUG, logger=APP_NAME):
+            changed = subscriber.set_switch_state(switch_state=1, reason="all_clear")
+
+        assert changed == [BANK]
+        assert len(subscriber._mqtt_client.published) == 2
+        published = [
+            r
+            for r in caplog.records
+            if r.getMessage() == "Switch bank control message published"
+        ]
+        assert len(published) == 1
+        published_record: Any = published[0]
+        assert published_record.reported_state == [1, 0]
+
+    def test_converged_bank_clears_the_unacknowledged_warning(self) -> None:
+        subscriber = self._subscriber_with_bank_off()
+        subscriber.set_switch_state(switch_state=1, reason="all_clear")
+        subscriber._warn_unacknowledged_switch_bank(
+            switch_bank=BANK, switch_state=1, reported_state=[0, 0], reason="all_clear"
+        )
+        assert subscriber._unacknowledged_banks_warned == {BANK}
+        # the bank catches up: the episode is over
+        subscriber.on_message(None, None, _state_message(BANK, [1, 1]))
+        changed = subscriber.set_switch_state(switch_state=1, reason="all_clear")
+        assert changed == []
+        assert subscriber._unacknowledged_banks_warned == set()
+
+    def test_forced_command_bypasses_the_retry_window(self) -> None:
+        subscriber = self._subscriber_with_bank_off()
+        subscriber.set_switch_state(switch_state=1, reason="all_clear")
+        forced = subscriber.set_switch_state(
+            switch_state=1, reason="manual_restore", force=True
+        )
+        assert forced == [BANK]
+        assert len(subscriber._mqtt_client.published) == 2
+
+    def test_manual_command_re_asserts_a_pending_command(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        subscriber = _new_subscriber(banks=[BANK])
+        subscriber.on_message(None, None, _state_message(BANK, [1, 1]))
+        app_socket = FakeAppSocket()
+        with caplog.at_level(logging.INFO, logger=APP_NAME):
+            subscriber._apply_manual_switch_command(
+                app_socket=app_socket, command="start_load_shed"
+            )
+            subscriber._apply_manual_switch_command(
+                app_socket=app_socket, command="start_load_shed"
+            )
+
+        # both manual commands publish, because the bank ignores the command
+        assert len(subscriber._mqtt_client.published) == 2
+        published = [
+            r
+            for r in caplog.records
+            if r.getMessage() == "Switch bank control message published"
+        ]
+        assert len(published) == 2
+        published_record: Any = published[1]
+        assert published_record.reason == "manual_load_shed"
+        event_banks = [
+            payload["switch_event"]["switch_banks"] for payload in app_socket.sent
+        ]
+        assert event_banks == [[BANK], [BANK]]

@@ -468,3 +468,97 @@ def test_end_load_shed_reports_missing_control(monkeypatch: pytest.MonkeyPatch) 
     assert result == ConversationHandler.END
     reply, _ = update.effective_message.replies[0]
     assert "Could not end load shedding" in reply
+
+
+class FlakyBot(FakeBot):
+    """Bot stand-in that raises one network error for a selected chat ID."""
+
+    def __init__(self, failing_chat_id: int, error: Exception) -> None:
+        super().__init__(None)
+        self.failing_chat_id = failing_chat_id
+        self.failure = error
+        self.remaining_failures = 1
+
+    async def send_message(
+        self, chat_id: int, text: str, parse_mode: Any = None
+    ) -> None:
+        self.calls.append(chat_id)
+        if chat_id == self.failing_chat_id and self.remaining_failures > 0:
+            self.remaining_failures -= 1
+            raise self.failure
+
+
+def test_send_notification_retries_after_transient_network_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A timed-out send is retried once (bounded) and then delivered."""
+    monkeypatch.setattr(bot_module, "app_config", FakeConfig())
+    monkeypatch.setattr(bot_module, "TELEGRAM_RETRY_DELAY_SECONDS", 0)
+    bot = TelegramBot(creds_obj=FakeCreds())
+    fake_bot = FlakyBot(failing_chat_id=222, error=TimedOut("Timed out"))
+    setattr(bot, "_application", FakeApplication(fake_bot))  # noqa: B010
+    payload = {
+        "load_alert": {
+            "kind": "load_warning",
+            "load_w": 7100.0,
+            "threshold_w": 7000.0,
+        }
+    }
+
+    with caplog.at_level(logging.INFO, logger=APP_NAME):
+        asyncio.run(bot._send_notification(payload))
+    # the 222 recipient is attempted twice: once timed out, once retried
+    assert fake_bot.calls == [111, 222, 222]
+    retried = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Retrying Telegram notification after network error"
+    ]
+    assert len(retried) == 1
+    record: Any = retried[0]
+    assert record.chat_id == "222"
+    assert record.error_type == "telegram.error.TimedOut"
+    dispatched = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Telegram notification dispatched"
+    ]
+    summary: Any = dispatched[0]
+    assert summary.recipient_count == 2
+    assert summary.failed_count == 0
+
+
+def test_send_notification_counts_transient_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A send that keeps failing is counted in the dispatch summary."""
+    monkeypatch.setattr(bot_module, "app_config", FakeConfig())
+    monkeypatch.setattr(bot_module, "TELEGRAM_RETRY_DELAY_SECONDS", 0)
+    bot = TelegramBot(creds_obj=FakeCreds())
+    fake_bot = FakeBot(TimedOut("Timed out"))
+    setattr(bot, "_application", FakeApplication(fake_bot))  # noqa: B010
+    payload = {
+        "load_alert": {
+            "kind": "load_warning",
+            "load_w": 7100.0,
+            "threshold_w": 7000.0,
+        }
+    }
+
+    with caplog.at_level(logging.INFO, logger=APP_NAME):
+        asyncio.run(bot._send_notification(payload))
+    assert [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Failed to send Telegram notification"
+    ]
+    dispatched = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Telegram notification dispatched"
+    ]
+    summary: Any = dispatched[0]
+    assert summary.recipient_count == 0
+    assert summary.failed_count == 2

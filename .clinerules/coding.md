@@ -53,17 +53,28 @@ One `AppThread` per concern, wired over ZMQ inproc (`URL_WORKER_APP`,
   caches forwarded weather samples (overcast rationing); subscribes to
   `{topic_prefix}/state/#`, applies the rationing checks (high load,
   overcast, surplus, battery SoC, grid fallback) and controls switch banks.
-  Every control publish to `{topic_prefix}/control/{bank}` logs at INFO
-  (`"Switch bank control message published"`) with its `topic` and
-  `payload`. A bank is only controllable once it has reported its state to
-  the subscription topic (the change gate needs its current switch states);
-  a configured bank that never reports is left alone and logs one WARNING
-  per bank and episode (`"Switch banks without reported state were not
-  controlled"`, re-armed by a state message, with `configured_banks`,
-  `unreported_banks`, `subscription_topic` and `state_age_secs`). The
-  manual-command record (`"Manual switch command applied"`) carries the bank
-  visibility (`configured_banks`, `known_banks`, `unchanged_banks`,
-  `state_age_secs`). Every decision is also handed to the `SonoffController`
+  A control message to `{topic_prefix}/control/{bank}` is published only when
+  the commanded state changes or when the bank reported a different state
+  than the one the decision was based on; each such publish logs at INFO
+  (`"Switch bank control message published"`) with its `topic`, `payload`
+  and `reported_state`. A bank that keeps reporting a state the command
+  never reached is retried at most once per `switch_retry_seconds` (optional
+  `[mqtt]` override, code default 60 s), logging the retry and the deferral
+  at DEBUG and one WARNING per bank and episode (`"Switch controller did not
+  acknowledge the commanded state"`, re-armed by convergence). The manual
+  load-shed commands re-assert the decision immediately, bypassing the retry
+  interval. A reported transition logs one INFO per bank (`"Switch bank state
+  changed"` with `previous_state` and `state`); a bank's first report logs
+  `"Switch bank state received"`. A bank is only controllable once it has
+  reported its state to the subscription topic (the change gate needs its
+  current switch states); a configured bank that never reports is left alone
+  and logs one WARNING per bank and episode (`"Switch banks without reported
+  state were not controlled"`, re-armed by a state message, with
+  `configured_banks`, `unreported_banks`, `subscription_topic` and
+  `state_age_secs`). The manual-command record (`"Manual switch command
+  applied"`) carries the bank visibility (`configured_banks`, `known_banks`,
+  `unchanged_banks`, `state_age_secs`). Every decision is also handed to the
+  `SonoffController`
   thread (`app/sonoff.py`), which issues the LAN-mode control messages for
   the configured Sonoff devices.
 - `LoadAlertMonitor`: consumes forwarded inverter samples; raises Telegram

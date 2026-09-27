@@ -66,8 +66,12 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
   the trace across the messaging boundary.
 - A helper `format_traceparent(span)` constructs the string from the span's
   `SpanContext`.
-- MQTT *control* publishes are change-gated: an unchanged switch state
-  produces no publish, no span, and no `traceparent`.
+- MQTT *control* publishes are change-gated on the commanded and reported
+  states: an unchanged switch state produces no publish, no span and no
+  `traceparent`. A bank that keeps reporting a state the command never
+  reached is retried at a bounded interval (`switch_retry_seconds`, optional
+  `[mqtt]` override) with its span and log at DEBUG, and one WARNING per bank
+  and episode names the unacknowledged command.
 
 ## Logs
 
@@ -80,8 +84,8 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
 | Level | Where |
 |---|---|
 | DEBUG | Per-poll/per-sample/frame tracing, gauge updates (including timing data), "Inverter is delivering power to consumers…" supporting data, inverter fetch failures (resolution, connect/send/receive, empty responses, malformed frames) and poll backoff detail |
-| INFO | Startup/lifecycle events, MQTT publishes (`traceparent` in `extra`; switch-bank control publishes also log `topic` and `payload`), switch-bank notifications, load warning/recovery events, PagerDuty triggers & resolves, recoverable failures (PD trigger/resolve failures, retried on the next sample cycle) |
-| WARNING | Weather fetch failures (resolution, connect/send/receive, empty responses, malformed payloads), implausible inverter samples, PagerDuty client not configured, missing switch-bank config, readers or Telegram bot disabled at startup, configured switch banks that never reported state (once per bank and episode) |
+| INFO | Startup/lifecycle events, MQTT publishes (`traceparent` in `extra`; switch-bank control publishes also log `topic` and `payload`, and only on an effective commanded/reported change — retries log at DEBUG), switch-bank notifications, load warning/recovery events, PagerDuty triggers & resolves, recoverable failures (PD trigger/resolve failures, retried on the next sample cycle) |
+| WARNING | Weather fetch failures (resolution, connect/send/receive, empty responses, malformed payloads), implausible inverter samples, PagerDuty client not configured, missing switch-bank config, readers or Telegram bot disabled at startup, configured switch banks that never reported state (once per bank and episode), switch controllers that did not acknowledge the commanded state (once per bank and episode) |
 | ERROR | Lost connections (serial, MQTT), unreadable mappings, inverter poll backoff reaching its maximum (once per outage episode) |
 | CRITICAL | Reserved |
 

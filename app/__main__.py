@@ -96,6 +96,9 @@ DEFAULT_LOAD_WARNING_W = 7000
 DEFAULT_LOAD_CRITICAL_W = 7500
 DEFAULT_LOAD_CRITICAL_RESOLVE_SECONDS = 60
 DEFAULT_LOAD_SHED_COOLDOWN_SECONDS = 600
+# switch-bank control retry interval for a bank whose reported state does not
+# follow the commanded state (optional [mqtt] switch_retry_seconds override)
+DEFAULT_SWITCH_RETRY_SECONDS = 60
 # PagerDuty dedup key for the high-load incident class
 PD_LOAD_DEDUP_KEY = "load_high"
 
@@ -1180,6 +1183,16 @@ class MqttSubscriber(AppThread, Closable):
         self._switch_state_seen_at: float | None = None
         self._unreported_banks_warned: set[str] = set()
         self._unconfigured_banks_warned: set[str] = set()
+        # switch-bank control gate: the change gate tracks the last commanded
+        # state and the reported state the command was based on, so a bank
+        # that does not follow the command is retried at a bounded interval
+        self._switch_retry_seconds = app_config.getint(
+            "mqtt", "switch_retry_seconds", fallback=DEFAULT_SWITCH_RETRY_SECONDS
+        )
+        self._last_commanded: dict[str, int] = {}
+        self._last_reported: dict[str, list] = {}
+        self._last_command_at: dict[str, float] = {}
+        self._unacknowledged_banks_warned: set[str] = set()
 
         generation_average_secs = app_config.getint(
             "alert_thresholds",
@@ -1287,15 +1300,14 @@ class MqttSubscriber(AppThread, Closable):
             if not first_seen:
                 old_state = self._switch_state[switch_bank]
             if new_state != old_state:
-                for ids, s in enumerate(new_state):
-                    log.info(
-                        "Switch state changed",
-                        extra={
-                            "switch_bank": switch_bank,
-                            "switch_number": ids + 1,
-                            "state": s,
-                        },
-                    )
+                log.info(
+                    "Switch bank state changed",
+                    extra={
+                        "switch_bank": switch_bank,
+                        "previous_state": list(old_state),
+                        "state": list(new_state),
+                    },
+                )
             # state capture
             self._switch_state[switch_bank] = new_state
             self._switch_state_seen_at = time.time()
@@ -1311,17 +1323,30 @@ class MqttSubscriber(AppThread, Closable):
                     },
                 )
 
-    def set_switch_state(self, switch_state=1, reason="unknown"):
+    def set_switch_state(self, switch_state=1, reason="unknown", force=False):
         """Set every controllable bank and return the banks that changed.
 
         Only banks that have reported their state are controllable: the
         change gate needs the current switch states, so a configured bank
         that never published state is left alone and reported once per bank
-        and episode by `_warn_unreported_switch_banks`.  The same decision
-        drives the configured Sonoff devices, whose control messages are
-        issued by the SonoffController thread.
+        and episode by `_warn_unreported_switch_banks`.
+
+        The control message is published (and the change reported to the
+        consumers) when the commanded state changes or when the bank
+        reported a different state than the one the last decision was based
+        on.  A bank that keeps reporting a state the command never reached is
+        retried at most once per `switch_retry_seconds` and logged at DEBUG,
+        so a controller that does not follow the command cannot flood the
+        log or the Telegram notifications (one WARNING per bank and episode
+        names the unacknowledged command).  ``force`` re-asserts the decision
+        immediately, bypassing the retry interval; the manual load-shed
+        commands use it.
+
+        The same decision drives the configured Sonoff devices, whose
+        control messages are issued by the SonoffController thread.
         """
         changed_banks = []
+        now = time.time()
         for switch_bank in self._switch_state.keys():
             if switch_bank not in self._mqtt_switch_devices:
                 if switch_bank not in self._unconfigured_banks_warned:
@@ -1331,23 +1356,48 @@ class MqttSubscriber(AppThread, Closable):
                         extra={"switch_bank": switch_bank},
                     )
                 continue
-            mqtt_pub_topic = "/".join(
-                [f"{self._mqtt_subscribe_topic_prefix}", "control", switch_bank]
-            )
-            mqtt_update = list()
-            for _ids, _ in enumerate(self._switch_state[switch_bank]):
-                mqtt_update.append(switch_state)
-            # only publish (and trace a switch event) on an actual state change
-            if not any(s != switch_state for s in self._switch_state[switch_bank]):
+            reported_state = list(self._switch_state[switch_bank])
+            if all(state == switch_state for state in reported_state):
+                # the bank is at the commanded state: nothing to assert
+                self._last_commanded[switch_bank] = switch_state
+                self._last_reported[switch_bank] = reported_state
+                self._unacknowledged_banks_warned.discard(switch_bank)
                 log.debug(
                     "Switch state unchanged; skipping control publish",
                     extra={
                         "switch_bank": switch_bank,
                         "switch_state": switch_state,
-                        "current_state": self._switch_state[switch_bank],
+                        "current_state": reported_state,
                     },
                 )
                 continue
+            # the bank reported a state other than the commanded one
+            command_changed = self._last_commanded.get(switch_bank) != switch_state
+            report_changed = self._last_reported.get(switch_bank) != reported_state
+            retrying = not (command_changed or report_changed or force)
+            if retrying:
+                last_command_at = self._last_command_at.get(switch_bank)
+                if (
+                    last_command_at is not None
+                    and now - last_command_at < self._switch_retry_seconds
+                ):
+                    # the same command was issued moments ago: let the
+                    # controller report its state before retrying at INFO
+                    log.debug(
+                        "Switch bank control retry deferred",
+                        extra={
+                            "switch_bank": switch_bank,
+                            "switch_state": switch_state,
+                            "reported_state": reported_state,
+                            "reason": reason,
+                            "retry_seconds": self._switch_retry_seconds,
+                        },
+                    )
+                    continue
+            mqtt_pub_topic = "/".join(
+                [f"{self._mqtt_subscribe_topic_prefix}", "control", switch_bank]
+            )
+            mqtt_update = [switch_state for _ in reported_state]
             message_data = json.dumps({"state": mqtt_update})
             _mqtt_publish_start = time.time()
             with OTEL_TRACER.start_as_current_span(
@@ -1365,24 +1415,84 @@ class MqttSubscriber(AppThread, Closable):
                     self._mqtt_client.publish(
                         topic=mqtt_pub_topic, payload=message_data
                     )
-                log.info(
-                    "Switch bank control message published",
-                    extra={
-                        "topic": mqtt_pub_topic,
-                        "payload": message_data,
-                        "switch_bank": switch_bank,
-                        "switch_state": switch_state,
-                        "reason": reason,
-                        "message_bytes": len(message_data),
-                        "traceparent": tp,
-                    },
-                )
+                if retrying:
+                    # the same command, still unacknowledged: bounded retry
+                    log.debug(
+                        "Retrying switch bank control message",
+                        extra={
+                            "topic": mqtt_pub_topic,
+                            "payload": message_data,
+                            "switch_bank": switch_bank,
+                            "switch_state": switch_state,
+                            "reported_state": reported_state,
+                            "reason": reason,
+                            "message_bytes": len(message_data),
+                            "traceparent": tp,
+                        },
+                    )
+                else:
+                    log.info(
+                        "Switch bank control message published",
+                        extra={
+                            "topic": mqtt_pub_topic,
+                            "payload": message_data,
+                            "switch_bank": switch_bank,
+                            "switch_state": switch_state,
+                            "reported_state": reported_state,
+                            "reason": reason,
+                            "message_bytes": len(message_data),
+                            "traceparent": tp,
+                        },
+                    )
                 _mqtt_publish_duration = time.time() - _mqtt_publish_start
                 MQTT_PUBLISH_DURATION.set(_mqtt_publish_duration)
-            changed_banks.append(switch_bank)
+            self._last_commanded[switch_bank] = switch_state
+            self._last_reported[switch_bank] = reported_state
+            self._last_command_at[switch_bank] = now
+            if retrying:
+                self._warn_unacknowledged_switch_bank(
+                    switch_bank=switch_bank,
+                    switch_state=switch_state,
+                    reported_state=reported_state,
+                    reason=reason,
+                )
+            else:
+                self._unacknowledged_banks_warned.discard(switch_bank)
+                changed_banks.append(switch_bank)
         self._warn_unreported_switch_banks(switch_state=switch_state, reason=reason)
         self._apply_sonoff(switch_state=switch_state, reason=reason)
         return changed_banks
+
+    def _warn_unacknowledged_switch_bank(
+        self,
+        switch_bank: str,
+        switch_state: int,
+        reported_state: list,
+        reason: str,
+    ) -> None:
+        """Warn once per bank and episode about an unacknowledged command.
+
+        The bank has kept reporting the state the command was based on, so
+        the control message is only retried at the throttled interval; the
+        operator is told that the controller is not following the command.
+        """
+        if switch_bank in self._unacknowledged_banks_warned:
+            return
+        self._unacknowledged_banks_warned.add(switch_bank)
+        log.warning(
+            "Switch controller did not acknowledge the commanded state",
+            extra={
+                "switch_bank": switch_bank,
+                "commanded_state": switch_state,
+                "reported_state": list(reported_state),
+                "reason": reason,
+                "retry_seconds": self._switch_retry_seconds,
+                "error_hint": (
+                    "check that the switch controller accepts control messages "
+                    "on its control topic; it keeps reporting its previous state"
+                ),
+            },
+        )
 
     def _warn_unreported_switch_banks(self, switch_state: int, reason: str) -> None:
         """Warn once per bank about configured banks that never reported.
@@ -1462,7 +1572,9 @@ class MqttSubscriber(AppThread, Closable):
             overcast_latch=self._overcast_latch,
             now=now,
         )
-        changed_banks = self.set_switch_state(switch_state=switch_state, reason=reason)
+        changed_banks = self.set_switch_state(
+            switch_state=switch_state, reason=reason, force=True
+        )
         self._notify_switch_change(
             app_socket=app_socket,
             changed_banks=changed_banks,
