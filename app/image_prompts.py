@@ -2,16 +2,20 @@
 """Pure prompt construction for the Telegram /imagine command.
 
 Prompts follow Google's image-model guidance: the scene is described in
-narrative sentences (subject, setting, style, lighting, camera, lens) rather
-than a list of tags, and anything that should be absent is phrased as a
-positive description instead of a negative instruction.
+narrative sentences that lead with the operation and fill the guide's
+formula -- [subject] + [action] + [location/context] + [composition] +
+[style] -- rather than listing tags, and anything that should be absent is
+phrased as a positive description instead of a negative instruction.
 
 Telemetry from the inverter, BMS, weather and switch threads is distilled
 into the mandatory visual elements: an inverter shown outdoors with the sky
-visible, the time of day and the wind taken from the weather sample, a face
-that reflects its health, and an explicit load-shedding indicator. The
-composed prompt stays inside the model's 480-token prompt budget (roughly
-2000 characters).
+visible, an action and a face that reflect its health, the time of day and
+the wind taken from the weather sample, and an explicit load-shedding
+indicator. Styles, outdoor locations and subject materials are each picked
+at random from their rotations when the user does not choose one, and the
+composed prompt stays inside a self-imposed prompt budget that keeps the
+request cheap and on-target (the image models' own context windows are far
+larger).
 
 No I/O and no framework dependencies: the application threads gather the
 telemetry and hand it to these pure helpers, which are unit-tested in
@@ -25,9 +29,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-# image-model prompt budget: 480 tokens, roughly 2000 characters
-MAX_PROMPT_TOKENS = 480
-MAX_PROMPT_CHARS = 2000
+# self-imposed prompt budget: the image models' context windows are far
+# larger, but short specific prompts stay cheap, fast and on-target
+MAX_PROMPT_TOKENS = 700
+MAX_PROMPT_CHARS = 2800
 # portrait framing fits a mobile chat bubble
 DEFAULT_ASPECT_RATIO = "4:5"
 DEFAULT_IMAGE_SIZE = "1K"
@@ -66,18 +71,21 @@ WIND_GUST_GAP_MS = 3.0
 MAX_MATERIAL_CHARS = 40
 
 
-def _subject_sentence(material: str | None) -> str:
-    """Describe the inverter, its material and the outdoors framing."""
-    subject = (
-        "centred in the middle of the frame stands a friendly modern hybrid "
-        "solar inverter"
-    )
+def _subject_sentence(material: str | None, action: str) -> str:
+    """Describe the inverter, its material, its action and the framing.
+
+    The guide asks a prompt to open with a strong verb that names the
+    primary operation, so the sentence starts with ``Create`` and carries
+    the action clause last.
+    """
+    subject = "a friendly modern hybrid solar inverter"
     if material:
         subject += f" made of {material}"
     return (
-        f"Out in the open air beneath the open sky, {subject} on a low "
+        f"Create a picture of {subject} standing out in the open air "
+        "beneath the open sky, centred in the middle of the frame on a low "
         "concrete plinth, with thick power cables looping down to the floor "
-        "and a small glowing display on its front."
+        f"and a small glowing display on its front, {action}."
     )
 
 
@@ -172,9 +180,11 @@ DEFAULT_LOCATIONS: tuple[LocationConfig, ...] = (
 class StyleConfig:
     """A rendering style preset: the /imagine style parameter's domain.
 
-    ``style`` is the narrative medium sentence; camera, lens and palette
-    complete the look, and ``aspect_ratio``/``image_size`` are forwarded to
-    the API as the image response format. Locations always stay outdoors.
+    ``style`` is the narrative medium sentence; camera, lens, palette and
+    the designed ``lighting`` complete the look, ``text`` carries any quoted
+    typography the guide's text-rendering rules ask for, and
+    ``aspect_ratio``/``image_size`` are forwarded to the API as the image
+    response format. Locations always stay outdoors.
     """
 
     name: str
@@ -182,6 +192,8 @@ class StyleConfig:
     camera: str
     lens: str
     palette: str | None = None
+    lighting: str | None = None
+    text: str | None = None
     aspect_ratio: str = DEFAULT_ASPECT_RATIO
     image_size: str = DEFAULT_IMAGE_SIZE
 
@@ -202,6 +214,7 @@ DEFAULT_STYLES: tuple[StyleConfig, ...] = (
             "blurred background."
         ),
         palette="The palette stays natural and true to every material.",
+        lighting="Soft directional daylight keeps every surface believable.",
     ),
     StyleConfig(
         name="cartoon",
@@ -215,6 +228,7 @@ DEFAULT_STYLES: tuple[StyleConfig, ...] = (
         ),
         lens="A 35 mm look with gentle depth of field keeps the background soft.",
         palette="The palette leans on warm amber highlights over teal shadows.",
+        lighting="Bright bounced light keeps the shadows soft and simple.",
     ),
     StyleConfig(
         name="flat_vector",
@@ -228,6 +242,7 @@ DEFAULT_STYLES: tuple[StyleConfig, ...] = (
         ),
         lens="Wide 28 mm perspective layers the simple shapes clearly.",
         palette="The palette mixes golden yellow with dusty blue.",
+        lighting="Flat even light keeps the shapes crisp and shadow-free.",
     ),
     StyleConfig(
         name="claymation",
@@ -241,6 +256,7 @@ DEFAULT_STYLES: tuple[StyleConfig, ...] = (
         ),
         lens="A macro-style shallow depth of field melts the background.",
         palette="The palette pairs teal with burnt orange.",
+        lighting="A warm tabletop key light makes the clay textures pop.",
     ),
     StyleConfig(
         name="watercolour",
@@ -254,6 +270,7 @@ DEFAULT_STYLES: tuple[StyleConfig, ...] = (
         ),
         lens="Loose washes and soft edges keep the drawing airy.",
         palette="The palette stays in faded greens and straw yellows.",
+        lighting="Soft diffused daylight keeps the washes pale and airy.",
     ),
     StyleConfig(
         name="stylised_3d",
@@ -264,6 +281,104 @@ DEFAULT_STYLES: tuple[StyleConfig, ...] = (
         camera=("The camera frames it as a centred medium shot from slightly below."),
         lens="A wide-angle feel with crisp detail keeps every panel readable.",
         palette="The palette contrasts deep blue with warm white.",
+        lighting=(
+            "A crisp studio key light and a cool rim light separate it from "
+            "the background."
+        ),
+    ),
+    StyleConfig(
+        name="analog_film",
+        style=(
+            "The picture is shot as if on 1980s colour film with warm analog "
+            "colour and pronounced grain."
+        ),
+        camera=(
+            "The camera frames it as a waist-level medium-format portrait "
+            "shot with the inverter dead centre."
+        ),
+        lens="An 80 mm lens at f/2.8 keeps it sharp with creamy falloff.",
+        palette="The palette stays warm, faded and gently low in contrast.",
+        lighting="Golden hour light rakes across the scene with soft haze.",
+        aspect_ratio="4:5",
+    ),
+    StyleConfig(
+        name="action_cam",
+        style=(
+            "The picture is an immersive action-camera shot with a distorted "
+            "ultra-wide view."
+        ),
+        camera=(
+            "The camera is mounted low and close, tilting up at the inverter "
+            "dead centre."
+        ),
+        lens="A fisheye wide-angle lens bends the frame at the edges.",
+        palette="The palette is vivid and high contrast.",
+        lighting="Crisp daylight gives punchy contrast and a corner flare.",
+        aspect_ratio="9:16",
+    ),
+    StyleConfig(
+        name="flash_snapshot",
+        style=(
+            "The picture is a raw nostalgic snapshot taken on a cheap "
+            "disposable camera."
+        ),
+        camera=(
+            "The camera is held at arm's length with the inverter dead "
+            "centre and slightly off level."
+        ),
+        lens="A fixed 35 mm plastic lens keeps the whole scene in focus.",
+        palette="The palette carries the dated colour cast of cheap film.",
+        lighting="A direct on-camera flash throws a hard shadow on the wall.",
+        aspect_ratio="3:2",
+    ),
+    StyleConfig(
+        name="studio_product",
+        style=(
+            "The picture is a glossy studio product hero shot on a seamless backdrop."
+        ),
+        camera=("The camera frames it as a clean centred three-quarter product view."),
+        lens="A 100 mm macro lens renders every panel and port crisply.",
+        palette="The palette stays neutral so every material reads true.",
+        lighting=(
+            "A three-point softbox setup lights it evenly with gentle reflections."
+        ),
+        aspect_ratio="1:1",
+        image_size="2K",
+    ),
+    StyleConfig(
+        name="cinematic_noir",
+        style=(
+            "The picture is a moody cinematic still in chiaroscuro light "
+            "with deep shadows."
+        ),
+        camera=(
+            "The camera frames it as a low-angle anamorphic wide shot with "
+            "the inverter dead centre."
+        ),
+        lens="A 40 mm anamorphic lens stretches highlights into soft streaks.",
+        palette="The palette is graded in muted teal and amber.",
+        lighting=(
+            "Harsh high-contrast chiaroscuro light carves it out of the darkness."
+        ),
+        aspect_ratio="21:9",
+    ),
+    StyleConfig(
+        name="typographic_poster",
+        style=(
+            "The picture is a bold typographic poster with solid colour and "
+            "crisp edges."
+        ),
+        camera=("The camera frames it flat and head-on with the inverter dead centre."),
+        lens="A flat graphic perspective keeps every letterform square.",
+        palette="The palette uses two bold spot colours.",
+        lighting="Even poster-grade light keeps the colours flat and bold.",
+        text=(
+            'The word "SOLAR" is spelled in heavy blocky white letters '
+            "across the top, with the inverter and the sky showing through "
+            "inside the letterforms."
+        ),
+        aspect_ratio="2:3",
+        image_size="2K",
     ),
 )
 
@@ -327,6 +442,31 @@ def select_location(
 
 _MATERIAL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 '\-]*")
 
+# default subjects: the guide's materiality rule asks for specific physical
+# makeup ("navy blue tweed", not "suit jacket"), so the rotation names the
+# material and its finish rather than leaving the surface unsaid
+DEFAULT_MATERIALS: tuple[str, ...] = (
+    "polished brass and walnut",
+    "brushed aluminium with smoked glass",
+    "matte ceramic with a cobalt blue glaze",
+    "hammered copper with a deep patina",
+    "carved oak banded with blackened steel",
+    "bakelite with polished chrome trim",
+    "frosted glass with a soft inner glow",
+    "weathered corten steel",
+)
+
+
+def select_material(
+    materials: Sequence[str] = DEFAULT_MATERIALS,
+    rng: random.Random | None = None,
+) -> str:
+    """Pick a random default material (deterministic with a seeded rng)."""
+    if not materials:
+        raise ValueError("at least one default material is required")
+    chooser = rng if rng is not None else random.Random()
+    return chooser.choice(list(materials))
+
 
 def sanitize_material(text: str | None) -> str | None:
     """Normalise a user-supplied material into a short prompt-safe phrase.
@@ -359,6 +499,7 @@ def resolve_imagine_args(
     args: Sequence[str] | None,
     styles: Sequence[StyleConfig] = DEFAULT_STYLES,
     locations: Sequence[LocationConfig] = DEFAULT_LOCATIONS,
+    materials: Sequence[str] = DEFAULT_MATERIALS,
     rng: random.Random | None = None,
 ) -> ImagineArgs:
     """Resolve the optional /imagine arguments into style and material.
@@ -366,15 +507,17 @@ def resolve_imagine_args(
     One token names a style when it matches a configured style, and is
     treated as the material otherwise; with two tokens the first is the
     material and the second must name a style. The location is never chosen
-    by the user: one of the outdoor locations is picked at random. Materials
-    join words with underscores. Unusable arguments come back as error codes
-    for the bot to phrase.
+    by the user: one of the outdoor locations is picked at random, and one
+    of the default materials is picked at random whenever the user does not
+    name a material. Materials join words with underscores. Unusable
+    arguments come back as error codes for the bot to phrase.
     """
     tokens = [token for token in (args or []) if token.strip()]
     if not tokens:
         return ImagineArgs(
             style=select_style(styles, rng),
             location=select_location(locations, rng),
+            material=select_material(materials, rng),
         )
     if len(tokens) > 2:
         return ImagineArgs(error="too_many_args")
@@ -395,6 +538,7 @@ def resolve_imagine_args(
         return ImagineArgs(
             style=style,
             location=select_location(locations, rng),
+            material=select_material(materials, rng),
         )
     if find_location(locations, tokens[0]) is not None:
         # the location stays outdoors and is never user-selected
@@ -628,6 +772,21 @@ def wind_sentence(weather: Mapping[str, Any] | None) -> str | None:
     return sentence
 
 
+def _action_sentence(health: _Health) -> str:
+    """Name what the inverter is doing for the guide's action slot."""
+    if not health.online:
+        return "waiting quietly with its fans still"
+    if health.alert or (
+        health.soc_pct is not None and health.soc_pct < BATTERY_UNWELL_PCT
+    ):
+        return "straining to keep the lights on"
+    if health.charging:
+        return "working busily to charge the battery packs"
+    if health.major_draw:
+        return "working hard to feed the household demand"
+    return "humming along as it passes power through the house"
+
+
 def _face_sentence(health: _Health, load_warning_w: float) -> str:
     """Describe the inverter's face so it reflects its health."""
     if not health.online:
@@ -786,6 +945,26 @@ def _shed_sentence(state: LoadShedState) -> str:
 # -- prompt composition --------------------------------------------------------
 
 
+def _composition_sentence(aspect_ratio: str) -> str:
+    """State a framing that agrees with the requested aspect ratio."""
+    parts = aspect_ratio.split(":")
+    orientation = "vertical portrait"
+    if len(parts) == 2:
+        try:
+            width, height = int(parts[0]), int(parts[1])
+        except ValueError:
+            width = height = 0
+        if width and height:
+            if width == height:
+                orientation = "square"
+            elif width > height:
+                orientation = "wide landscape"
+    return (
+        f"The whole picture is a {orientation} composition in a "
+        f"{aspect_ratio} aspect ratio."
+    )
+
+
 def _compose(mandatory: Sequence[str | None], optional: Sequence[str | None]) -> str:
     """Join mandatory clauses and add optional ones while they still fit."""
     prompt = " ".join(clause for clause in mandatory if clause)
@@ -821,7 +1000,8 @@ def build_image_prompt(
     health = _health_from(inverter)
     phase = time_of_day_phase(weather, now)
     mandatory = [
-        _subject_sentence(material),
+        _subject_sentence(material, _action_sentence(health)),
+        _composition_sentence(style.aspect_ratio),
         location.setting,
         _time_sentence(phase),
         _sky_sentence(weather, phase),
@@ -831,16 +1011,14 @@ def build_image_prompt(
         _power_sentence(health, load_warning_w, shed_w),
         _shed_sentence(load_shed_state(inverter, switches, load_warning_w, shed_w)),
         style.style,
+        style.text,
         location.lighting,
+        style.lighting,
         style.camera,
     ]
     optional = [
         style.lens,
         style.palette,
-        (
-            "The whole picture is a vertical portrait composition in a "
-            f"{style.aspect_ratio} aspect ratio."
-        ),
     ]
     return _compose(mandatory, optional)
 

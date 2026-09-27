@@ -2,8 +2,8 @@
 """Gemini text-to-image client backing the Telegram /imagine command.
 
 Wraps the google-genai Interactions API: the prompt is counted against the
-model's 480-token prompt budget before the request is sent, the returned
-base64 image payload is decoded, and every failure is raised as
+project's self-imposed prompt budget before the request is sent, the
+returned base64 image payload is decoded, and every failure is raised as
 ``ImageGenerationError`` carrying the client's own error message so the bot
 can relay it to the user.
 

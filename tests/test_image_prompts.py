@@ -7,7 +7,9 @@ import pytest
 
 from app.image_prompts import (
     DEFAULT_ASPECT_RATIO,
+    DEFAULT_IMAGE_SIZE,
     DEFAULT_LOCATIONS,
+    DEFAULT_MATERIALS,
     DEFAULT_STYLES,
     MAX_MATERIAL_CHARS,
     MAX_PROMPT_CHARS,
@@ -24,6 +26,7 @@ from app.image_prompts import (
     resolve_imagine_args,
     sanitize_material,
     select_location,
+    select_material,
     select_style,
     style_names,
     time_of_day_phase,
@@ -129,6 +132,28 @@ def test_prompt_offline_inverter_is_sleepy() -> None:
     assert "sleepy and offline" in prompt
 
 
+def test_prompt_action_reflects_battery_charging() -> None:
+    """A charging battery puts the charging action in the subject sentence."""
+    prompt = build_image_prompt(inverter=_healthy_inverter())
+    assert "working busily to charge the battery packs" in prompt
+
+
+def test_prompt_action_reflects_heavy_draw() -> None:
+    """A heavy discharge shows the inverter working hard to keep up."""
+    inverter = _healthy_inverter() | {
+        "battery_power_w": 900.0,
+        "battery_soc_pct": 70.0,
+    }
+    prompt = build_image_prompt(inverter=inverter)
+    assert "working hard to feed the household demand" in prompt
+
+
+def test_prompt_action_reflects_offline_inverter() -> None:
+    """No live sample leaves the inverter waiting quietly."""
+    prompt = build_image_prompt()
+    assert "waiting quietly with its fans still" in prompt
+
+
 def test_prompt_indicates_load_shedding_needed() -> None:
     """An active latch puts the shedding indicator into the prompt."""
     prompt = build_image_prompt(
@@ -181,14 +206,16 @@ def test_prompt_reports_solar_and_grid_conditions() -> None:
     assert "dark and disconnected" in prompt
 
 
-def test_default_styles_are_portrait_and_lite_sized() -> None:
-    """Every default style targets a mobile-portrait image at 1K."""
-    portrait = {"3:4", "4:5", "9:16"}
+def test_default_styles_use_supported_ratios_and_sizes() -> None:
+    """Every default style targets a supported ratio and image size."""
+    supported_ratios = {"1:1", "3:2", "2:3", "3:4", "4:5", "9:16", "16:9", "21:9"}
+    supported_sizes = {"512", "1K", "2K", "4K"}
     assert DEFAULT_STYLES
     for style in DEFAULT_STYLES:
-        assert style.aspect_ratio in portrait
-        assert style.image_size == "1K"
+        assert style.aspect_ratio in supported_ratios
+        assert style.image_size in supported_sizes
     assert DEFAULT_STYLES[0].aspect_ratio == DEFAULT_ASPECT_RATIO
+    assert DEFAULT_STYLES[0].image_size == DEFAULT_IMAGE_SIZE
 
 
 @pytest.mark.parametrize("style", DEFAULT_STYLES, ids=style_names())
@@ -199,6 +226,9 @@ def test_prompt_includes_all_style_ingredients(style: StyleConfig) -> None:
     assert style.camera in prompt
     assert style.lens in prompt
     assert style.palette is not None and style.palette in prompt
+    assert style.lighting is not None and style.lighting in prompt
+    if style.text is not None:
+        assert style.text in prompt
 
 
 @pytest.mark.parametrize("location", DEFAULT_LOCATIONS, ids=location_names())
@@ -209,12 +239,12 @@ def test_prompt_includes_all_location_ingredients(
     prompt = build_image_prompt(inverter=_healthy_inverter(), location=location)
     assert location.setting in prompt
     assert location.lighting in prompt
-    assert "Out in the open air beneath the open sky" in prompt
+    assert "out in the open air beneath the open sky" in prompt.lower()
 
 
 @pytest.mark.parametrize("style", DEFAULT_STYLES, ids=style_names())
 def test_prompt_stays_in_budget_for_every_style(style: StyleConfig) -> None:
-    """Even the worst-case sample stays inside the 480-token budget."""
+    """Even the worst-case sample stays inside the self-imposed budget."""
     prompt = build_image_prompt(
         inverter=_worst_case_inverter(),
         bms={"active_count": 8, "cell_diff_mv": 250.0},
@@ -232,7 +262,7 @@ def test_prompt_stays_in_budget_for_every_style(style: StyleConfig) -> None:
     )
     assert len(prompt) <= MAX_PROMPT_CHARS
     assert estimate_prompt_tokens(prompt) <= MAX_PROMPT_TOKENS
-    assert len(prompt.split()) <= 400
+    assert len(prompt.split()) <= 500
     assert style.aspect_ratio in prompt
 
 
@@ -270,6 +300,43 @@ def test_prompt_handles_junk_values() -> None:
     )
     assert "middle of the frame" in prompt
     assert "neutral sky" in prompt
+
+
+def test_prompt_opens_with_a_strong_verb() -> None:
+    """The prompt leads with the operation, per the guide's guidance."""
+    prompt = build_image_prompt(inverter=_healthy_inverter())
+    assert prompt.startswith("Create a picture of")
+
+
+@pytest.mark.parametrize(
+    ("aspect_ratio", "framing"),
+    [
+        ("4:5", "vertical portrait"),
+        ("1:1", "square"),
+        ("21:9", "wide landscape"),
+    ],
+)
+def test_prompt_composition_matches_aspect_ratio(
+    aspect_ratio: str, framing: str
+) -> None:
+    """The composition sentence agrees with the requested aspect ratio."""
+    style = StyleConfig(
+        name="probe",
+        style="The picture is a probe.",
+        camera="The camera frames it from the front.",
+        lens="A 50 mm lens keeps it sharp.",
+        aspect_ratio=aspect_ratio,
+    )
+    prompt = build_image_prompt(inverter=_healthy_inverter(), style=style)
+    assert f"{framing} composition in a {aspect_ratio} aspect ratio" in prompt
+
+
+def test_typographic_poster_quotes_its_rendered_text() -> None:
+    """The poster style names its text in quotes, per the guide's rules."""
+    style = find_style(DEFAULT_STYLES, "typographic_poster")
+    assert style is not None
+    assert style.text is not None
+    assert '"SOLAR"' in style.text
 
 
 def test_find_style_is_case_insensitive() -> None:
@@ -401,7 +468,7 @@ def test_prompt_states_outdoors_time_of_day_and_wind() -> None:
         ),
         now=_SUNRISE + 60 * 60,
     )
-    assert "Out in the open air beneath the open sky" in prompt
+    assert "out in the open air beneath the open sky" in prompt.lower()
     assert "The time of day is morning." in prompt
     assert "westerly breeze" in prompt
     assert "Stronger gusts" in prompt
@@ -496,12 +563,42 @@ def test_sanitize_material(text: str | None, expected: str | None) -> None:
     assert sanitize_material(text) == expected
 
 
-def test_resolve_imagine_args_defaults_to_random_style_and_location() -> None:
-    """No arguments pick a random style and location, and no material."""
+def test_default_materials_are_prompt_safe() -> None:
+    """Every default material survives sanitisation unchanged."""
+    assert DEFAULT_MATERIALS
+    for material in DEFAULT_MATERIALS:
+        assert len(material) <= MAX_MATERIAL_CHARS
+        assert sanitize_material(material) == material
+
+
+def test_select_material_is_deterministic() -> None:
+    """Random material selection can be pinned by a seeded generator."""
+    assert select_material(DEFAULT_MATERIALS, random.Random(7)) == select_material(
+        DEFAULT_MATERIALS, random.Random(7)
+    )
+
+
+def test_select_material_requires_an_option() -> None:
+    """An empty material rotation is a programming error."""
+    with pytest.raises(ValueError):
+        select_material(())
+
+
+def test_prompt_weaves_the_default_material_into_the_subject() -> None:
+    """A default-rotation material reaches the subject sentence."""
+    resolved = resolve_imagine_args(None, rng=random.Random(11))
+    prompt = build_image_prompt(
+        inverter=_healthy_inverter(), material=resolved.material
+    )
+    assert f"made of {resolved.material}" in prompt
+
+
+def test_resolve_imagine_args_defaults_to_the_full_rotation() -> None:
+    """No arguments pick a random style, location and material."""
     resolved = resolve_imagine_args(None, rng=random.Random(3))
     assert resolved.style in DEFAULT_STYLES
     assert resolved.location in DEFAULT_LOCATIONS
-    assert resolved.material is None
+    assert resolved.material in DEFAULT_MATERIALS
     assert resolved.error is None
 
 
@@ -511,7 +608,7 @@ def test_resolve_imagine_args_single_token_naming_a_style() -> None:
     assert resolved.style is not None
     assert resolved.style.name == "hyperrealistic"
     assert resolved.location in DEFAULT_LOCATIONS
-    assert resolved.material is None
+    assert resolved.material in DEFAULT_MATERIALS
     assert resolved.error is None
 
 

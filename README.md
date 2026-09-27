@@ -29,7 +29,7 @@ A multi-threaded Python application that interfaces with Deye/Sunsynk hybrid inv
 | **OpenTelemetry Metrics** | Exports all inverter, battery, and BMS metrics as OTEL synchronous gauges via OTLP to any OpenTelemetry backend. |
 | **MQTT Integration** | Publishes inverter state to MQTT topics and subscribes to control topics for remote switch management. |
 | **Smart Switching** | Evaluates battery state-of-charge, load draw, and grid status to make decisions about switching off non-essential consumers via MQTT-controlled switches. |
-| **Imagined Status** | The Telegram `/imagine [material] [style]` command turns live inverter, BMS, weather and switch-bank state into a narrative prompt of the inverter outdoors under an open sky (always naming the time of day and the wind), rendered by Gemini in the chosen style — random when omitted — as a portrait image; prompts are budgeted to the model's 480-token limit. |
+| **Imagined Status** | The Telegram `/imagine [material] [style]` command turns live inverter, BMS, weather and switch-bank state into a narrative prompt of the inverter outdoors under an open sky (always naming the time of day and the wind), rendered by Gemini in the chosen style — random when omitted, as are the outdoor location and the subject material; prompts stay inside a self-imposed token budget. |
 | **Alerting & Paging** | PagerDuty Events API v2 integration for critical alerts including BMS data loss and minimum BMS unit count violations. |
 | **Error Tracking** | Sentry SDK integration with threading and async support for production error monitoring. |
 | **Health Monitoring** | Healthchecks.io and Cronitor integration for uptime tracking. |

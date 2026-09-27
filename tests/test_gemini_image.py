@@ -14,7 +14,11 @@ from app.gemini_image import (
     GeminiImageClient,
     ImageGenerationError,
 )
-from app.image_prompts import DEFAULT_ASPECT_RATIO, DEFAULT_IMAGE_SIZE
+from app.image_prompts import (
+    DEFAULT_ASPECT_RATIO,
+    DEFAULT_IMAGE_SIZE,
+    MAX_PROMPT_TOKENS,
+)
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-image-data"
 
@@ -136,8 +140,9 @@ def test_generate_image_counts_the_prompt_first() -> None:
 
 def test_generate_image_rejects_over_budget_prompt() -> None:
     """An over-long prompt never reaches the image model."""
-    fake = _FakeGenaiClient(interaction=_interaction(), tokens=512)
-    with pytest.raises(ImageGenerationError, match="512"):
+    over_budget = MAX_PROMPT_TOKENS + 1
+    fake = _FakeGenaiClient(interaction=_interaction(), tokens=over_budget)
+    with pytest.raises(ImageGenerationError, match=str(over_budget)):
         _client(fake).generate_image("a prompt")
     assert fake.interactions.calls == []
 
@@ -159,7 +164,7 @@ def test_generate_image_surfaces_client_error_message() -> None:
         {
             "error": {
                 "code": 400,
-                "message": "The prompt is too long: 512 tokens (max 480).",
+                "message": "The prompt is too long: 512 tokens (max 700).",
                 "status": "INVALID_ARGUMENT",
             }
         },
@@ -186,7 +191,7 @@ def test_generate_image_extracts_message_from_interactions_error() -> None:
             {
                 "error": {
                     "code": 400,
-                    "message": "The prompt is too long: 512 tokens (max 480).",
+                    "message": "The prompt is too long: 512 tokens (max 700).",
                     "status": "INVALID_ARGUMENT",
                 }
             }

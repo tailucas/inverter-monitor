@@ -541,23 +541,28 @@ Current commands (registered as simple `CommandHandler`s in `app/bot.py`
   current state. The composed prompt is replied to the user first (HTML
   `<pre>` block), then the image follows as a photo with a plain-text
   caption. `StyleConfig` presets (the style parameter's domain: medium
-  sentence, camera, lens, palette, portrait aspect ratio, 1K image size)
-  and `LocationConfig` presets live in `app/image_prompts.py`; the location
-  is never user-selected — one of the outdoor settings (sky visible) is
-  picked at random and shown in the header/logs, while the style is the
-  second argument overriding the random pick. Arguments are resolved by the
-  pure `resolve_imagine_args`: one token is the material unless it names a
+  sentence, designed lighting, camera, lens, palette, any quoted rendered
+  text, and the image response format's aspect ratio and size) and
+  `LocationConfig` presets live in `app/image_prompts.py`; the location is
+  never user-selected — one of the outdoor settings (sky visible) is picked
+  at random and shown in the header/logs, and the style is the second
+  argument overriding the random pick. Arguments are resolved by the pure
+  `resolve_imagine_args`: one token is the material unless it names a
   configured style, two tokens are material then style, a location name is
   rejected as not-a-style, underscores join material words, and unusable
   arguments come back as error codes the bot phrases (an unknown style
-  lists the options). Prompts always state that the subject is outdoors
+  lists the options). A material from `DEFAULT_MATERIALS` is picked at
+  random whenever the user names none, so every picture keeps specific
+  physical makeup. Prompts always state that the subject is outdoors
   with the sky visible, name the time of day (`dawn`, `morning`, `midday`,
   `afternoon`, `dusk`, `evening` — derived from the weather sample's
   `sunrise_epoch`/`sunset_epoch`) and describe the wind
-  (`wind_speed_ms`/`wind_deg`/`wind_gust_ms`). Prompts stay inside
-  `MAX_PROMPT_TOKENS`/`MAX_PROMPT_CHARS`, are token-counted by
-  `app/gemini_image.py` before the request, and the client's own error
-  message is relayed verbatim (plain text, never Markdown-parsed).
+  (`wind_speed_ms`/`wind_deg`/`wind_gust_ms`). Prompts fill the guide's
+  formula (subject, action, location/context, composition, style) and stay
+  inside the self-imposed `MAX_PROMPT_TOKENS`/`MAX_PROMPT_CHARS` budget.
+  Prompts are token-counted by `app/gemini_image.py` before the request, and
+  the client's own error message is relayed verbatim (plain text, never
+  Markdown-parsed).
 
 Conventions:
 
