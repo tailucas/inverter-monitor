@@ -21,6 +21,7 @@ from tailucas_pylib import APP_NAME
 
 import app.sonoff as sonoff_module
 from app.sonoff import (
+    SONOFF_INFO_PATH,
     SONOFF_LAN_PORT,
     SONOFF_REQUEST_TIMEOUT_SECONDS,
     SONOFF_SWITCH_PATH,
@@ -35,7 +36,8 @@ from app.sonoff import (
     plan_sonoff_commands,
 )
 
-API_KEY = "12345678-1234-1234-1234-123456789abc"
+# the device key (LAN key) is the credential used for LAN-mode encryption
+DEVICE_KEY = "12345678-1234-1234-1234-123456789abc"
 # deterministic test vector pinning the AES-128-CBC LAN-mode payload
 FIXED_IV = bytes(range(16))
 FIXED_IV_B64 = "AAECAwQFBgcICQoLDA0ODw=="
@@ -48,7 +50,7 @@ def _device(device_id: str, shed_only: bool = True) -> SonoffDeviceConfig:
         device_id=device_id,
         name=f"name-{device_id}",
         address="192.168.1.10",
-        api_key=API_KEY,
+        device_key=DEVICE_KEY,
         shed_only=shed_only,
     )
 
@@ -71,6 +73,7 @@ class FakeResponse:
     def __init__(self, payload: Any, status_code: int = 200) -> None:
         self._payload = payload
         self.status_code = status_code
+        self.text = json.dumps(payload)
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -158,22 +161,22 @@ class TestBuildSwitchPayload:
 
     def test_protocol_test_vector(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(sonoff_module, "get_random_bytes", lambda _size: FIXED_IV)
-        on_payload = build_switch_payload("shed1", API_KEY, STATE_ON)
+        on_payload = build_switch_payload("shed1", DEVICE_KEY, STATE_ON)
         assert on_payload["iv"] == FIXED_IV_B64
         assert on_payload["data"] == ON_CIPHERTEXT_B64
         assert on_payload["deviceid"] == "shed1"
         assert on_payload["selfApikey"] == "123"
         assert on_payload["encrypt"] is True
         assert str(on_payload["sequence"]).isdigit()
-        off_payload = build_switch_payload("shed1", API_KEY, STATE_OFF)
+        off_payload = build_switch_payload("shed1", DEVICE_KEY, STATE_OFF)
         assert off_payload["data"] == OFF_CIPHERTEXT_B64
 
     def test_round_trip_is_compact_json_switch_command(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(sonoff_module, "get_random_bytes", lambda _size: FIXED_IV)
-        payload = build_switch_payload("shed1", API_KEY, STATE_ON)
-        key = md5(API_KEY.encode()).digest()
+        payload = build_switch_payload("shed1", DEVICE_KEY, STATE_ON)
+        key = md5(DEVICE_KEY.encode()).digest()
         cipher = AES.new(key, AES.MODE_CBC, iv=base64.b64decode(payload["iv"]))
         plaintext = unpad(
             cipher.decrypt(base64.b64decode(payload["data"])), AES.block_size
@@ -186,7 +189,7 @@ class TestBuildSwitchPayload:
 def _creds_fields(device_id: str, **overrides: str) -> dict[str, str]:
     fields = {
         f"Sonoff/{device_id}/name": f"name-{device_id}",
-        f"Sonoff/{device_id}/apikey": API_KEY,
+        f"Sonoff/{device_id}/devicekey": DEVICE_KEY,
         f"Sonoff/{device_id}/address": "192.168.1.50",
     }
     fields.update(overrides)
@@ -207,7 +210,7 @@ class TestLoadSonoffDevices:
         assert device.device_id == "shed1"
         assert device.name == "name-shed1"
         assert device.address == "192.168.1.50"
-        assert device.api_key == API_KEY
+        assert device.device_key == DEVICE_KEY
         assert device.shed_only is False
         configured = [
             r for r in caplog.records if r.getMessage() == "Sonoff device configured"
@@ -217,12 +220,32 @@ class TestLoadSonoffDevices:
         assert record.device_id == "shed1"
         assert record.device_name == "name-shed1"
         assert record.address == "192.168.1.50"
-        # the API key must never end up in a log record
-        assert API_KEY not in str(record.__dict__)
+        # the device key must never end up in a log record
+        assert DEVICE_KEY not in str(record.__dict__)
 
     def test_shed_only_defaults_to_true(self) -> None:
         devices = load_sonoff_devices(FakeCreds(_creds_fields("shed1")), ["shed1"])
         assert devices[0].shed_only is True
+
+    def test_devicekey_credential_is_required(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An account apikey is not accepted in place of the device key."""
+        fields = _creds_fields("shed1")
+        del fields["Sonoff/shed1/devicekey"]
+        fields["Sonoff/shed1/apikey"] = "731e4609-08da-40df-a173-7404c6e5a7f6"
+        with caplog.at_level(logging.WARNING, logger=APP_NAME):
+            devices = load_sonoff_devices(FakeCreds(fields), ["shed1"])
+        assert devices == []
+        skipped = [
+            r
+            for r in caplog.records
+            if r.getMessage() == "Skipping Sonoff device with incomplete credentials"
+        ]
+        assert len(skipped) == 1
+        record: Any = skipped[0]
+        assert record.device_id == "shed1"
+        assert record.field == "devicekey"
 
     def test_incomplete_credentials_are_skipped(
         self, caplog: pytest.LogCaptureFixture
@@ -250,6 +273,14 @@ class TestLoadSonoffDevices:
 
 class TestSonoffController:
     """The controller issues control messages and backs off on failure."""
+
+    def test_session_sends_the_json_content_type(self) -> None:
+        """The LAN-mode POST carries the content type the firmware expects."""
+        controller = SonoffController(devices=[_device("shed1")])
+        assert (
+            controller._session.headers["Content-Type"]
+            == "application/json;charset=UTF-8"
+        )
 
     @staticmethod
     def _post_recorder(posts: list[dict[str, Any]], response: Any) -> Any:
@@ -420,3 +451,125 @@ class TestSonoffController:
         controller = SonoffController(devices=[_device("shed1", shed_only=False)])
         controller._issue(intent=(STATE_ON, "all_clear"))
         assert controller._failures == {"shed1": 1}
+
+    def test_device_rejection_reports_body_and_hint(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A device-side rejection carries its body and an actionable hint."""
+
+        def rejected_post(self, url, data=None, timeout=None, **kwargs):
+            return FakeResponse({"seq": 3, "sequence": "1", "error": 400})
+
+        monkeypatch.setattr(requests.Session, "post", rejected_post)
+        controller = SonoffController(devices=[_device("shed1", shed_only=False)])
+        with caplog.at_level(logging.WARNING, logger=APP_NAME):
+            controller._issue(intent=(STATE_OFF, "load_shed"))
+        failed = [
+            r
+            for r in caplog.records
+            if r.getMessage() == "Sonoff control message failed"
+        ]
+        record: Any = failed[0]
+        assert '"error": 400' in record.response_body
+        assert "does not match the device's LAN key" in record.error_hint
+
+    def test_startup_key_check_warns_on_rejected_key(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A key the device refuses is reported once at start-up."""
+        posts: list[str] = []
+
+        def rejected_post(self, url, data=None, timeout=None, **kwargs):
+            posts.append(url)
+            return FakeResponse({"seq": 3, "sequence": "1", "error": 401})
+
+        monkeypatch.setattr(requests.Session, "post", rejected_post)
+        controller = SonoffController(devices=[_device("shed1")])
+        with caplog.at_level(logging.INFO, logger=APP_NAME):
+            controller._verify_device_keys()
+        assert posts == [f"http://192.168.1.10:{SONOFF_LAN_PORT}{SONOFF_INFO_PATH}"]
+        rejected = [
+            r
+            for r in caplog.records
+            if r.getMessage() == "Sonoff API key rejected by device"
+        ]
+        assert len(rejected) == 1
+        record: Any = rejected[0]
+        assert record.device_id == "shed1"
+        assert "does not match the device's LAN key" in record.error_hint
+        summary = [
+            r for r in caplog.records if r.getMessage() == "Sonoff device keys verified"
+        ]
+        summary_record: Any = summary[0]
+        assert summary_record.verified_count == 0
+        assert summary_record.rejected_count == 1
+        assert summary_record.rejected_devices == ["shed1"]
+
+    def test_startup_key_check_accepts_valid_key(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A device that accepts the payload counts as verified."""
+
+        def ok_post(self, url, data=None, timeout=None, **kwargs):
+            return FakeResponse({"seq": 3, "sequence": "1", "error": 0})
+
+        monkeypatch.setattr(requests.Session, "post", ok_post)
+        controller = SonoffController(devices=[_device("shed1")])
+        with caplog.at_level(logging.INFO, logger=APP_NAME):
+            controller._verify_device_keys()
+        summary = [
+            r for r in caplog.records if r.getMessage() == "Sonoff device keys verified"
+        ]
+        summary_record: Any = summary[0]
+        assert summary_record.device_count == 1
+        assert summary_record.verified_count == 1
+        assert summary_record.rejected_count == 0
+
+    def test_startup_key_check_counts_refused_probe_as_verified(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A refused info probe still proves the device decrypted our key."""
+        posts: list[str] = []
+
+        def refused_post(self, url, data=None, timeout=None, **kwargs):
+            posts.append(url)
+            return FakeResponse({"seq": 4, "sequence": "1", "error": 422})
+
+        monkeypatch.setattr(requests.Session, "post", refused_post)
+        controller = SonoffController(devices=[_device("shed1")])
+        with caplog.at_level(logging.DEBUG, logger=APP_NAME):
+            controller._verify_device_keys()
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        accepted = [
+            r for r in caplog.records if r.getMessage() == "Sonoff API key accepted"
+        ]
+        assert len(accepted) == 1
+        accepted_record: Any = accepted[0]
+        assert accepted_record.probe_error == 422
+        summary = [
+            r for r in caplog.records if r.getMessage() == "Sonoff device keys verified"
+        ]
+        summary_record: Any = summary[0]
+        assert summary_record.verified_count == 1
+        assert summary_record.rejected_count == 0
+
+    def test_startup_key_check_ignores_unreachable_device(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An offline device at start-up is not reported as a key failure."""
+
+        def unreachable_post(self, url, data=None, timeout=None, **kwargs):
+            raise requests.ConnectionError("no route to host")
+
+        monkeypatch.setattr(requests.Session, "post", unreachable_post)
+        controller = SonoffController(devices=[_device("shed1")])
+        with caplog.at_level(logging.DEBUG, logger=APP_NAME):
+            controller._verify_device_keys()
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        summary = [
+            r for r in caplog.records if r.getMessage() == "Sonoff device keys verified"
+        ]
+        summary_record: Any = summary[0]
+        assert summary_record.device_count == 1
+        assert summary_record.verified_count == 0
+        assert summary_record.rejected_count == 0

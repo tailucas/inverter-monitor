@@ -3,8 +3,9 @@
 
 Sonoff BasicR2 devices running the stock (Itead/eWeLink) V3+ firmware accept
 control messages in local LAN mode: an HTTP POST to port 8081 carrying an
-AES-128-CBC payload keyed by the device API key (the documented LAN-mode
-protocol).  This module implements that payload directly and addresses each
+AES-128-CBC payload keyed by the device key (the eWeLink `devicekey`, also
+shown as the API key in the app's DIY mode — not the eWeLink account
+`apikey`).  This module implements that payload directly and addresses each
 device by the IP address held in 1Password, so no mDNS discovery, no cloud
 round-trip and no asyncio event loop is involved.
 
@@ -36,7 +37,10 @@ SONOFF_CREDS_ITEM = "Sonoff"
 # LAN-mode control endpoint exposed by the stock firmware
 SONOFF_LAN_PORT = 8081
 SONOFF_SWITCH_PATH = "/zeroconf/switch"
-# constant the LAN-mode protocol expects alongside the device API key
+SONOFF_INFO_PATH = "/zeroconf/info"
+# device response excerpt kept for diagnostics
+SONOFF_RESPONSE_EXCERPT_CHARS = 200
+# constant for the protocol's `selfApikey` envelope field (not a credential)
 SONOFF_SELF_API_KEY = "123"
 SONOFF_REQUEST_TIMEOUT_SECONDS = 3
 # per-device retry backoff after a failed control message (doubles to the cap)
@@ -56,7 +60,7 @@ class SonoffDeviceConfig:
     device_id: str
     name: str
     address: str
-    api_key: str = field(repr=False)
+    device_key: str = field(repr=False)
     shed_only: bool = True
 
 
@@ -118,16 +122,15 @@ def plan_sonoff_commands(
     return commands
 
 
-def build_switch_payload(device_id: str, api_key: str, state: int) -> dict:
-    """Build the encrypted LAN-mode payload for one switch state.
+def build_payload(device_id: str, device_key: str, params: dict) -> dict:
+    """Build the encrypted LAN-mode payload for one command.
 
     The documented scheme: the AES-128-CBC key is the MD5 digest of the
-    device API key, the IV is 16 random bytes carried base64-encoded in the
-    payload, and the plaintext is the compact JSON switch command.
+    device key, the IV is 16 random bytes carried base64-encoded in the
+    payload, and the plaintext is the compact JSON command.
     """
-    switch = "on" if state == STATE_ON else "off"
-    plaintext = json.dumps({"switch": switch}, separators=(",", ":")).encode("utf-8")
-    key = MD5.new(bytes(api_key, "utf-8")).digest()
+    plaintext = json.dumps(params, separators=(",", ":")).encode("utf-8")
+    key = MD5.new(bytes(device_key, "utf-8")).digest()
     iv = get_random_bytes(AES.block_size)
     cipher = AES.new(key, AES.MODE_CBC, iv=iv)
     ciphertext = cipher.encrypt(pad(plaintext, AES.block_size))
@@ -141,6 +144,42 @@ def build_switch_payload(device_id: str, api_key: str, state: int) -> dict:
     }
 
 
+def build_switch_payload(device_id: str, device_key: str, state: int) -> dict:
+    """Build the encrypted LAN-mode payload for one switch state."""
+    switch = "on" if state == STATE_ON else "off"
+    return build_payload(device_id, device_key, {"switch": switch})
+
+
+def _bounded_body(response: requests.Response) -> str:
+    """Return a bounded excerpt of the device response for diagnostics."""
+    body = response.text or ""
+    return body[:SONOFF_RESPONSE_EXCERPT_CHARS]
+
+
+def sonoff_error_hint(response_body: str | None) -> str | None:
+    """Return an actionable hint for a rejection reported by the device.
+
+    The device answers ``{"error": 400}`` when it cannot decrypt the payload
+    with its LAN key, which in practice means the configured device key is
+    stale or belongs to another device.
+    """
+    if not response_body:
+        return None
+    try:
+        error = json.loads(response_body).get("error")
+    except AttributeError, ValueError:
+        return None
+    if error in (400, 401):
+        return (
+            "device rejected the encrypted payload: the configured key does "
+            "not match the device's LAN key. Store the device's *device key* "
+            "(the eWeLink cloud `devicekey`, shown as the API key in the "
+            "app's DIY mode) as Sonoff/<device_id>/devicekey — not the "
+            "eWeLink account `apikey` — and restart the app."
+        )
+    return None
+
+
 def parse_device_ids(device_id_csv: str) -> list[str]:
     """Split the configured Sonoff device id list.
 
@@ -152,34 +191,45 @@ def parse_device_ids(device_id_csv: str) -> list[str]:
     ]
 
 
+def _read_credential(
+    creds_obj: Creds, creds_path: str
+) -> tuple[str | None, str | None]:
+    """Return a trimmed credential value and the reason it is unusable."""
+    try:
+        raw_value = creds_obj.get_creds(creds_path)
+    except Exception as e:
+        return None, str(e)
+    value = raw_value.strip() if raw_value else ""
+    if not value:
+        return None, "empty value"
+    return value, None
+
+
 def load_sonoff_devices(
     creds_obj: Creds, device_ids: Iterable[str]
 ) -> list[SonoffDeviceConfig]:
     """Resolve the configured Sonoff devices from 1Password.
 
     Each field lives in the `Sonoff` item under a section named after the
-    device id: `Sonoff/{id}/name`, `/apikey`, `/address` and the optional
-    boolean `/shed_only` (absent means shed-only).  A device with any
-    required field missing is skipped with a WARNING; the API key is never
-    logged.
+    device id: `Sonoff/{id}/name`, `/devicekey`, `/address` and the optional
+    boolean `/shed_only` (absent means shed-only).  The key is the device's
+    *device key* (the eWeLink cloud `devicekey`, which is the LAN encryption
+    key) — the eWeLink account `apikey` is a different credential and is
+    never read.  A device with any required field missing is skipped with a
+    WARNING; the key is never logged.
     """
     devices = []
     for device_id in device_ids:
         fields: dict[str, str] = {}
         missing_field = None
         missing_error = None
-        for field_name in ("name", "apikey", "address"):
-            creds_path = f"{SONOFF_CREDS_ITEM}/{device_id}/{field_name}"
-            try:
-                raw_value = creds_obj.get_creds(creds_path)
-                value = raw_value.strip() if raw_value else ""
-            except Exception as e:
+        for field_name in ("name", "devicekey", "address"):
+            value, error = _read_credential(
+                creds_obj, f"{SONOFF_CREDS_ITEM}/{device_id}/{field_name}"
+            )
+            if value is None:
                 missing_field = field_name
-                missing_error = str(e)
-                break
-            if not value:
-                missing_field = field_name
-                missing_error = "empty value"
+                missing_error = error
                 break
             fields[field_name] = value
         if missing_field is not None:
@@ -202,7 +252,7 @@ def load_sonoff_devices(
             device_id=device_id,
             name=fields["name"],
             address=fields["address"],
-            api_key=fields["apikey"],
+            device_key=fields["devicekey"],
             shed_only=parse_shed_only(shed_only_field),
         )
         log.info(
@@ -234,9 +284,13 @@ class SonoffController(AppThread):
     ):
         AppThread.__init__(self, name=self.__class__.__name__)
         self._devices = list(devices)
-        self._api_keys = {device.device_id: device.api_key for device in self._devices}
+        self._device_keys = {
+            device.device_id: device.device_key for device in self._devices
+        }
         self._request_timeout = request_timeout
         self._session = requests.Session()
+        # the stock firmware expects the JSON content type on LAN-mode posts
+        self._session.headers.update({"Content-Type": "application/json;charset=UTF-8"})
         self._wake = threading.Event()
         self._intent_lock = threading.Lock()
         self._intent: tuple[int, str] | None = None
@@ -262,6 +316,7 @@ class SonoffController(AppThread):
                 ),
             },
         )
+        self._verify_device_keys()
         # the wake event keeps the wait interruptible with a bounded
         # shutdown latency, so no terminator thread is needed
         while not threads.shutting_down:
@@ -285,6 +340,83 @@ class SonoffController(AppThread):
         except Exception:
             log.warning("Ignoring error closing Sonoff HTTP session.", exc_info=True)
         log.info("Sonoff controller stopped.")
+
+    def _verify_device_keys(self) -> None:
+        """Check that every device accepts the configured device key.
+
+        A read-only ``/zeroconf/info`` request is encrypted with the same key
+        and payload builder as a control message, so the reply reveals
+        whether the device can decrypt our payload: ``error 400/401`` means
+        the credential is not the device's LAN key and is logged as an
+        actionable WARNING, while any other JSON reply (some firmwares refuse
+        the info probe, e.g. with error 422) proves the key works.
+        Unreachable devices are logged at DEBUG (they are normal at
+        start-up).
+        """
+        verified = 0
+        rejected = []
+        for device in self._devices:
+            try:
+                payload = build_payload(
+                    device_id=device.device_id,
+                    device_key=device.device_key,
+                    params={},
+                )
+                response = self._session.post(
+                    url=(
+                        f"http://{device.address}:{SONOFF_LAN_PORT}{SONOFF_INFO_PATH}"
+                    ),
+                    data=json.dumps(payload, separators=(",", ":")),
+                    timeout=self._request_timeout,
+                )
+                response_body = _bounded_body(response)
+                error = response.json().get("error")
+            except Exception:
+                log.debug(
+                    "Sonoff device key check could not reach the device",
+                    extra={
+                        "device_id": device.device_id,
+                        "address": device.address,
+                    },
+                    exc_info=True,
+                )
+                continue
+            hint = sonoff_error_hint(response_body)
+            if hint is not None:
+                rejected.append(device.device_id)
+                log.warning(
+                    "Sonoff API key rejected by device",
+                    extra={
+                        "device_id": device.device_id,
+                        "device_name": device.name,
+                        "address": device.address,
+                        "error": str(error),
+                        "response_body": response_body,
+                        "error_hint": hint,
+                    },
+                )
+                continue
+            # the device decrypted our payload; a non-zero error only means
+            # this firmware does not answer the read-only info probe
+            verified += 1
+            log.debug(
+                "Sonoff API key accepted",
+                extra={
+                    "device_id": device.device_id,
+                    "device_name": device.name,
+                    "probe_error": error,
+                    "response_body": response_body,
+                },
+            )
+        log.info(
+            "Sonoff device keys verified",
+            extra={
+                "device_count": len(self._devices),
+                "verified_count": verified,
+                "rejected_count": len(rejected),
+                "rejected_devices": rejected,
+            },
+        )
 
     def _issue(self, intent: tuple[int, str]) -> None:
         switch_state, reason = intent
@@ -319,10 +451,11 @@ class SonoffController(AppThread):
 
     def _send(self, command: SonoffCommand, reason: str) -> None:
         url = f"http://{command.address}:{SONOFF_LAN_PORT}{SONOFF_SWITCH_PATH}"
+        response_body = None
         try:
             payload = build_switch_payload(
                 device_id=command.device_id,
-                api_key=self._api_keys.get(command.device_id, ""),
+                device_key=self._device_keys.get(command.device_id, ""),
                 state=command.state,
             )
             response = self._session.post(
@@ -330,6 +463,7 @@ class SonoffController(AppThread):
                 data=json.dumps(payload, separators=(",", ":")),
                 timeout=self._request_timeout,
             )
+            response_body = _bounded_body(response)
             response.raise_for_status()
             error = response.json().get("error")
             if error != 0:
@@ -339,6 +473,8 @@ class SonoffController(AppThread):
                 command=command,
                 reason=reason,
                 error=e,
+                response_body=response_body,
+                error_hint=sonoff_error_hint(response_body),
                 exc_info=not isinstance(e, RequestException),
             )
             return
@@ -366,6 +502,8 @@ class SonoffController(AppThread):
         command: SonoffCommand,
         reason: str,
         error: Exception,
+        response_body: str | None = None,
+        error_hint: str | None = None,
         exc_info: bool = False,
     ) -> None:
         failures = self._failures.get(command.device_id, 0) + 1
@@ -387,6 +525,10 @@ class SonoffController(AppThread):
             "error": str(error),
             "error_type": type(error).__name__,
         }
+        if response_body is not None:
+            fields["response_body"] = response_body
+        if error_hint is not None:
+            fields["error_hint"] = error_hint
         if command.device_id in self._backoff_alerted:
             log.debug("Sonoff control message retry failed", extra=fields)
         elif backoff >= SONOFF_MAX_RETRY_BACKOFF_SECONDS:

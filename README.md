@@ -168,7 +168,7 @@ Key configuration items (see `base.env` and `config/app.conf`):
 - `INVERTER_LOGGER_SN` — Serial number of the inverter
 - `BMS_SERIAL_PORT` — Serial device for BMS (e.g., `/dev/ttyUSB0`)
 - `MQTT_SERVER_ADDRESS` — MQTT broker hostname
-- `SONOFF_LOAD_SHED_DEVICE_ID_CSV` — Comma-separated Sonoff device IDs (a single id works too; empty disables Sonoff control). Each id names a section of the `Sonoff` 1Password item holding `name`, `apikey`, `address` and the optional boolean `shed_only` (default true: only ever switch off)
+- `SONOFF_LOAD_SHED_DEVICE_ID_CSV` — Comma-separated Sonoff device IDs (a single id works too; empty disables Sonoff control). Each id names a section of the `Sonoff` 1Password item holding `name`, `address`, the **device's `devicekey`** and the optional boolean `shed_only` (default true: only ever switch off). The `devicekey` is the eWeLink *device* key (the LAN encryption key; the eWeLink app shows it as the device's API key in DIY mode, and the cloud API returns it as `devicekey` beside the device `params`) — the eWeLink *account* `apikey` is a different credential and is never used. The app verifies each key at start-up and logs an actionable WARNING when a device rejects it (the device replies `{"error":400}` and load shedding continues without that device)
 - `WEATHER_COORD` — Latitude,longitude for weather data
 - `GEMINI_MODEL` — Optional `/imagine` text-to-image model override (defaults to `gemini-3.1-flash-lite-image`)
 - `INFLUXDB_BUCKET` — Target InfluxDB bucket name

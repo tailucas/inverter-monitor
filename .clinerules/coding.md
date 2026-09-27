@@ -85,12 +85,18 @@ Rules:
 - Unknown-but-valid frames get logged with raw hex fields for reverse
   engineering, not dropped silently.
 - Sonoff LAN-mode control (`app/sonoff.py`) builds the documented
-  AES-128-CBC payload (MD5 of the device API key, random IV, compact JSON
+  AES-128-CBC payload (MD5 of the *device key*, random IV, compact JSON
   switch command) and POSTs it to `http://{address}:8081/zeroconf/switch`
   with a 3 s timeout — devices are addressed by their 1Password address, so
-  no mDNS discovery, cloud round-trip or event loop is involved. Failed
-  control messages log a WARNING and back off per device (5 s doubling to a
-  60 s cap, one ERROR when the cap is reached, re-armed by a success).
+  no mDNS discovery, cloud round-trip or event loop is involved. The
+  credential is `Sonoff/{id}/devicekey` (the eWeLink device key) — the account
+  `apikey` is a different credential, is never read, and would be rejected by
+  the device with `error 400`. The controller verifies each key at start-up
+  with a read-only `/zeroconf/info` probe: a device that answers
+  `error 400/401` logs an actionable WARNING, and failed control messages
+  log a WARNING with the device's bounded `response_body` and the same
+  `error_hint` before backing off per device (5 s doubling to a 60 s cap,
+  one ERROR when the cap is reached, re-armed by a success).
 
 ## 4. Alerting & Metrics
 
