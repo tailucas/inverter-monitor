@@ -562,7 +562,11 @@ Current commands (registered as simple `CommandHandler`s in `app/bot.py`
   inside the self-imposed `MAX_PROMPT_TOKENS`/`MAX_PROMPT_CHARS` budget.
   Prompts are token-counted by `app/gemini_image.py` before the request, and
   the client's own error message is relayed verbatim (plain text, never
-  Markdown-parsed).
+  Markdown-parsed). The transient `404 Requested entity was not found` the
+  Interactions API intermittently returns for a valid request is retried
+  once (INFO `"Retrying Gemini image request after not-found error"`, after
+  `IMAGE_REQUEST_RETRY_DELAY_SECONDS`); if that retry fails with any error,
+  the failure is logged and relayed exactly like a first failure.
 
 Conventions:
 

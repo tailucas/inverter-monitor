@@ -2,14 +2,18 @@
 """Unit tests for the Gemini text-to-image client (no network access)."""
 
 import base64
+import logging
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from google.genai.errors import ClientError
+from tailucas_pylib import APP_NAME
 
+from app import gemini_image
 from app.gemini_image import (
     DEFAULT_IMAGE_MODEL,
+    IMAGE_REQUEST_RETRY_DELAY_SECONDS,
     IMAGE_REQUEST_TIMEOUT_SECONDS,
     GeminiImageClient,
     ImageGenerationError,
@@ -21,6 +25,7 @@ from app.image_prompts import (
 )
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-image-data"
+NOT_FOUND_MESSAGE = "Requested entity was not found."
 
 
 class _FakeCreds:
@@ -44,13 +49,21 @@ class _FakeModels:
 
 
 class _FakeInteractions:
-    def __init__(self, interaction: Any = None, error: Exception | None = None):
+    def __init__(
+        self,
+        interaction: Any = None,
+        error: Exception | None = None,
+        errors: list[Exception] | None = None,
+    ):
         self.interaction = interaction
         self.error = error
+        self.errors = list(errors) if errors is not None else []
         self.calls: list[dict[str, Any]] = []
 
     def create(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
+        if self.errors:
+            raise self.errors.pop(0)
         if self.error is not None:
             raise self.error
         return self.interaction
@@ -64,11 +77,12 @@ class _FakeGenaiClient:
         interaction: Any = None,
         tokens: int | None = 120,
         create_error: Exception | None = None,
+        create_errors: list[Exception] | None = None,
         count_error: Exception | None = None,
     ) -> None:
         self.models = _FakeModels(tokens=tokens, error=count_error)
         self.interactions = _FakeInteractions(
-            interaction=interaction, error=create_error
+            interaction=interaction, error=create_error, errors=create_errors
         )
 
 
@@ -172,16 +186,39 @@ def test_generate_image_surfaces_client_error_message() -> None:
     fake = _FakeGenaiClient(create_error=error)
     with pytest.raises(ImageGenerationError, match="The prompt is too long"):
         _client(fake).generate_image("a prompt")
+    assert len(fake.interactions.calls) == 1
 
 
 class _GaosStyleError(Exception):
     """Stand-in for the Interactions client's GAOS compat error classes."""
 
-    def __init__(self, body: object, message: str = "verbose error dump") -> None:
+    def __init__(
+        self,
+        body: object,
+        message: str = "verbose error dump",
+        status_code: int = 400,
+    ) -> None:
         super().__init__(message)
-        self.status_code = 400
+        self.status_code = status_code
         self.message = message
         self.body = body
+
+
+def _not_found_error() -> _GaosStyleError:
+    """Build the transient 404 the Interactions API intermittently returns."""
+    return _GaosStyleError(
+        {"error": {"message": NOT_FOUND_MESSAGE, "code": "not_found"}},
+        message="Error code: 404 - {'error': {...}}",
+        status_code=404,
+    )
+
+
+@pytest.fixture()
+def recorded_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Capture retry delays instead of sleeping."""
+    delays: list[float] = []
+    monkeypatch.setattr(gemini_image.time, "sleep", delays.append)
+    return delays
 
 
 def test_generate_image_extracts_message_from_interactions_error() -> None:
@@ -211,6 +248,91 @@ def test_generate_image_extracts_message_from_dict_body() -> None:
     fake = _FakeGenaiClient(create_error=error)
     with pytest.raises(ImageGenerationError, match="quota exceeded"):
         _client(fake).generate_image("a prompt")
+
+
+def test_generate_image_retries_transient_not_found(
+    caplog: pytest.LogCaptureFixture,
+    recorded_sleeps: list[float],
+) -> None:
+    """The intermittent 404 'not found' is retried once and then succeeds."""
+    fake = _FakeGenaiClient(
+        interaction=_interaction(), create_errors=[_not_found_error()]
+    )
+    with caplog.at_level(logging.INFO, logger=APP_NAME):
+        assert _client(fake).generate_image("a prompt") == PNG_BYTES
+    assert len(fake.interactions.calls) == 2
+    assert recorded_sleeps == [IMAGE_REQUEST_RETRY_DELAY_SECONDS]
+    retries = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Retrying Gemini image request after not-found error"
+    ]
+    assert len(retries) == 1
+    record: Any = retries[0]
+    assert record.status_code == 404
+    assert record.error == NOT_FOUND_MESSAGE
+    assert record.retry_delay_seconds == IMAGE_REQUEST_RETRY_DELAY_SECONDS
+
+
+def test_generate_image_reports_not_found_after_failed_retry(
+    caplog: pytest.LogCaptureFixture,
+    recorded_sleeps: list[float],
+) -> None:
+    """A repeated 404 is reported to the caller like any other failure."""
+    fake = _FakeGenaiClient(create_errors=[_not_found_error(), _not_found_error()])
+    with caplog.at_level(logging.INFO, logger=APP_NAME):
+        with pytest.raises(ImageGenerationError, match=NOT_FOUND_MESSAGE):
+            _client(fake).generate_image("a prompt")
+    assert len(fake.interactions.calls) == 2
+    assert recorded_sleeps == [IMAGE_REQUEST_RETRY_DELAY_SECONDS]
+    rejections = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Gemini image request rejected"
+    ]
+    assert len(rejections) == 1
+    record: Any = rejections[0]
+    assert record.status_code == 404
+    assert record.error == NOT_FOUND_MESSAGE
+    assert record.error_type == "_GaosStyleError"
+
+
+def test_generate_image_reports_different_error_from_the_retry(
+    recorded_sleeps: list[float],
+) -> None:
+    """Only the first 404 is retried; the retry's failure is surfaced."""
+    fake = _FakeGenaiClient(
+        create_errors=[_not_found_error(), RuntimeError("connection reset")]
+    )
+    with pytest.raises(ImageGenerationError, match="connection reset"):
+        _client(fake).generate_image("a prompt")
+    assert len(fake.interactions.calls) == 2
+    assert recorded_sleeps == [IMAGE_REQUEST_RETRY_DELAY_SECONDS]
+
+
+@pytest.mark.parametrize(
+    "status_code,message",
+    [
+        (404, "quota exhausted"),
+        (400, "requested entity was not found"),
+    ],
+)
+def test_generate_image_does_not_retry_other_errors(
+    status_code: int,
+    message: str,
+    recorded_sleeps: list[float],
+) -> None:
+    """Only a 404 whose message says 'not found' is treated as transient."""
+    error = _GaosStyleError(
+        {"error": {"message": message}},
+        message=f"Error code: {status_code}",
+        status_code=status_code,
+    )
+    fake = _FakeGenaiClient(create_error=error)
+    with pytest.raises(ImageGenerationError, match=message):
+        _client(fake).generate_image("a prompt")
+    assert len(fake.interactions.calls) == 1
+    assert recorded_sleeps == []
 
 
 def test_generate_image_surfaces_unexpected_errors() -> None:

@@ -5,7 +5,9 @@ Wraps the google-genai Interactions API: the prompt is counted against the
 project's self-imposed prompt budget before the request is sent, the
 returned base64 image payload is decoded, and every failure is raised as
 ``ImageGenerationError`` carrying the client's own error message so the bot
-can relay it to the user.
+can relay it to the user. The transient ``404 Requested entity was not
+found`` the Interactions API occasionally returns for a valid request is
+retried once before the failure is reported.
 
 No Telegram imports and no asyncio: the bot thread calls these blocking
 helpers through an executor, and the image response format is taken from the
@@ -30,6 +32,10 @@ from app.image_prompts import (
 DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-lite-image"
 # bounded time for one text-to-image round trip
 IMAGE_REQUEST_TIMEOUT_SECONDS = 120
+# the Interactions API intermittently answers a valid image request with
+# "404 Requested entity was not found"; one delayed retry clears it
+NOT_FOUND_STATUS_CODE = 404
+IMAGE_REQUEST_RETRY_DELAY_SECONDS = 1.0
 
 OTEL_METER = metrics.get_meter(APP_NAME)
 IMAGE_GENERATION_DURATION = OTEL_METER.create_gauge(
@@ -84,6 +90,18 @@ def _status_code(exc: Exception) -> int | None:
         if isinstance(value, int):
             return value
     return None
+
+
+def _is_retryable_not_found(exc: Exception) -> bool:
+    """Detect the intermittent "entity not found" failure of the API.
+
+    A valid image request is occasionally answered with
+    ``404 Requested entity was not found``; the same request succeeds when
+    repeated, so a single retry is warranted.
+    """
+    if _status_code(exc) != NOT_FOUND_STATUS_CODE:
+        return False
+    return "not found" in _server_error_message(exc).lower()
 
 
 class GeminiImageClient:
@@ -183,33 +201,7 @@ class GeminiImageClient:
                 "image_size": image_size,
             },
         )
-        try:
-            interaction = self._client.interactions.create(
-                model=self.model,
-                input=prompt,
-                response_format=response_format,
-                timeout=IMAGE_REQUEST_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            status_code = _status_code(exc)
-            error_message = _server_error_message(exc)
-            if status_code is not None:
-                log.warning(
-                    "Gemini image request rejected",
-                    extra={
-                        "model": self.model,
-                        "error": error_message,
-                        "status_code": status_code,
-                        "error_type": type(exc).__name__,
-                    },
-                )
-            else:
-                log.warning(
-                    "Unexpected error requesting Gemini image",
-                    exc_info=True,
-                    extra={"model": self.model, "error": error_message},
-                )
-            raise ImageGenerationError(error_message) from exc
+        interaction = self._request_interaction(prompt, response_format)
         self._raise_for_interaction_errors(interaction)
         image_bytes = self._decode_output_image(interaction)
         log.info(
@@ -222,6 +214,66 @@ class GeminiImageClient:
             },
         )
         return image_bytes
+
+    def _request_interaction(self, prompt: str, response_format: dict[str, str]) -> Any:
+        """Create the interaction, retrying a transient "not found" once.
+
+        The Interactions API intermittently rejects a valid request with
+        ``404 Requested entity was not found``; one delayed retry clears it.
+        The retry's outcome is reported exactly like a first failure: the
+        warning is logged and ``ImageGenerationError`` carries the API's own
+        message back to the user.
+        """
+        try:
+            return self._create_interaction(prompt, response_format)
+        except Exception as exc:
+            if not _is_retryable_not_found(exc):
+                raise self._image_request_error(exc) from exc
+            log.info(
+                "Retrying Gemini image request after not-found error",
+                extra={
+                    "model": self.model,
+                    "error": _server_error_message(exc),
+                    "status_code": _status_code(exc),
+                    "retry_delay_seconds": IMAGE_REQUEST_RETRY_DELAY_SECONDS,
+                },
+            )
+            time.sleep(IMAGE_REQUEST_RETRY_DELAY_SECONDS)
+        try:
+            return self._create_interaction(prompt, response_format)
+        except Exception as exc:
+            raise self._image_request_error(exc) from exc
+
+    def _create_interaction(self, prompt: str, response_format: dict[str, str]) -> Any:
+        """Send one image request to the Interactions API."""
+        return self._client.interactions.create(
+            model=self.model,
+            input=prompt,
+            response_format=response_format,
+            timeout=IMAGE_REQUEST_TIMEOUT_SECONDS,
+        )
+
+    def _image_request_error(self, exc: Exception) -> ImageGenerationError:
+        """Log a failed image request and build the error to relay."""
+        status_code = _status_code(exc)
+        error_message = _server_error_message(exc)
+        if status_code is not None:
+            log.warning(
+                "Gemini image request rejected",
+                extra={
+                    "model": self.model,
+                    "error": error_message,
+                    "status_code": status_code,
+                    "error_type": type(exc).__name__,
+                },
+            )
+        else:
+            log.warning(
+                "Unexpected error requesting Gemini image",
+                exc_info=True,
+                extra={"model": self.model, "error": error_message},
+            )
+        return ImageGenerationError(error_message)
 
     @staticmethod
     def _raise_for_interaction_errors(interaction: Any) -> None:
