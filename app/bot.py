@@ -38,15 +38,16 @@ from telegram.ext import (
 from app.gemini_image import GeminiImageClient
 from app.image_prompts import (
     DEFAULT_LOAD_WARNING_W,
-    DEFAULT_SCENES,
+    DEFAULT_STYLES,
     MAX_PROMPT_TOKENS,
     ImaginePrompt,
-    SceneConfig,
+    LocationConfig,
+    StyleConfig,
     build_image_prompt,
     estimate_prompt_tokens,
-    find_scene,
-    scene_names,
-    select_scene,
+    resolve_imagine_args,
+    style_names,
+    time_of_day_phase,
 )
 from app.metrics import (
     BATTERY_QUERIES,
@@ -208,11 +209,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 f"/history [hours] \u2014 power time-series chart\n"
                 f"/battery [hours] \u2014 battery time-series chart\n"
                 f"/cell [hours] \u2014 per-cell voltages and balancing advice\n"
-                f"/imagine [scene] \u2014 generated picture of the inverter\n\n"
+                f"/imagine [material] [style] \u2014 picture of the inverter\n\n"
                 f"Examples:\n"
                 f"/history 12 \u2014 last 12 hours\n"
                 f"/history \u2014 default ({DEFAULT_HISTORY_HOURS} hours)\n"
-                f"/imagine \u2014 a random scene; a wrong scene lists the options"
+                f"/imagine \u2014 a random style\n"
+                f"`/imagine copper` \u2014 copper build, random style\n"
+                f"`/imagine brushed_aluminium hyperrealistic` \u2014 style "
+                f"names and material words use underscores"
             ),
             disable_web_page_preview=True,
             parse_mode=ParseMode.MARKDOWN,
@@ -502,27 +506,50 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
             return ConversationHandler.END
 
-        scene = bot.resolve_scene(context.args)
-        if scene is None:
-            available = ", ".join(scene_names(DEFAULT_SCENES))
-            await update.effective_message.reply_text(
-                text=(
-                    f"{emoji.emojize(':warning:')} Unknown scene. Available "
-                    f"scenes: {available}."
-                ),
-            )
+        resolved = resolve_imagine_args(context.args)
+        if (
+            resolved.error is not None
+            or resolved.style is None
+            or resolved.location is None
+        ):
+            available = ", ".join(style_names(DEFAULT_STYLES))
+            if resolved.error == "too_many_args":
+                message = (
+                    f"{emoji.emojize(':warning:')} Too many arguments. Use "
+                    f"/imagine [material] [style] -- styles: {available}. "
+                    f"Join material words with underscores."
+                )
+            elif resolved.error == "invalid_material":
+                message = (
+                    f"{emoji.emojize(':warning:')} Material must be a short "
+                    f"phrase of words or numbers joined by underscores. "
+                    f"Styles: {available}."
+                )
+            else:
+                message = (
+                    f"{emoji.emojize(':warning:')} Unknown style. Available "
+                    f"styles: {available}. The location is always outdoors."
+                )
+            await update.effective_message.reply_text(text=message)
             return ConversationHandler.END
+        style = resolved.style
+        location = resolved.location
 
         loop = asyncio.get_running_loop()
-        request = await loop.run_in_executor(None, bot.build_imagine, scene)
+        request = await loop.run_in_executor(
+            None, bot.build_imagine, style, location, resolved.material
+        )
         prompt_tokens = estimate_prompt_tokens(request.prompt)
         await update.effective_message.reply_html(
             text=build_imagine_prompt_message(
-                scene.name,
-                scene.aspect_ratio,
+                style.name,
+                style.aspect_ratio,
                 request.prompt,
                 prompt_tokens,
                 MAX_PROMPT_TOKENS,
+                location=location.name,
+                material=resolved.material,
+                time_of_day=request.time_of_day,
             ),
         )
 
@@ -540,9 +567,12 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             "Imagine report sent",
             extra={
                 "user_id": user.id,
-                "scene": scene.name,
+                "style": style.name,
+                "location": location.name,
+                "material": resolved.material,
+                "time_of_day": request.time_of_day,
                 "model": bot._image_client.model,
-                "aspect_ratio": scene.aspect_ratio,
+                "aspect_ratio": style.aspect_ratio,
                 "prompt_chars": len(request.prompt),
                 "prompt_tokens_estimate": prompt_tokens,
                 "image_bytes": len(image_bytes),
@@ -919,13 +949,13 @@ class TelegramBot(AppThread, Closable):
 
     # -- /imagine helpers ------------------------------------------------------
 
-    def resolve_scene(self, args: list[str] | None) -> SceneConfig | None:
-        """Resolve the requested scene, randomly selecting one when unnamed."""
-        if not args:
-            return select_scene(DEFAULT_SCENES)
-        return find_scene(DEFAULT_SCENES, args[0])
-
-    def build_imagine(self, scene: SceneConfig) -> ImaginePrompt:
+    def build_imagine(
+        self,
+        style: StyleConfig,
+        location: LocationConfig,
+        material: str | None = None,
+        now: float | None = None,
+    ) -> ImaginePrompt:
         """Blocking: snapshot telemetry and compose the image prompt."""
         inverter = None
         if self._inverter_query is not None:
@@ -935,14 +965,18 @@ class TelegramBot(AppThread, Closable):
                 log.warning("Live inverter query failed for /imagine", exc_info=True)
         weather = self._weather.summary()
         switches = self._switch_stats.summary()
+        phase = time_of_day_phase(weather, now)
         prompt = build_image_prompt(
             inverter=inverter,
             bms=self._bms_summary.summary(),
             weather=weather,
             switches=switches,
-            scene=scene,
+            style=style,
+            location=location,
             load_warning_w=self._load_warning_w,
             load_shed_w=self._load_shed_w,
+            material=material,
+            now=now,
         )
         caption = build_imagine_caption(
             inverter,
@@ -954,13 +988,22 @@ class TelegramBot(AppThread, Closable):
         log.debug(
             "Composed image prompt",
             extra={
-                "scene": scene.name,
+                "style": style.name,
+                "location": location.name,
+                "material": material,
+                "time_of_day": phase,
                 "prompt": prompt,
                 "prompt_chars": len(prompt),
                 "prompt_tokens_estimate": estimate_prompt_tokens(prompt),
             },
         )
-        return ImaginePrompt(prompt=prompt, caption=caption, scene=scene)
+        return ImaginePrompt(
+            prompt=prompt,
+            caption=caption,
+            style=style,
+            location=location,
+            time_of_day=phase,
+        )
 
     def render_imagine(self, request: ImaginePrompt) -> bytes:
         """Blocking: generate the image for a composed prompt."""
@@ -968,8 +1011,8 @@ class TelegramBot(AppThread, Closable):
             raise RuntimeError("image generation is not configured")
         return self._image_client.generate_image(
             request.prompt,
-            aspect_ratio=request.scene.aspect_ratio,
-            image_size=request.scene.image_size,
+            aspect_ratio=request.style.aspect_ratio,
+            image_size=request.style.image_size,
         )
 
     def run(self) -> None:

@@ -7,10 +7,11 @@ than a list of tags, and anything that should be absent is phrased as a
 positive description instead of a negative instruction.
 
 Telemetry from the inverter, BMS, weather and switch threads is distilled
-into the mandatory visual elements: the inverter centred in the frame, the
-weather above it, a face that reflects its health, and an explicit
-load-shedding indicator. The composed prompt stays inside the model's
-480-token prompt budget (roughly 2000 characters).
+into the mandatory visual elements: an inverter shown outdoors with the sky
+visible, the time of day and the wind taken from the weather sample, a face
+that reflects its health, and an explicit load-shedding indicator. The
+composed prompt stays inside the model's 480-token prompt budget (roughly
+2000 characters).
 
 No I/O and no framework dependencies: the application threads gather the
 telemetry and hand it to these pure helpers, which are unit-tested in
@@ -18,6 +19,8 @@ telemetry and hand it to these pure helpers, which are unit-tested in
 """
 
 import random
+import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -40,12 +43,42 @@ BATTERY_MAJOR_DRAW_W = 500.0
 # cell voltage spread that shows a balancing problem
 CELL_MONITOR_MV = 30.0
 CELL_ACTION_MV = 80.0
-
-_SUBJECT = (
-    "Centred in the middle of the frame stands a friendly modern hybrid "
-    "solar inverter on a low concrete plinth, with thick power cables "
-    "looping down to the floor and a small glowing display on its front"
+# the six phases that name the time of day; evening covers the dark hours
+TIME_OF_DAY_PHASES = (
+    "dawn",
+    "morning",
+    "midday",
+    "afternoon",
+    "dusk",
+    "evening",
 )
+# twilight windows straddle sunrise/sunset, midday straddles solar noon
+_TWILIGHT_FRACTION = 1 / 12
+_MIDDAY_FRACTION = 1 / 8
+# Beaufort-inspired wind bands (m/s) for the narrative wind sentence
+WIND_STILL_MS = 0.5
+WIND_LIGHT_MS = 3.4
+WIND_STEADY_MS = 8.0
+WIND_FRESH_MS = 13.9
+# a gust this much stronger than the mean speed is worth describing
+WIND_GUST_GAP_MS = 3.0
+# user-supplied materials stay short so they cannot blow the prompt budget
+MAX_MATERIAL_CHARS = 40
+
+
+def _subject_sentence(material: str | None) -> str:
+    """Describe the inverter, its material and the outdoors framing."""
+    subject = (
+        "centred in the middle of the frame stands a friendly modern hybrid "
+        "solar inverter"
+    )
+    if material:
+        subject += f" made of {material}"
+    return (
+        f"Out in the open air beneath the open sky, {subject} on a low "
+        "concrete plinth, with thick power cables looping down to the floor "
+        "and a small glowing display on its front."
+    )
 
 
 def numeric_value(value: Any) -> float | None:
@@ -71,22 +104,81 @@ def _truthy(value: Any) -> bool:
     return False
 
 
-# -- scene configurations ------------------------------------------------------
+# -- locations and styles ------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class SceneConfig:
-    """A narrative scene preset woven into the composed prompt.
+class LocationConfig:
+    """An outdoor location preset for the composed prompt.
 
-    Each field is a complete sentence (or clause pair) describing one of the
-    image-model prompt ingredients; ``aspect_ratio`` and ``image_size`` are
-    forwarded to the API as the image response format.
+    Locations are never chosen by the user: every entry describes an outdoor
+    place where the sky is visible, and one is picked at random per image.
+    ``setting`` describes the place and ``lighting`` its phase-neutral
+    ambience (the time of day comes from the weather sample instead).
     """
 
     name: str
     setting: str
-    style: str
     lighting: str
+
+
+DEFAULT_LOCATIONS: tuple[LocationConfig, ...] = (
+    LocationConfig(
+        name="cosy_home_garage",
+        setting=(
+            "It stands on the paved apron of a cosy suburban home beside an "
+            "open garage door, with a wooden workbench and a pegboard of "
+            "hand tools visible inside."
+        ),
+        lighting="A gentle warm glow spills out from the open garage doorway.",
+    ),
+    LocationConfig(
+        name="sunny_rooftop",
+        setting=(
+            "It stands on a sunny rooftop terrace with potted succulents, a "
+            "water tank and the city skyline far below."
+        ),
+        lighting="Soft shadows stretch across the rooftop terrace.",
+    ),
+    LocationConfig(
+        name="retro_control_room",
+        setting=(
+            "It stands on the flat roof of a vintage control building ringed "
+            "with dials, gauges and a softly humming console."
+        ),
+        lighting="A moody teal console glow mixes with one warm service lamp.",
+    ),
+    LocationConfig(
+        name="farmyard_shed",
+        setting=(
+            "It stands in an open farmyard beside a corrugated-iron shed, "
+            "with hay bales, a wheelbarrow and dust motes in the air."
+        ),
+        lighting="Soft even light rims the props without harsh shadows.",
+    ),
+    LocationConfig(
+        name="orbital_station",
+        setting=(
+            "It stands on the open observation deck of a small orbital "
+            "station behind a railing, with Earth hanging in the black sky "
+            "below."
+        ),
+        lighting="Cool blue starlight from the black sky meets a warm console strip.",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class StyleConfig:
+    """A rendering style preset: the /imagine style parameter's domain.
+
+    ``style`` is the narrative medium sentence; camera, lens and palette
+    complete the look, and ``aspect_ratio``/``image_size`` are forwarded to
+    the API as the image response format. Locations always stay outdoors.
+    """
+
+    name: str
+    style: str
     camera: str
     lens: str
     palette: str | None = None
@@ -94,18 +186,29 @@ class SceneConfig:
     image_size: str = DEFAULT_IMAGE_SIZE
 
 
-DEFAULT_SCENES: tuple[SceneConfig, ...] = (
-    SceneConfig(
-        name="cosy_home_garage",
-        setting=(
-            "It stands in a tidy home garage with a wooden workbench, a "
-            "pegboard of hand tools and coiled cables on the wall behind it."
+DEFAULT_STYLES: tuple[StyleConfig, ...] = (
+    StyleConfig(
+        name="hyperrealistic",
+        style=(
+            "The picture is a hyperrealistic photograph with true-to-life "
+            "materials, crisp focus and natural colour."
         ),
+        camera=(
+            "The camera frames it as an eye-level documentary shot with the "
+            "inverter dead centre."
+        ),
+        lens=(
+            "A 50 mm lens keeps the subject tack sharp against a softly "
+            "blurred background."
+        ),
+        palette="The palette stays natural and true to every material.",
+    ),
+    StyleConfig(
+        name="cartoon",
         style=(
             "The picture is rendered as a whimsical 3D cartoon with soft "
             "rounded shapes and clean plain surfaces."
         ),
-        lighting="Warm afternoon sunlight falls through a high side window.",
         camera=(
             "The camera frames it as a medium shot from slightly above with "
             "the inverter dead centre."
@@ -113,17 +216,12 @@ DEFAULT_SCENES: tuple[SceneConfig, ...] = (
         lens="A 35 mm look with gentle depth of field keeps the background soft.",
         palette="The palette leans on warm amber highlights over teal shadows.",
     ),
-    SceneConfig(
-        name="sunny_rooftop",
-        setting=(
-            "It stands on a sunny rooftop terrace with potted succulents, a "
-            "water tank and the city skyline far below."
-        ),
+    StyleConfig(
+        name="flat_vector",
         style=(
             "The picture is drawn as a crisp flat vector illustration with "
             "bold outlines and smooth flat colour."
         ),
-        lighting="Low golden-hour sun backlights the scene with long soft shadows.",
         camera=(
             "The camera frames it as a slightly low eye-level shot with the "
             "inverter dead centre."
@@ -131,17 +229,12 @@ DEFAULT_SCENES: tuple[SceneConfig, ...] = (
         lens="Wide 28 mm perspective layers the simple shapes clearly.",
         palette="The palette mixes golden yellow with dusty blue.",
     ),
-    SceneConfig(
-        name="retro_control_room",
-        setting=(
-            "It stands in a vintage control room lined with dials, gauges and "
-            "a softly humming console."
-        ),
+    StyleConfig(
+        name="claymation",
         style=(
             "The picture is built like a claymation diorama with fingerprint "
             "textures and chunky props."
         ),
-        lighting="A moody teal console glow mixes with one warm desk lamp.",
         camera=(
             "The camera frames it as an eye-level medium shot with the "
             "inverter dead centre."
@@ -149,67 +242,171 @@ DEFAULT_SCENES: tuple[SceneConfig, ...] = (
         lens="A macro-style shallow depth of field melts the background.",
         palette="The palette pairs teal with burnt orange.",
     ),
-    SceneConfig(
-        name="farmyard_shed",
-        setting=(
-            "It stands inside an open corrugated-iron farm shed with hay "
-            "bales, a wheelbarrow and dust motes in the air."
-        ),
+    StyleConfig(
+        name="watercolour",
         style=(
             "The picture is painted as a soft watercolour storybook "
             "illustration on textured paper."
         ),
-        lighting="Gentle overcast daylight washes the scene with no harsh shadows.",
         camera=(
             "The camera frames it as a three-quarter view from waist height "
             "with the inverter dead centre."
         ),
         lens="Loose washes and soft edges keep the drawing airy.",
         palette="The palette stays in faded greens and straw yellows.",
-        aspect_ratio="3:4",
     ),
-    SceneConfig(
-        name="orbital_station",
-        setting=(
-            "It stands on the observation deck of a small orbital station "
-            "with a round porthole showing Earth below."
-        ),
+    StyleConfig(
+        name="stylised_3d",
         style=(
             "The picture is rendered as a polished stylised 3D illustration "
             "with smooth surfaces."
         ),
-        lighting="Cool blue starlight from the porthole meets a warm console strip.",
         camera=("The camera frames it as a centred medium shot from slightly below."),
         lens="A wide-angle feel with crisp detail keeps every panel readable.",
         palette="The palette contrasts deep blue with warm white.",
-        aspect_ratio="9:16",
     ),
 )
 
 
-def scene_names(scenes: Sequence[SceneConfig] = DEFAULT_SCENES) -> list[str]:
-    """Return the configured scene names in presentation order."""
-    return [scene.name for scene in scenes]
+def style_names(styles: Sequence[StyleConfig] = DEFAULT_STYLES) -> list[str]:
+    """Return the configured style names in presentation order."""
+    return [style.name for style in styles]
 
 
-def find_scene(scenes: Sequence[SceneConfig], name: str) -> SceneConfig | None:
-    """Find a scene by name (case-insensitive), or None when unknown."""
+def find_style(styles: Sequence[StyleConfig], name: str) -> StyleConfig | None:
+    """Find a style by name (case-insensitive), or None when unknown."""
     wanted = name.strip().lower()
-    for scene in scenes:
-        if scene.name.lower() == wanted:
-            return scene
+    for style in styles:
+        if style.name.lower() == wanted:
+            return style
     return None
 
 
-def select_scene(
-    scenes: Sequence[SceneConfig] = DEFAULT_SCENES,
+def select_style(
+    styles: Sequence[StyleConfig] = DEFAULT_STYLES,
     rng: random.Random | None = None,
-) -> SceneConfig:
-    """Pick a random scene configuration (deterministic with a seeded rng)."""
-    if not scenes:
-        raise ValueError("at least one scene configuration is required")
+) -> StyleConfig:
+    """Pick a random style configuration (deterministic with a seeded rng)."""
+    if not styles:
+        raise ValueError("at least one style configuration is required")
     chooser = rng if rng is not None else random.Random()
-    return chooser.choice(list(scenes))
+    return chooser.choice(list(styles))
+
+
+def location_names(
+    locations: Sequence[LocationConfig] = DEFAULT_LOCATIONS,
+) -> list[str]:
+    """Return the configured location names in presentation order."""
+    return [location.name for location in locations]
+
+
+def find_location(
+    locations: Sequence[LocationConfig],
+    name: str,
+) -> LocationConfig | None:
+    """Find a location by name (case-insensitive), or None when unknown."""
+    wanted = name.strip().lower()
+    for location in locations:
+        if location.name.lower() == wanted:
+            return location
+    return None
+
+
+def select_location(
+    locations: Sequence[LocationConfig] = DEFAULT_LOCATIONS,
+    rng: random.Random | None = None,
+) -> LocationConfig:
+    """Pick a random outdoor location (deterministic with a seeded rng)."""
+    if not locations:
+        raise ValueError("at least one location configuration is required")
+    chooser = rng if rng is not None else random.Random()
+    return chooser.choice(list(locations))
+
+
+# -- /imagine arguments --------------------------------------------------------
+
+_MATERIAL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 '\-]*")
+
+
+def sanitize_material(text: str | None) -> str | None:
+    """Normalise a user-supplied material into a short prompt-safe phrase.
+
+    Underscores join words (Telegram splits arguments on whitespace), runs of
+    whitespace collapse, and anything longer than ``MAX_MATERIAL_CHARS`` or
+    carrying other punctuation is rejected so the prompt budget stays safe.
+    """
+    if not text:
+        return None
+    cleaned = " ".join(text.replace("_", " ").split())
+    if not cleaned or len(cleaned) > MAX_MATERIAL_CHARS:
+        return None
+    if _MATERIAL_PATTERN.fullmatch(cleaned) is None:
+        return None
+    return cleaned
+
+
+@dataclass(frozen=True)
+class ImagineArgs:
+    """Resolved /imagine arguments: style, location, material or an error."""
+
+    style: StyleConfig | None = None
+    location: LocationConfig | None = None
+    material: str | None = None
+    error: str | None = None
+
+
+def resolve_imagine_args(
+    args: Sequence[str] | None,
+    styles: Sequence[StyleConfig] = DEFAULT_STYLES,
+    locations: Sequence[LocationConfig] = DEFAULT_LOCATIONS,
+    rng: random.Random | None = None,
+) -> ImagineArgs:
+    """Resolve the optional /imagine arguments into style and material.
+
+    One token names a style when it matches a configured style, and is
+    treated as the material otherwise; with two tokens the first is the
+    material and the second must name a style. The location is never chosen
+    by the user: one of the outdoor locations is picked at random. Materials
+    join words with underscores. Unusable arguments come back as error codes
+    for the bot to phrase.
+    """
+    tokens = [token for token in (args or []) if token.strip()]
+    if not tokens:
+        return ImagineArgs(
+            style=select_style(styles, rng),
+            location=select_location(locations, rng),
+        )
+    if len(tokens) > 2:
+        return ImagineArgs(error="too_many_args")
+    if len(tokens) == 2:
+        style = find_style(styles, tokens[1])
+        if style is None:
+            return ImagineArgs(error="unknown_style")
+        material = sanitize_material(tokens[0])
+        if material is None:
+            return ImagineArgs(error="invalid_material")
+        return ImagineArgs(
+            style=style,
+            location=select_location(locations, rng),
+            material=material,
+        )
+    style = find_style(styles, tokens[0])
+    if style is not None:
+        return ImagineArgs(
+            style=style,
+            location=select_location(locations, rng),
+        )
+    if find_location(locations, tokens[0]) is not None:
+        # the location stays outdoors and is never user-selected
+        return ImagineArgs(error="unknown_style")
+    material = sanitize_material(tokens[0])
+    if material is None:
+        return ImagineArgs(error="invalid_material")
+    return ImagineArgs(
+        style=select_style(styles, rng),
+        location=select_location(locations, rng),
+        material=material,
+    )
 
 
 # -- inverter health -----------------------------------------------------------
@@ -256,24 +453,109 @@ def _health_from(inverter: Mapping[str, Any] | None) -> _Health:
     )
 
 
-def _sky_sentence(weather: Mapping[str, Any] | None) -> str:
-    """Describe the weather in the upper part of the frame."""
+# -- weather: sky, time of day and wind ---------------------------------------
+
+
+def _cloud_description(cloudiness: float | None) -> str | None:
+    """Turn a cloud-cover percentage into a narrative cloud description."""
+    if cloudiness is None:
+        return None
+    if cloudiness >= 90:
+        return "a heavy flat layer of grey cloud"
+    if cloudiness >= 60:
+        return "ragged grey clouds with only small gaps of blue"
+    if cloudiness >= 30:
+        return "scattered white clouds drifting across blue sky"
+    return "a deep clear blue sky"
+
+
+def time_of_day_phase(
+    weather: Mapping[str, Any] | None,
+    now: float | None = None,
+) -> str | None:
+    """Name the phase of the day from the sample's sunrise/sunset epochs.
+
+    The sun times published with the weather sample make this timezone-free:
+    twilight windows straddle each sun event and the midday window straddles
+    solar noon, both scaled to the length of the daylight span. The six
+    named phases cover the whole day, so evening spans the dark hours.
+    """
+    data = weather or {}
+    sunrise = numeric_value(data.get("sunrise_epoch"))
+    sunset = numeric_value(data.get("sunset_epoch"))
+    if sunrise is None or sunset is None or sunset <= sunrise:
+        return None
+    moment = time.time() if now is None else now
+    daylight = sunset - sunrise
+    twilight = daylight * _TWILIGHT_FRACTION
+    midday_span = daylight * _MIDDAY_FRACTION
+    solar_noon = sunrise + daylight / 2
+    if moment < sunrise - twilight or moment >= sunset + twilight:
+        return "evening"
+    if moment < sunrise + twilight:
+        return "dawn"
+    if moment < solar_noon - midday_span:
+        return "morning"
+    if moment < solar_noon + midday_span:
+        return "midday"
+    if moment < sunset - twilight:
+        return "afternoon"
+    return "dusk"
+
+
+def _time_sentence(phase: str | None) -> str:
+    """State the time of day explicitly so the lighting is anchored."""
+    if not phase:
+        return ""
+    return f"The time of day is {phase}."
+
+
+# how the light reads for every named phase of the day
+_PHASE_LIGHT = {
+    "dawn": "soft golden light from a sun rising on the horizon",
+    "morning": "bright clear light from a climbing sun",
+    "midday": "bright daylight from a high sun",
+    "afternoon": "warm light from a slowly descending sun",
+    "dusk": "low burnt-orange light from a sun sinking on the horizon",
+}
+
+
+def _sky_sentence(
+    weather: Mapping[str, Any] | None,
+    phase: str | None,
+) -> str:
+    """Describe the sky and its light, named by phase when one is known."""
     data = weather or {}
     cloudiness = numeric_value(data.get("cloudiness_pct"))
     midday = numeric_value(data.get("midday_pct"))
+    if phase == "evening":
+        if cloudiness is not None and cloudiness >= 60:
+            return (
+                "Above the inverter the upper part of the frame holds a dark "
+                "night sky with a slim moon hidden behind thick cloud."
+            )
+        return (
+            "Above the inverter the upper part of the frame holds a dark "
+            "night sky pricked with stars around a slim crescent moon."
+        )
+    if phase is not None:
+        cloud = _cloud_description(cloudiness)
+        light = _PHASE_LIGHT[phase]
+        if cloud is None:
+            return (
+                "Above the inverter the upper part of the frame holds an "
+                f"open sky under {light}."
+            )
+        return (
+            "Above the inverter the upper part of the frame holds "
+            f"{cloud} under {light}."
+        )
+    # no sun times in the sample: infer what the solar output allows
     if cloudiness is None and midday is None:
         return (
             "Above the inverter the upper part of the frame holds a calm "
             "neutral sky that keeps the composition open."
         )
-    if cloudiness is not None and cloudiness >= 90:
-        cloud = "a heavy flat layer of grey cloud"
-    elif cloudiness is not None and cloudiness >= 60:
-        cloud = "ragged grey clouds with only small gaps of blue"
-    elif cloudiness is not None and cloudiness >= 30:
-        cloud = "scattered white clouds drifting across blue sky"
-    else:
-        cloud = "a deep clear blue sky"
     if midday is not None and midday <= 5:
         if cloudiness is not None and cloudiness >= 60:
             return (
@@ -284,6 +566,7 @@ def _sky_sentence(weather: Mapping[str, Any] | None) -> str:
             "Above the inverter the upper part of the frame holds a dark "
             "night sky pricked with stars around a slim crescent moon."
         )
+    cloud = _cloud_description(cloudiness) or "an open sky"
     if midday is not None and midday <= 25:
         light = "low golden light from a sun near the horizon"
     else:
@@ -291,6 +574,58 @@ def _sky_sentence(weather: Mapping[str, Any] | None) -> str:
     return (
         f"Above the inverter the upper part of the frame holds {cloud} under {light}."
     )
+
+
+# compass adjectives for the direction the wind blows from
+_COMPASS_ADJECTIVES = (
+    "northerly",
+    "north-easterly",
+    "easterly",
+    "south-easterly",
+    "southerly",
+    "south-westerly",
+    "westerly",
+    "north-westerly",
+)
+
+
+def _compass_adjective(degrees: float | None) -> str | None:
+    """Convert a meteorological wind bearing into a compass adjective."""
+    if degrees is None:
+        return None
+    index = int(((degrees % 360) + 22.5) // 45) % 8
+    return _COMPASS_ADJECTIVES[index]
+
+
+def wind_sentence(weather: Mapping[str, Any] | None) -> str | None:
+    """Describe the wind, or None when the sample carries no wind speed."""
+    data = weather or {}
+    speed = numeric_value(data.get("wind_speed_ms"))
+    if speed is None:
+        return None
+    direction = _compass_adjective(numeric_value(data.get("wind_deg")))
+    if speed < WIND_STILL_MS:
+        sentence = "The air around it is completely still."
+    elif speed < WIND_LIGHT_MS:
+        sentence = "A light breeze drifts through the scene."
+        if direction:
+            sentence = f"A light {direction} breeze drifts through the scene."
+    elif speed < WIND_STEADY_MS:
+        sentence = "A steady breeze stirs the scene around it."
+        if direction:
+            sentence = f"A steady {direction} breeze stirs the scene around it."
+    elif speed < WIND_FRESH_MS:
+        sentence = "A fresh wind sweeps through the scene."
+        if direction:
+            sentence = f"A fresh {direction} wind sweeps through the scene."
+    else:
+        sentence = "Gale-force winds bend everything around it."
+        if direction:
+            sentence = f"Gale-force {direction} winds bend everything around it."
+    gust = numeric_value(data.get("wind_gust_ms"))
+    if gust is not None and gust >= speed + WIND_GUST_GAP_MS:
+        sentence += " Stronger gusts tug at everything around it."
+    return sentence
 
 
 def _face_sentence(health: _Health, load_warning_w: float) -> str:
@@ -451,7 +786,7 @@ def _shed_sentence(state: LoadShedState) -> str:
 # -- prompt composition --------------------------------------------------------
 
 
-def _compose(mandatory: Sequence[str], optional: Sequence[str | None]) -> str:
+def _compose(mandatory: Sequence[str | None], optional: Sequence[str | None]) -> str:
     """Join mandatory clauses and add optional ones while they still fit."""
     prompt = " ".join(clause for clause in mandatory if clause)
     for clause in optional:
@@ -474,30 +809,37 @@ def build_image_prompt(
     bms: Mapping[str, Any] | None = None,
     weather: Mapping[str, Any] | None = None,
     switches: Mapping[str, Any] | None = None,
-    scene: SceneConfig = DEFAULT_SCENES[0],
+    style: StyleConfig = DEFAULT_STYLES[0],
+    location: LocationConfig = DEFAULT_LOCATIONS[0],
     load_warning_w: float = DEFAULT_LOAD_WARNING_W,
     load_shed_w: float | None = None,
+    material: str | None = None,
+    now: float | None = None,
 ) -> str:
     """Compose a narrative, budgeted image prompt from live telemetry."""
     shed_w = DEFAULT_LOAD_SHED_W if load_shed_w is None else load_shed_w
     health = _health_from(inverter)
+    phase = time_of_day_phase(weather, now)
     mandatory = [
-        f"{_SUBJECT}. {scene.setting}",
-        _sky_sentence(weather),
+        _subject_sentence(material),
+        location.setting,
+        _time_sentence(phase),
+        _sky_sentence(weather, phase),
+        wind_sentence(weather),
         _face_sentence(health, load_warning_w),
         _battery_sentence(health, bms),
         _power_sentence(health, load_warning_w, shed_w),
         _shed_sentence(load_shed_state(inverter, switches, load_warning_w, shed_w)),
-        scene.style,
-        scene.lighting,
-        scene.camera,
+        style.style,
+        location.lighting,
+        style.camera,
     ]
     optional = [
-        scene.lens,
-        scene.palette,
+        style.lens,
+        style.palette,
         (
             "The whole picture is a vertical portrait composition in a "
-            f"{scene.aspect_ratio} aspect ratio."
+            f"{style.aspect_ratio} aspect ratio."
         ),
     ]
     return _compose(mandatory, optional)
@@ -510,8 +852,10 @@ def estimate_prompt_tokens(prompt: str) -> int:
 
 @dataclass(frozen=True)
 class ImaginePrompt:
-    """A composed prompt plus the photo caption and scene it came from."""
+    """A composed prompt plus the caption, style and location behind it."""
 
     prompt: str
     caption: str
-    scene: SceneConfig
+    style: StyleConfig
+    location: LocationConfig
+    time_of_day: str | None = None

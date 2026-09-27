@@ -626,6 +626,8 @@ class WeatherReader(AppThread):
                     "lat": self.lat,
                     "lon": self.lon,
                     "appid": self.api_key,
+                    # metric units make the wind speed explicitly m/s
+                    "units": "metric",
                 },
                 timeout=WEATHER_REQUEST_TIMEOUT_SECONDS,
             )
@@ -720,42 +722,59 @@ class WeatherReader(AppThread):
         """Derive the published weather fields from an OpenWeather payload."""
         weather = dict()
         weather["cloudiness_pct"] = wd["clouds"]["all"]
+        wind = wd.get("wind")
+        if isinstance(wind, dict):
+            wind_fields = (
+                ("wind_speed_ms", "speed"),
+                ("wind_deg", "deg"),
+                ("wind_gust_ms", "gust"),
+            )
+            for field_name, source_key in wind_fields:
+                value = numeric_field(wind.get(source_key))
+                if value is not None:
+                    weather[field_name] = value
         date_value = int(wd["dt"])
-        sunrise = int(wd["sys"]["sunrise"])
-        sunset = int(wd["sys"]["sunset"])
-        sun_output = 0
-        # calculate theoretical sun output
-        if date_value > sunrise and date_value < sunset:
-            # normalize and divide
-            midday_secs = (sunset - sunrise) / 2
-            secs_from_dark = min(date_value - sunrise, sunset - date_value)
-            sun_output = int((secs_from_dark / midday_secs) * 100)
-            log.debug(
-                "Derived sun output",
-                extra={
-                    "sun_output_pct": sun_output,
-                    "sunrise": sunrise,
-                    "date_value": date_value,
-                    "sunset": sunset,
-                    "midday_secs": midday_secs,
-                    "secs_from_dark": secs_from_dark,
-                },
-            )
-        else:
-            log.debug(
-                "Using sun output",
-                extra={
-                    "sun_output_pct": sun_output,
-                    "sunrise": sunrise,
-                    "date_value": date_value,
-                    "sunset": sunset,
-                },
-            )
-        weather["midday_pct"] = sun_output
+        sys_block = wd.get("sys") or {}
+        sunrise_value = numeric_field(sys_block.get("sunrise"))
+        sunset_value = numeric_field(sys_block.get("sunset"))
+        if sunrise_value is not None and sunset_value is not None:
+            sunrise = int(sunrise_value)
+            sunset = int(sunset_value)
+            weather["sunrise_epoch"] = sunrise
+            weather["sunset_epoch"] = sunset
+            sun_output = 0
+            # calculate theoretical sun output
+            if date_value > sunrise and date_value < sunset:
+                # normalize and divide
+                midday_secs = (sunset - sunrise) / 2
+                secs_from_dark = min(date_value - sunrise, sunset - date_value)
+                sun_output = int((secs_from_dark / midday_secs) * 100)
+                log.debug(
+                    "Derived sun output",
+                    extra={
+                        "sun_output_pct": sun_output,
+                        "sunrise": sunrise,
+                        "date_value": date_value,
+                        "sunset": sunset,
+                        "midday_secs": midday_secs,
+                        "secs_from_dark": secs_from_dark,
+                    },
+                )
+            else:
+                log.debug(
+                    "Using sun output",
+                    extra={
+                        "sun_output_pct": sun_output,
+                        "sunrise": sunrise,
+                        "date_value": date_value,
+                        "sunset": sunset,
+                    },
+                )
+            weather["midday_pct"] = sun_output
         log.debug(
             "Derived weather fields",
             extra={
-                "country": wd["sys"]["country"],
+                "country": sys_block.get("country"),
                 "field_count": len(weather),
                 "weather": weather,
             },

@@ -470,15 +470,18 @@ def build_imagine_caption(
     cloudiness_pct = numeric_value(weather.get("cloudiness_pct"))
     if cloudiness_pct is not None:
         details.append(f"cloud cover {cloudiness_pct:.0f} %")
-    return f"Inverter imagination -- {', '.join(details)}"
+    return f"{', '.join(details)}"
 
 
 def build_imagine_prompt_message(
-    scene_name: str,
+    style_name: str,
     aspect_ratio: str,
     prompt: str,
     prompt_tokens: int,
     max_prompt_tokens: int,
+    location: str | None = None,
+    material: str | None = None,
+    time_of_day: str | None = None,
 ) -> str:
     """Build the HTML message that shows the composed /imagine prompt.
 
@@ -487,10 +490,18 @@ def build_imagine_prompt_message(
     itself (the middle dots below are real ``\\u00b7`` characters so they
     render correctly).
     """
+    details = [html.escape(style_name)]
+    if location:
+        details.append(f"location: {html.escape(location)}")
+    if material:
+        details.append(f"material: {html.escape(material)}")
+    if time_of_day:
+        details.append(html.escape(time_of_day))
+    details.append(html.escape(aspect_ratio))
+    details.append(f"~{prompt_tokens}/{max_prompt_tokens} tokens")
     return (
-        f"{emoji.emojize(':artist_palette:')} <b>Scene:</b> "
-        f"{html.escape(scene_name)} \u00b7 {html.escape(aspect_ratio)} \u00b7 "
-        f"~{prompt_tokens}/{max_prompt_tokens} tokens\n"
+        f"{emoji.emojize(':artist_palette:')} <b>Style:</b> "
+        f"{' \u00b7 '.join(details)}\n"
         f"<pre>{html.escape(prompt)}</pre>"
     )
 

@@ -124,7 +124,6 @@ def test_build_imagine_caption_reports_load_shedding() -> None:
 def test_build_imagine_caption_without_data() -> None:
     """A caption is always produced, even with no telemetry."""
     caption = build_imagine_caption()
-    assert caption.startswith("Inverter imagination --")
     assert "no load shedding" in caption
 
 
@@ -137,14 +136,28 @@ def test_build_imagine_caption_uses_ratio_threshold() -> None:
 def test_build_imagine_prompt_message_uses_telegram_html() -> None:
     """Only Telegram-supported entities appear and the prompt is escaped."""
     message = build_imagine_prompt_message(
-        "orbital_station", "9:16", "A <b>bold</b> & risky prompt", 350, 480
+        "hyperrealistic", "9:16", "A <b>bold</b> & risky prompt", 350, 480
     )
-    assert "<b>Scene:</b> orbital_station" in message
+    assert "<b>Style:</b> hyperrealistic" in message
     assert "\u00b7 9:16 \u00b7 ~350/480 tokens" in message
     assert "<pre>A &lt;b&gt;bold&lt;/b&gt; &amp; risky prompt</pre>" in message
     assert "&middot;" not in message
     entities = set(re.findall(r"&[a-zA-Z]+;", message))
     assert entities <= {"&lt;", "&gt;", "&amp;", "&quot;"}
+
+    detailed = build_imagine_prompt_message(
+        "cartoon",
+        "9:16",
+        "prompt",
+        10,
+        480,
+        location="sunny_rooftop",
+        material="brushed_aluminium",
+        time_of_day="dusk",
+    )
+    assert "location: sunny_rooftop" in detailed
+    assert "material: brushed_aluminium" in detailed
+    assert "\u00b7 dusk \u00b7 9:16 \u00b7 ~10/480 tokens" in detailed
 
 
 def test_build_bms_summary() -> None:
