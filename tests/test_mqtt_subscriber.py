@@ -13,6 +13,7 @@ import.
 import importlib
 import json
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -29,6 +30,8 @@ app_module = importlib.import_module("app.__main__")
 TOPIC_PREFIX = "inverter"
 BANK = "bank1"
 CONTROL_TOPIC = f"{TOPIC_PREFIX}/control/{BANK}"
+# emitted once per bank and episode for a bank that never reported state
+MISSING_STATE_MESSAGE = "Switch banks without reported state were not controlled"
 
 
 class FakeMqttClient:
@@ -39,6 +42,35 @@ class FakeMqttClient:
 
     def publish(self, topic: str, payload: str) -> None:
         self.published.append({"topic": topic, "payload": payload})
+
+
+class FakeAppSocket:
+    """ZMQ socket stand-in recording fanned-out payloads."""
+
+    def __init__(self) -> None:
+        self.sent: list[Any] = []
+
+    def send_pyobj(self, payload: Any) -> None:
+        self.sent.append(payload)
+
+
+def _state_message(bank: str, switches: list[int]) -> Any:
+    """A minimal paho-style MQTT message for a switch-bank state publish."""
+    return SimpleNamespace(
+        topic=f"{TOPIC_PREFIX}/state/{bank}",
+        payload=json.dumps({"switches": switches}).encode(),
+    )
+
+
+def _new_subscriber(banks: list[str]) -> Any:
+    """A MqttSubscriber with a recording client and no reported bank state."""
+    subscriber = app_module.MqttSubscriber(
+        mqtt_server_address="localhost",
+        mqtt_topic_prefix=TOPIC_PREFIX,
+        mqtt_switch_devices=banks,
+    )
+    subscriber._mqtt_client = FakeMqttClient()
+    return subscriber
 
 
 @pytest.fixture
@@ -102,3 +134,139 @@ class TestSwitchBankControlPublish:
             for r in caplog.records
             if r.getMessage() == "Switch bank control message published"
         ] == []
+
+
+class TestMissingSwitchStateDiagnostics:
+    """Configured banks that never reported state are loudly left alone."""
+
+    def test_unreported_bank_warns_once_and_never_publishes(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        subscriber = _new_subscriber(banks=[BANK])
+        with caplog.at_level(logging.INFO, logger=APP_NAME):
+            first = subscriber.set_switch_state(switch_state=0, reason="load_shed")
+            second = subscriber.set_switch_state(switch_state=0, reason="load_shed")
+
+        assert first == []
+        assert second == []
+        assert subscriber._mqtt_client.published == []
+        records = [r for r in caplog.records if r.getMessage() == MISSING_STATE_MESSAGE]
+        assert len(records) == 1
+        record: Any = records[0]
+        assert record.levelno == logging.WARNING
+        assert record.switch_state == 0
+        assert record.reason == "load_shed"
+        assert record.subscription_topic == f"{TOPIC_PREFIX}/state/#"
+        assert record.configured_banks == [BANK]
+        assert record.unreported_banks == [BANK]
+        assert record.state_age_secs is None
+        assert "error_hint" in record.__dict__
+
+    def test_reported_bank_is_controlled_without_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        subscriber = _new_subscriber(banks=[BANK])
+        with caplog.at_level(logging.INFO, logger=APP_NAME):
+            subscriber.on_message(None, None, _state_message(BANK, [1, 1]))
+            changed_banks = subscriber.set_switch_state(
+                switch_state=0, reason="load_shed"
+            )
+
+        assert changed_banks == [BANK]
+        assert [p["topic"] for p in subscriber._mqtt_client.published] == [
+            CONTROL_TOPIC
+        ]
+        assert [
+            r for r in caplog.records if r.getMessage() == MISSING_STATE_MESSAGE
+        ] == []
+
+    def test_state_message_logs_the_learned_bank(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        subscriber = _new_subscriber(banks=[BANK])
+        with caplog.at_level(logging.INFO, logger=APP_NAME):
+            subscriber.on_message(None, None, _state_message(BANK, [1, 0]))
+
+        records = [
+            r for r in caplog.records if r.getMessage() == "Switch bank state received"
+        ]
+        assert len(records) == 1
+        record: Any = records[0]
+        assert record.switch_bank == BANK
+        assert record.switch_count == 2
+        assert record.state == [1, 0]
+
+    def test_partial_state_feed_warns_only_about_the_silent_bank(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        subscriber = _new_subscriber(banks=[BANK, "bank2"])
+        with caplog.at_level(logging.INFO, logger=APP_NAME):
+            subscriber.on_message(None, None, _state_message(BANK, [1]))
+            subscriber.set_switch_state(switch_state=0, reason="load_shed")
+            subscriber.set_switch_state(switch_state=0, reason="load_shed")
+
+        records = [r for r in caplog.records if r.getMessage() == MISSING_STATE_MESSAGE]
+        assert len(records) == 1
+        record: Any = records[0]
+        assert record.unreported_banks == ["bank2"]
+        assert record.state_age_secs is not None
+
+
+class TestManualSwitchCommandDiagnostics:
+    """The manual command record shows what the MQTT banks actually did."""
+
+    def test_manual_command_reports_unreported_banks(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        subscriber = _new_subscriber(banks=[BANK])
+        with caplog.at_level(logging.INFO, logger=APP_NAME):
+            subscriber._apply_manual_switch_command(
+                app_socket=FakeAppSocket(), command="start_load_shed"
+            )
+
+        records = [
+            r
+            for r in caplog.records
+            if r.getMessage() == "Manual switch command applied"
+        ]
+        assert len(records) == 1
+        record: Any = records[0]
+        assert record.command == "start_load_shed"
+        assert record.switch_state == 0
+        assert record.switch_banks == []
+        assert record.configured_banks == [BANK]
+        assert record.known_banks == []
+        assert record.unchanged_banks == []
+        assert record.state_age_secs is None
+        assert record.load_shed == 1
+
+    def test_manual_command_reports_banks_already_at_the_target(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        subscriber = _new_subscriber(banks=[BANK])
+        subscriber.on_message(None, None, _state_message(BANK, [0, 0]))
+        with caplog.at_level(logging.INFO, logger=APP_NAME):
+            subscriber._apply_manual_switch_command(
+                app_socket=FakeAppSocket(), command="start_load_shed"
+            )
+
+        assert subscriber._mqtt_client.published == []
+        records = [
+            r
+            for r in caplog.records
+            if r.getMessage() == "Manual switch command applied"
+        ]
+        assert len(records) == 1
+        record: Any = records[0]
+        assert record.switch_banks == []
+        assert record.known_banks == [BANK]
+        assert record.unchanged_banks == [BANK]
+        assert isinstance(record.state_age_secs, float)
+
+
+class TestConfiguredBankParsing:
+    """Configured bank names survive padded CSV entries."""
+
+    def test_padded_bank_names_are_trimmed_and_blanks_dropped(self) -> None:
+        subscriber = _new_subscriber(banks=[" bank1 ", "", " bank2 "])
+        assert subscriber._mqtt_switch_devices == ["bank1", "bank2"]

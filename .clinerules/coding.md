@@ -55,9 +55,17 @@ One `AppThread` per concern, wired over ZMQ inproc (`URL_WORKER_APP`,
   overcast, surplus, battery SoC, grid fallback) and controls switch banks.
   Every control publish to `{topic_prefix}/control/{bank}` logs at INFO
   (`"Switch bank control message published"`) with its `topic` and
-  `payload`. Every decision is also handed to the `SonoffController` thread
-  (`app/sonoff.py`), which issues the LAN-mode control messages for the
-  configured Sonoff devices.
+  `payload`. A bank is only controllable once it has reported its state to
+  the subscription topic (the change gate needs its current switch states);
+  a configured bank that never reports is left alone and logs one WARNING
+  per bank and episode (`"Switch banks without reported state were not
+  controlled"`, re-armed by a state message, with `configured_banks`,
+  `unreported_banks`, `subscription_topic` and `state_age_secs`). The
+  manual-command record (`"Manual switch command applied"`) carries the bank
+  visibility (`configured_banks`, `known_banks`, `unchanged_banks`,
+  `state_age_secs`). Every decision is also handed to the `SonoffController`
+  thread (`app/sonoff.py`), which issues the LAN-mode control messages for
+  the configured Sonoff devices.
 - `LoadAlertMonitor`: consumes forwarded inverter samples; raises Telegram
   load warnings/recoveries and the `load_high` PagerDuty incident. Its
   load-shed state machine is pure logic in `app/load_alerts.py`.

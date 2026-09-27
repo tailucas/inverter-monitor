@@ -115,6 +115,6 @@ log.info(message.format("RabbitMQ control"))                    # .format()
 |---|---|
 | DEBUG | per-sample/chunk/frame tracing, gauge updates, "Inverter is delivering power to consumers from backup…" supporting data (always, not conditional), inverter fetch failures (resolution, connect/send/receive, empty responses, malformed frames) and poll backoff detail |
 | INFO | reader lifecycle, switch state changes and switch-bank notifications, load warning/recovery events, MQTT publishes, PagerDuty triggers & resolves, startup, recoverable warnings (PD trigger/resolve failures) |
-| WARNING | weather fetch failures (address resolution, connect/send/receive timeouts and errors, empty responses, malformed payloads), implausible inverter samples, non-recoverable config gaps (PagerDuty client not configured, missing switch-bank config, reader or Telegram bot disabled) |
+| WARNING | weather fetch failures (address resolution, connect/send/receive timeouts and errors, empty responses, malformed payloads), implausible inverter samples, non-recoverable config gaps (PagerDuty client not configured, missing switch-bank config, reader or Telegram bot disabled), configured switch banks that never reported state (once per bank, re-armed by a state message) |
 | ERROR | lost connections (serial, MQTT), unreadable mappings, inverter poll backoff reaching its maximum |
 | CRITICAL | reserved |

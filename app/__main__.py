@@ -1166,12 +1166,20 @@ class MqttSubscriber(AppThread, Closable):
         self._mqtt_client: mqtt.Client | None = None
         self._mqtt_server_address = mqtt_server_address
         self._mqtt_subscribe_topic_prefix = mqtt_topic_prefix
-        self._mqtt_switch_devices = mqtt_switch_devices
+        # trim whitespace: a padded entry never matches a state-message bank
+        self._mqtt_switch_devices = [
+            bank.strip() for bank in mqtt_switch_devices if bank.strip()
+        ]
         self._sonoff_controller = sonoff_controller
 
         self._disconnected = False
 
         self._switch_state = dict()
+        # switch-state diagnostics: a bank is only controllable once it has
+        # reported its state to the subscription topic
+        self._switch_state_seen_at: float | None = None
+        self._unreported_banks_warned: set[str] = set()
+        self._unconfigured_banks_warned: set[str] = set()
 
         generation_average_secs = app_config.getint(
             "alert_thresholds",
@@ -1238,7 +1246,11 @@ class MqttSubscriber(AppThread, Closable):
     def on_connect(self, client, userdata, flags, reason_code, properties):
         subscription_topic = f"{self._mqtt_subscribe_topic_prefix}/state/#"
         log.info(
-            "Subscribing to topic", extra={"subscription_topic": subscription_topic}
+            "Subscribing to topic",
+            extra={
+                "subscription_topic": subscription_topic,
+                "configured_banks": list(self._mqtt_switch_devices),
+            },
         )
         if self._mqtt_client is not None:
             self._mqtt_client.subscribe(subscription_topic)
@@ -1270,8 +1282,9 @@ class MqttSubscriber(AppThread, Closable):
         if msg_data is not None and "switches" in msg_data.keys():
             switch_bank = topic.split("/")[2]
             new_state = msg_data["switches"]
+            first_seen = switch_bank not in self._switch_state
             old_state = list()
-            if switch_bank in self._switch_state:
+            if not first_seen:
                 old_state = self._switch_state[switch_bank]
             if new_state != old_state:
                 for ids, s in enumerate(new_state):
@@ -1285,20 +1298,38 @@ class MqttSubscriber(AppThread, Closable):
                     )
             # state capture
             self._switch_state[switch_bank] = new_state
+            self._switch_state_seen_at = time.time()
+            # a reported bank is observable again
+            self._unreported_banks_warned.discard(switch_bank)
+            if first_seen:
+                log.info(
+                    "Switch bank state received",
+                    extra={
+                        "switch_bank": switch_bank,
+                        "switch_count": len(new_state),
+                        "state": list(new_state),
+                    },
+                )
 
     def set_switch_state(self, switch_state=1, reason="unknown"):
-        """Set every configured bank and return the banks that changed.
+        """Set every controllable bank and return the banks that changed.
 
-        The same decision drives the configured Sonoff devices, whose control
-        messages are issued by the SonoffController thread.
+        Only banks that have reported their state are controllable: the
+        change gate needs the current switch states, so a configured bank
+        that never published state is left alone and reported once per bank
+        and episode by `_warn_unreported_switch_banks`.  The same decision
+        drives the configured Sonoff devices, whose control messages are
+        issued by the SonoffController thread.
         """
         changed_banks = []
         for switch_bank in self._switch_state.keys():
             if switch_bank not in self._mqtt_switch_devices:
-                log.warning(
-                    "Not changing switch state due to missing configuration",
-                    extra={"switch_bank": switch_bank},
-                )
+                if switch_bank not in self._unconfigured_banks_warned:
+                    self._unconfigured_banks_warned.add(switch_bank)
+                    log.warning(
+                        "Not changing switch state due to missing configuration",
+                        extra={"switch_bank": switch_bank},
+                    )
                 continue
             mqtt_pub_topic = "/".join(
                 [f"{self._mqtt_subscribe_topic_prefix}", "control", switch_bank]
@@ -1349,8 +1380,45 @@ class MqttSubscriber(AppThread, Closable):
                 _mqtt_publish_duration = time.time() - _mqtt_publish_start
                 MQTT_PUBLISH_DURATION.set(_mqtt_publish_duration)
             changed_banks.append(switch_bank)
+        self._warn_unreported_switch_banks(switch_state=switch_state, reason=reason)
         self._apply_sonoff(switch_state=switch_state, reason=reason)
         return changed_banks
+
+    def _warn_unreported_switch_banks(self, switch_state: int, reason: str) -> None:
+        """Warn once per bank about configured banks that never reported.
+
+        A bank that has not published its state to the subscription topic is
+        never controlled over MQTT, so the operator has to know that a shed
+        decision did not reach it.
+        """
+        unreported_banks = [
+            bank
+            for bank in self._mqtt_switch_devices
+            if bank not in self._switch_state
+            and bank not in self._unreported_banks_warned
+        ]
+        if not unreported_banks:
+            return
+        self._unreported_banks_warned.update(unreported_banks)
+        state_age_secs = None
+        if self._switch_state_seen_at is not None:
+            state_age_secs = round(time.time() - self._switch_state_seen_at, 1)
+        log.warning(
+            "Switch banks without reported state were not controlled",
+            extra={
+                "switch_state": switch_state,
+                "reason": reason,
+                "subscription_topic": f"{self._mqtt_subscribe_topic_prefix}/state/#",
+                "configured_banks": list(self._mqtt_switch_devices),
+                "unreported_banks": unreported_banks,
+                "state_age_secs": state_age_secs,
+                "error_hint": (
+                    "check that every switch controller publishes its state "
+                    "to the subscription topic (retained messages make the "
+                    "state known immediately after a restart)"
+                ),
+            },
+        )
 
     def _apply_sonoff(self, switch_state, reason):
         """Hand a switch-bank decision to the Sonoff controller, if any."""
@@ -1403,12 +1471,26 @@ class MqttSubscriber(AppThread, Closable):
             inverter_data={},
             now=now,
         )
+        known_banks = sorted(self._switch_state)
+        unchanged_banks = [
+            bank
+            for bank in known_banks
+            if bank in self._mqtt_switch_devices
+            and all(s == switch_state for s in self._switch_state[bank])
+        ]
+        state_age_secs = None
+        if self._switch_state_seen_at is not None:
+            state_age_secs = round(now - self._switch_state_seen_at, 1)
         log.info(
             "Manual switch command applied",
             extra={
                 "command": command,
                 "switch_state": switch_state,
                 "switch_banks": list(changed_banks),
+                "configured_banks": list(self._mqtt_switch_devices),
+                "known_banks": known_banks,
+                "unchanged_banks": unchanged_banks,
+                "state_age_secs": state_age_secs,
                 "load_shed": int(self._load_shed_latch.active),
                 "overcast": int(self._overcast_latch.active),
             },

@@ -81,7 +81,7 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
 |---|---|
 | DEBUG | Per-poll/per-sample/frame tracing, gauge updates (including timing data), "Inverter is delivering power to consumers…" supporting data, inverter fetch failures (resolution, connect/send/receive, empty responses, malformed frames) and poll backoff detail |
 | INFO | Startup/lifecycle events, MQTT publishes (`traceparent` in `extra`; switch-bank control publishes also log `topic` and `payload`), switch-bank notifications, load warning/recovery events, PagerDuty triggers & resolves, recoverable failures (PD trigger/resolve failures, retried on the next sample cycle) |
-| WARNING | Weather fetch failures (resolution, connect/send/receive, empty responses, malformed payloads), implausible inverter samples, PagerDuty client not configured, missing switch-bank config, readers or Telegram bot disabled at startup |
+| WARNING | Weather fetch failures (resolution, connect/send/receive, empty responses, malformed payloads), implausible inverter samples, PagerDuty client not configured, missing switch-bank config, readers or Telegram bot disabled at startup, configured switch banks that never reported state (once per bank and episode) |
 | ERROR | Lost connections (serial, MQTT), unreadable mappings, inverter poll backoff reaching its maximum (once per outage episode) |
 | CRITICAL | Reserved |
 

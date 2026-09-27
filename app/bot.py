@@ -657,8 +657,9 @@ async def start_load_shed(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context,
         command=SWITCH_COMMAND_START_LOAD_SHED,
         success_message=(
-            f"{emoji.emojize(':warning:')} Load shedding started: switch "
-            "banks and Sonoff devices are being switched off."
+            f"{emoji.emojize(':warning:')} Load shedding started: Sonoff "
+            "devices and switch banks that have reported their state are "
+            "being switched off."
         ),
         failure_message="Could not start load shedding",
     )
@@ -672,8 +673,8 @@ async def end_load_shed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         command=SWITCH_COMMAND_END_LOAD_SHED,
         success_message=(
             f"{emoji.emojize(':check_mark:')} Load shed ended: switch banks "
-            "restored and restorable Sonoff devices enabled (shed-only "
-            "devices stay off)."
+            "that have reported their state restored and restorable Sonoff "
+            "devices enabled (shed-only devices stay off)."
         ),
         failure_message="Could not end load shedding",
     )
