@@ -80,7 +80,8 @@ log.info(message.format("RabbitMQ control"))                    # .format()
 7. **MQTT traceparent injection:** Every MQTT publish is wrapped in an OTEL
    span (`mqtt.publish`, `SpanKind.PRODUCER`). The generated traceparent is
    injected into the JSON payload (`"traceparent": "00-..."`) and logged as
-   a structured field. Log at INFO:
+   a structured field. Change-gated switch-bank control publishes log at INFO
+   with the topic and the published payload:
 
    ```python
    with OTEL_TRACER.start_as_current_span("mqtt.publish", kind=SpanKind.PRODUCER) as span:
@@ -91,8 +92,15 @@ log.info(message.format("RabbitMQ control"))                    # .format()
        payload_obj["traceparent"] = tp
        payload = json.dumps(payload_obj)
        client.publish(topic=topic, payload=payload)
-       log.debug("MQTT message dispatched", extra={"topic": topic, "traceparent": tp})
+       log.info(
+           "Switch bank control message published",
+           extra={"topic": topic, "payload": payload, "traceparent": tp},
+       )
    ```
+
+   The per-sample telemetry publish (`inverter/state`) stays at DEBUG with
+   `topic`, `message_bytes` and `traceparent`; its payload is the whole
+   inverter sample and it runs at poll cadence.
 
 8. **Tests** must assert on structured fields (`caplog.records` attributes) or
    static message text, never interpolated content.

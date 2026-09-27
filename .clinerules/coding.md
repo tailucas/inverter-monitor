@@ -53,7 +53,9 @@ One `AppThread` per concern, wired over ZMQ inproc (`URL_WORKER_APP`,
   caches forwarded weather samples (overcast rationing); subscribes to
   `{topic_prefix}/state/#`, applies the rationing checks (high load,
   overcast, surplus, battery SoC, grid fallback) and controls switch banks.
-  Every decision is also handed to the `SonoffController` thread
+  Every control publish to `{topic_prefix}/control/{bank}` logs at INFO
+  (`"Switch bank control message published"`) with its `topic` and
+  `payload`. Every decision is also handed to the `SonoffController` thread
   (`app/sonoff.py`), which issues the LAN-mode control messages for the
   configured Sonoff devices.
 - `LoadAlertMonitor`: consumes forwarded inverter samples; raises Telegram
@@ -93,7 +95,9 @@ Rules:
   `apikey` is a different credential, is never read, and would be rejected by
   the device with `error 400`. The controller verifies each key at start-up
   with a read-only `/zeroconf/info` probe: a device that answers
-  `error 400/401` logs an actionable WARNING, and failed control messages
+  `error 400/401` logs an actionable WARNING. Every issued control message
+  logs at INFO (`"Sonoff control message issued"`) with the device's HTTP
+  `response_status` and bounded `response_body`; failed control messages
   log a WARNING with the device's bounded `response_body` and the same
   `error_hint` before backing off per device (5 s doubling to a 60 s cap,
   one ERROR when the cap is reached, re-armed by a success).

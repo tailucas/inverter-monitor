@@ -478,24 +478,37 @@ class SonoffController(AppThread):
                 exc_info=not isinstance(e, RequestException),
             )
             return
-        self._record_success(command=command, reason=reason)
+        self._record_success(
+            command=command,
+            reason=reason,
+            response_status=response.status_code,
+            response_body=response_body,
+        )
 
-    def _record_success(self, command: SonoffCommand, reason: str) -> None:
+    def _record_success(
+        self,
+        command: SonoffCommand,
+        reason: str,
+        response_status: int | None = None,
+        response_body: str | None = None,
+    ) -> None:
         self._last_commanded[command.device_id] = command.state
         self._failed_state.pop(command.device_id, None)
         self._failures.pop(command.device_id, None)
         self._retry_at.pop(command.device_id, None)
         self._backoff_alerted.discard(command.device_id)
-        log.info(
-            "Sonoff control message issued",
-            extra={
-                "device_id": command.device_id,
-                "device_name": command.name,
-                "address": command.address,
-                "switch_state": command.state,
-                "reason": reason,
-            },
-        )
+        fields = {
+            "device_id": command.device_id,
+            "device_name": command.name,
+            "address": command.address,
+            "switch_state": command.state,
+            "reason": reason,
+        }
+        if response_status is not None:
+            fields["response_status"] = response_status
+        if response_body is not None:
+            fields["response_body"] = response_body
+        log.info("Sonoff control message issued", extra=fields)
 
     def _record_failure(
         self,

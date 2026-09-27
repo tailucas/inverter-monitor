@@ -318,6 +318,8 @@ class TestSonoffController:
         assert record.device_id == "shed1"
         assert record.switch_state == STATE_ON
         assert record.reason == "all_clear"
+        assert record.response_status == 200
+        assert record.response_body == '{"error": 0}'
 
     def test_shed_only_device_is_not_restored(
         self, monkeypatch: pytest.MonkeyPatch

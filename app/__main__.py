@@ -1334,10 +1334,14 @@ class MqttSubscriber(AppThread, Closable):
                     self._mqtt_client.publish(
                         topic=mqtt_pub_topic, payload=message_data
                     )
-                log.debug(
-                    "MQTT message dispatched",
+                log.info(
+                    "Switch bank control message published",
                     extra={
                         "topic": mqtt_pub_topic,
+                        "payload": message_data,
+                        "switch_bank": switch_bank,
+                        "switch_state": switch_state,
+                        "reason": reason,
                         "message_bytes": len(message_data),
                         "traceparent": tp,
                     },
