@@ -542,18 +542,21 @@ Current commands (registered as simple `CommandHandler`s in `app/bot.py`
   `<pre>` block), then the image follows as a photo with a plain-text
   caption. `StyleConfig` presets (the style parameter's domain: medium
   sentence, designed lighting, camera, lens, palette, any quoted rendered
-  text, and the image response format's aspect ratio and size) and
-  `LocationConfig` presets live in `app/image_prompts.py`; the location is
-  never user-selected — one of the outdoor settings (sky visible) is picked
-  at random and shown in the header/logs, and the style is the second
-  argument overriding the random pick. Arguments are resolved by the pure
-  `resolve_imagine_args`: one token is the material unless it names a
-  configured style, two tokens are material then style, a location name is
-  rejected as not-a-style, underscores join material words, and unusable
-  arguments come back as error codes the bot phrases (an unknown style
-  lists the options). A material from `DEFAULT_MATERIALS` is picked at
-  random whenever the user names none, so every picture keeps specific
-  physical makeup. Prompts always state that the subject is outdoors
+  text, and the image response format's aspect ratio and size) and the
+  `DEFAULT_LOCATIONS` outdoor settings (plain strings, sky visible) live in
+  `app/image_prompts.py`; the location is never user-selectable — one
+  outdoor setting is picked at random (not labelled in the header or logs),
+  and the style is the second argument overriding the random pick.
+  Arguments are resolved by the pure `resolve_imagine_args`: one token is
+  the material unless it names a configured style, two tokens are material
+  then style, a location-like token is just a material, underscores join
+  material words, and unusable arguments come back as error codes the bot
+  phrases (an unknown style lists the options). A material from
+  `DEFAULT_MATERIALS` is picked at random whenever the user names none, so
+  every picture keeps specific physical makeup, and the previous picture's
+  style, location and material are excluded from the next rotation so
+  consecutive pictures never repeat a choice. Prompts always state that the
+  subject is outdoors
   with the sky visible, name the time of day (`dawn`, `morning`, `midday`,
   `afternoon`, `dusk`, `evening` — derived from the weather sample's
   `sunrise_epoch`/`sunset_epoch`) and describe the wind

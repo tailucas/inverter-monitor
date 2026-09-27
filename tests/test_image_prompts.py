@@ -15,18 +15,15 @@ from app.image_prompts import (
     MAX_PROMPT_CHARS,
     MAX_PROMPT_TOKENS,
     TIME_OF_DAY_PHASES,
-    LocationConfig,
     StyleConfig,
     build_image_prompt,
     estimate_prompt_tokens,
     find_style,
     load_shed_state,
-    location_names,
     numeric_value,
     resolve_imagine_args,
     sanitize_material,
-    select_location,
-    select_material,
+    select_option,
     select_style,
     style_names,
     time_of_day_phase,
@@ -231,14 +228,15 @@ def test_prompt_includes_all_style_ingredients(style: StyleConfig) -> None:
         assert style.text in prompt
 
 
-@pytest.mark.parametrize("location", DEFAULT_LOCATIONS, ids=location_names())
-def test_prompt_includes_all_location_ingredients(
-    location: LocationConfig,
-) -> None:
-    """Every outdoor location contributes its setting and ambience."""
+@pytest.mark.parametrize(
+    "location",
+    DEFAULT_LOCATIONS,
+    ids=[f"setting_{index}" for index in range(len(DEFAULT_LOCATIONS))],
+)
+def test_prompt_includes_all_location_ingredients(location: str) -> None:
+    """Every outdoor setting contributes its scenery verbatim."""
     prompt = build_image_prompt(inverter=_healthy_inverter(), location=location)
-    assert location.setting in prompt
-    assert location.lighting in prompt
+    assert location in prompt
     assert "out in the open air beneath the open sky" in prompt.lower()
 
 
@@ -351,22 +349,53 @@ def test_find_style_unknown_returns_none() -> None:
     assert find_style(DEFAULT_STYLES, "moon_base") is None
 
 
-def test_select_style_and_location_are_deterministic() -> None:
-    """Random selection can be pinned by a seeded generator."""
+def test_select_style_is_deterministic() -> None:
+    """Random style selection can be pinned by a seeded generator."""
     assert select_style(DEFAULT_STYLES, random.Random(7)) == select_style(
         DEFAULT_STYLES, random.Random(7)
     )
-    assert select_location(DEFAULT_LOCATIONS, random.Random(7)) == (
-        select_location(DEFAULT_LOCATIONS, random.Random(7))
+
+
+def test_select_option_is_deterministic() -> None:
+    """Seeded draws from a string rotation can be pinned."""
+    assert select_option(DEFAULT_LOCATIONS, random.Random(7)) == select_option(
+        DEFAULT_LOCATIONS, random.Random(7)
+    )
+    assert select_option(DEFAULT_MATERIALS, random.Random(7)) == select_option(
+        DEFAULT_MATERIALS, random.Random(7)
     )
 
 
-def test_select_style_and_location_require_entries() -> None:
-    """Empty preset lists are a programming error."""
+def test_empty_rotations_are_a_programming_error() -> None:
+    """Empty rotations are a programming error."""
     with pytest.raises(ValueError):
         select_style(tuple())
     with pytest.raises(ValueError):
-        select_location(tuple())
+        select_option(tuple())
+
+
+def test_select_style_avoids_the_previous_choice() -> None:
+    """The style rotation never repeats the last style shown."""
+    rng = random.Random(5)
+    avoided = DEFAULT_STYLES[0].name
+    picks = {select_style(DEFAULT_STYLES, rng, avoid=avoided).name for _ in range(200)}
+    assert picks == {style.name for style in DEFAULT_STYLES} - {avoided}
+
+
+def test_select_option_avoids_the_previous_choice() -> None:
+    """A string rotation never repeats the last option shown."""
+    rng = random.Random(5)
+    avoided = DEFAULT_LOCATIONS[0]
+    picks = {select_option(DEFAULT_LOCATIONS, rng, avoid=avoided) for _ in range(200)}
+    assert picks == set(DEFAULT_LOCATIONS) - {avoided}
+
+
+def test_single_entry_rotation_returns_it_despite_an_avoid() -> None:
+    """A rotation holding only the avoided entry still returns that entry."""
+    style = select_style((DEFAULT_STYLES[0],), avoid=DEFAULT_STYLES[0].name)
+    assert style == DEFAULT_STYLES[0]
+    location = select_option((DEFAULT_LOCATIONS[0],), avoid=DEFAULT_LOCATIONS[0])
+    assert location == DEFAULT_LOCATIONS[0]
 
 
 def test_load_shed_state_prefers_switch_latches() -> None:
@@ -571,17 +600,14 @@ def test_default_materials_are_prompt_safe() -> None:
         assert sanitize_material(material) == material
 
 
-def test_select_material_is_deterministic() -> None:
-    """Random material selection can be pinned by a seeded generator."""
-    assert select_material(DEFAULT_MATERIALS, random.Random(7)) == select_material(
-        DEFAULT_MATERIALS, random.Random(7)
-    )
-
-
-def test_select_material_requires_an_option() -> None:
-    """An empty material rotation is a programming error."""
-    with pytest.raises(ValueError):
-        select_material(())
+def test_unknown_avoid_keeps_the_full_rotation() -> None:
+    """An avoid naming nothing leaves every entry in the draw."""
+    rng = random.Random(2)
+    picks = {
+        select_option(DEFAULT_MATERIALS, rng, avoid="nothing like this")
+        for _ in range(200)
+    }
+    assert picks == set(DEFAULT_MATERIALS)
 
 
 def test_prompt_weaves_the_default_material_into_the_subject() -> None:
@@ -600,6 +626,81 @@ def test_resolve_imagine_args_defaults_to_the_full_rotation() -> None:
     assert resolved.location in DEFAULT_LOCATIONS
     assert resolved.material in DEFAULT_MATERIALS
     assert resolved.error is None
+
+
+def test_resolve_imagine_args_avoids_the_previous_picks() -> None:
+    """No arguments rotate away from every previously shown choice."""
+    resolved = resolve_imagine_args(
+        None,
+        rng=random.Random(3),
+        avoid_style=DEFAULT_STYLES[0].name,
+        avoid_location=DEFAULT_LOCATIONS[0],
+        avoid_material=DEFAULT_MATERIALS[0],
+    )
+    assert resolved.style is not None
+    assert resolved.location is not None
+    assert resolved.style.name != DEFAULT_STYLES[0].name
+    assert resolved.location != DEFAULT_LOCATIONS[0]
+    assert resolved.material != DEFAULT_MATERIALS[0]
+    assert resolved.error is None
+
+
+def test_resolve_imagine_args_rotates_around_a_chosen_material() -> None:
+    """A named material wins the draw; style and location still vary."""
+    resolved = resolve_imagine_args(
+        ["copper"],
+        rng=random.Random(3),
+        avoid_style=DEFAULT_STYLES[0].name,
+        avoid_location=DEFAULT_LOCATIONS[0],
+        avoid_material=DEFAULT_MATERIALS[0],
+    )
+    assert resolved.material == "copper"
+    assert resolved.style is not None
+    assert resolved.location is not None
+    assert resolved.style.name != DEFAULT_STYLES[0].name
+    assert resolved.location != DEFAULT_LOCATIONS[0]
+
+
+def test_resolve_imagine_args_rotates_around_a_chosen_style() -> None:
+    """A named style wins the draw; material and location still vary."""
+    resolved = resolve_imagine_args(
+        ["claymation"],
+        rng=random.Random(8),
+        avoid_location=DEFAULT_LOCATIONS[1],
+        avoid_material=DEFAULT_MATERIALS[1],
+    )
+    assert resolved.style is not None
+    assert resolved.location is not None
+    assert resolved.style.name == "claymation"
+    assert resolved.location != DEFAULT_LOCATIONS[1]
+    assert resolved.material != DEFAULT_MATERIALS[1]
+
+
+def test_resolve_imagine_args_rotates_location_only_when_both_given() -> None:
+    """Named material and style still rotate the location."""
+    resolved = resolve_imagine_args(
+        ["copper", "cartoon"],
+        rng=random.Random(4),
+        avoid_location=DEFAULT_LOCATIONS[2],
+    )
+    assert resolved.material == "copper"
+    assert resolved.style is not None
+    assert resolved.location is not None
+    assert resolved.style.name == "cartoon"
+    assert resolved.location != DEFAULT_LOCATIONS[2]
+
+
+def test_unseeded_rotations_vary_between_calls() -> None:
+    """Unseeded calls draw fresh entropy, so the rotation actually rotates."""
+    triples: set[tuple[str, str, str | None]] = set()
+    for _ in range(30):
+        resolved = resolve_imagine_args(None)
+        style = resolved.style
+        location = resolved.location
+        assert style is not None
+        assert location is not None
+        triples.add((style.name, location, resolved.material))
+    assert len(triples) > 1
 
 
 def test_resolve_imagine_args_single_token_naming_a_style() -> None:
@@ -630,12 +731,13 @@ def test_resolve_imagine_args_material_then_style() -> None:
     assert resolved.error is None
 
 
-def test_resolve_imagine_args_rejects_a_location_token() -> None:
-    """The second parameter is a style; a location name is not accepted."""
+def test_resolve_imagine_args_treats_a_location_token_as_a_material() -> None:
+    """The location is never user-selectable: a location-like token is material."""
     resolved = resolve_imagine_args(["sunny_rooftop"])
-    assert resolved.style is None
-    assert resolved.location is None
-    assert resolved.error == "unknown_style"
+    assert resolved.style in DEFAULT_STYLES
+    assert resolved.location in DEFAULT_LOCATIONS
+    assert resolved.material == "sunny rooftop"
+    assert resolved.error is None
 
 
 @pytest.mark.parametrize(

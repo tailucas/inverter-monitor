@@ -151,11 +151,10 @@ def test_build_imagine_prompt_message_uses_telegram_html() -> None:
         "prompt",
         10,
         480,
-        location="sunny_rooftop",
         material="brushed_aluminium",
         time_of_day="dusk",
     )
-    assert "location: sunny_rooftop" in detailed
+    assert "location:" not in detailed
     assert "material: brushed_aluminium" in detailed
     assert "\u00b7 dusk \u00b7 9:16 \u00b7 ~10/480 tokens" in detailed
 

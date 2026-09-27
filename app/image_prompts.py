@@ -13,9 +13,9 @@ visible, an action and a face that reflect its health, the time of day and
 the wind taken from the weather sample, and an explicit load-shedding
 indicator. Styles, outdoor locations and subject materials are each picked
 at random from their rotations when the user does not choose one, and the
-composed prompt stays inside a self-imposed prompt budget that keeps the
-request cheap and on-target (the image models' own context windows are far
-larger).
+rotation never repeats the previous picture's pick; the composed prompt
+stays inside a self-imposed prompt budget that keeps the request cheap and
+on-target (the image models' own context windows are far larger).
 
 No I/O and no framework dependencies: the application threads gather the
 telemetry and hand it to these pure helpers, which are unit-tested in
@@ -112,66 +112,37 @@ def _truthy(value: Any) -> bool:
     return False
 
 
-# -- locations and styles ------------------------------------------------------
+# -- outdoor settings and styles ----------------------------------------------
 
 
-@dataclass(frozen=True)
-class LocationConfig:
-    """An outdoor location preset for the composed prompt.
-
-    Locations are never chosen by the user: every entry describes an outdoor
-    place where the sky is visible, and one is picked at random per image.
-    ``setting`` describes the place and ``lighting`` its phase-neutral
-    ambience (the time of day comes from the weather sample instead).
-    """
-
-    name: str
-    setting: str
-    lighting: str
-
-
-DEFAULT_LOCATIONS: tuple[LocationConfig, ...] = (
-    LocationConfig(
-        name="cosy_home_garage",
-        setting=(
-            "It stands on the paved apron of a cosy suburban home beside an "
-            "open garage door, with a wooden workbench and a pegboard of "
-            "hand tools visible inside."
-        ),
-        lighting="A gentle warm glow spills out from the open garage doorway.",
+# the subject sentence already places the inverter outdoors beneath the open
+# sky, so every setting below is a place where the sky stays visible; one is
+# picked at random per image and the location is never user-selectable
+DEFAULT_LOCATIONS: tuple[str, ...] = (
+    (
+        "It stands on the paved apron of a cosy suburban home beside an open "
+        "garage door, with a wooden workbench and a pegboard of hand tools "
+        "visible inside and a gentle warm glow spilling from the doorway."
     ),
-    LocationConfig(
-        name="sunny_rooftop",
-        setting=(
-            "It stands on a sunny rooftop terrace with potted succulents, a "
-            "water tank and the city skyline far below."
-        ),
-        lighting="Soft shadows stretch across the rooftop terrace.",
+    (
+        "It stands on a sunny rooftop terrace with potted succulents, a water "
+        "tank and the city skyline far below, with soft shadows stretching "
+        "across the terrace around it."
     ),
-    LocationConfig(
-        name="retro_control_room",
-        setting=(
-            "It stands on the flat roof of a vintage control building ringed "
-            "with dials, gauges and a softly humming console."
-        ),
-        lighting="A moody teal console glow mixes with one warm service lamp.",
+    (
+        "It stands on the flat roof of a vintage control building ringed with "
+        "dials, gauges and a softly humming console, lit by a moody teal "
+        "console glow mixed with one warm service lamp."
     ),
-    LocationConfig(
-        name="farmyard_shed",
-        setting=(
-            "It stands in an open farmyard beside a corrugated-iron shed, "
-            "with hay bales, a wheelbarrow and dust motes in the air."
-        ),
-        lighting="Soft even light rims the props without harsh shadows.",
+    (
+        "It stands in an open farmyard beside a corrugated-iron shed, with "
+        "hay bales, a wheelbarrow and dust motes in the air, rimmed by soft "
+        "even light without harsh shadows."
     ),
-    LocationConfig(
-        name="orbital_station",
-        setting=(
-            "It stands on the open observation deck of a small orbital "
-            "station behind a railing, with Earth hanging in the black sky "
-            "below."
-        ),
-        lighting="Cool blue starlight from the black sky meets a warm console strip.",
+    (
+        "It stands on the open observation deck of a small orbital station "
+        "behind a railing, with Earth hanging in the black sky below, where "
+        "cool blue starlight meets a warm console strip."
     ),
 )
 
@@ -400,42 +371,21 @@ def find_style(styles: Sequence[StyleConfig], name: str) -> StyleConfig | None:
 def select_style(
     styles: Sequence[StyleConfig] = DEFAULT_STYLES,
     rng: random.Random | None = None,
+    avoid: str | None = None,
 ) -> StyleConfig:
-    """Pick a random style configuration (deterministic with a seeded rng)."""
+    """Pick a random style configuration (deterministic with a seeded rng).
+
+    ``avoid`` names the style shown in the previous picture, so consecutive
+    rotations never repeat it; a rotation holding only that style still
+    returns it.
+    """
     if not styles:
         raise ValueError("at least one style configuration is required")
+    candidates = [style for style in styles if style.name != avoid]
+    if not candidates:
+        candidates = list(styles)
     chooser = rng if rng is not None else random.Random()
-    return chooser.choice(list(styles))
-
-
-def location_names(
-    locations: Sequence[LocationConfig] = DEFAULT_LOCATIONS,
-) -> list[str]:
-    """Return the configured location names in presentation order."""
-    return [location.name for location in locations]
-
-
-def find_location(
-    locations: Sequence[LocationConfig],
-    name: str,
-) -> LocationConfig | None:
-    """Find a location by name (case-insensitive), or None when unknown."""
-    wanted = name.strip().lower()
-    for location in locations:
-        if location.name.lower() == wanted:
-            return location
-    return None
-
-
-def select_location(
-    locations: Sequence[LocationConfig] = DEFAULT_LOCATIONS,
-    rng: random.Random | None = None,
-) -> LocationConfig:
-    """Pick a random outdoor location (deterministic with a seeded rng)."""
-    if not locations:
-        raise ValueError("at least one location configuration is required")
-    chooser = rng if rng is not None else random.Random()
-    return chooser.choice(list(locations))
+    return chooser.choice(candidates)
 
 
 # -- /imagine arguments --------------------------------------------------------
@@ -457,15 +407,24 @@ DEFAULT_MATERIALS: tuple[str, ...] = (
 )
 
 
-def select_material(
-    materials: Sequence[str] = DEFAULT_MATERIALS,
+def select_option(
+    options: Sequence[str],
     rng: random.Random | None = None,
+    avoid: str | None = None,
 ) -> str:
-    """Pick a random default material (deterministic with a seeded rng)."""
-    if not materials:
-        raise ValueError("at least one default material is required")
+    """Pick a random option from a string rotation.
+
+    Deterministic with a seeded rng. ``avoid`` names the option shown in the
+    previous picture, so consecutive rotations never repeat it; a rotation
+    holding only that option still returns it.
+    """
+    if not options:
+        raise ValueError("at least one option is required")
+    candidates = [option for option in options if option != avoid]
+    if not candidates:
+        candidates = list(options)
     chooser = rng if rng is not None else random.Random()
-    return chooser.choice(list(materials))
+    return chooser.choice(candidates)
 
 
 def sanitize_material(text: str | None) -> str | None:
@@ -487,10 +446,10 @@ def sanitize_material(text: str | None) -> str | None:
 
 @dataclass(frozen=True)
 class ImagineArgs:
-    """Resolved /imagine arguments: style, location, material or an error."""
+    """Resolved /imagine arguments: style, outdoor setting, material or error."""
 
     style: StyleConfig | None = None
-    location: LocationConfig | None = None
+    location: str | None = None
     material: str | None = None
     error: str | None = None
 
@@ -498,26 +457,32 @@ class ImagineArgs:
 def resolve_imagine_args(
     args: Sequence[str] | None,
     styles: Sequence[StyleConfig] = DEFAULT_STYLES,
-    locations: Sequence[LocationConfig] = DEFAULT_LOCATIONS,
+    locations: Sequence[str] = DEFAULT_LOCATIONS,
     materials: Sequence[str] = DEFAULT_MATERIALS,
     rng: random.Random | None = None,
+    avoid_style: str | None = None,
+    avoid_location: str | None = None,
+    avoid_material: str | None = None,
 ) -> ImagineArgs:
     """Resolve the optional /imagine arguments into style and material.
 
     One token names a style when it matches a configured style, and is
     treated as the material otherwise; with two tokens the first is the
     material and the second must name a style. The location is never chosen
-    by the user: one of the outdoor locations is picked at random, and one
-    of the default materials is picked at random whenever the user does not
-    name a material. Materials join words with underscores. Unusable
-    arguments come back as error codes for the bot to phrase.
+    by the user: the outdoor setting is picked at random, and one of the
+    default materials is picked at random whenever the user does not name
+    one, so a location-like token simply becomes the material. The
+    ``avoid_*`` parameters name the choices shown in the previous picture,
+    so no randomised rotation repeats them. Materials join words with
+    underscores. Unusable arguments come back as error codes for the bot to
+    phrase.
     """
     tokens = [token for token in (args or []) if token.strip()]
     if not tokens:
         return ImagineArgs(
-            style=select_style(styles, rng),
-            location=select_location(locations, rng),
-            material=select_material(materials, rng),
+            style=select_style(styles, rng, avoid=avoid_style),
+            location=select_option(locations, rng, avoid=avoid_location),
+            material=select_option(materials, rng, avoid=avoid_material),
         )
     if len(tokens) > 2:
         return ImagineArgs(error="too_many_args")
@@ -530,25 +495,22 @@ def resolve_imagine_args(
             return ImagineArgs(error="invalid_material")
         return ImagineArgs(
             style=style,
-            location=select_location(locations, rng),
+            location=select_option(locations, rng, avoid=avoid_location),
             material=material,
         )
     style = find_style(styles, tokens[0])
     if style is not None:
         return ImagineArgs(
             style=style,
-            location=select_location(locations, rng),
-            material=select_material(materials, rng),
+            location=select_option(locations, rng, avoid=avoid_location),
+            material=select_option(materials, rng, avoid=avoid_material),
         )
-    if find_location(locations, tokens[0]) is not None:
-        # the location stays outdoors and is never user-selected
-        return ImagineArgs(error="unknown_style")
     material = sanitize_material(tokens[0])
     if material is None:
         return ImagineArgs(error="invalid_material")
     return ImagineArgs(
-        style=select_style(styles, rng),
-        location=select_location(locations, rng),
+        style=select_style(styles, rng, avoid=avoid_style),
+        location=select_option(locations, rng, avoid=avoid_location),
         material=material,
     )
 
@@ -989,7 +951,7 @@ def build_image_prompt(
     weather: Mapping[str, Any] | None = None,
     switches: Mapping[str, Any] | None = None,
     style: StyleConfig = DEFAULT_STYLES[0],
-    location: LocationConfig = DEFAULT_LOCATIONS[0],
+    location: str = DEFAULT_LOCATIONS[0],
     load_warning_w: float = DEFAULT_LOAD_WARNING_W,
     load_shed_w: float | None = None,
     material: str | None = None,
@@ -1002,7 +964,7 @@ def build_image_prompt(
     mandatory = [
         _subject_sentence(material, _action_sentence(health)),
         _composition_sentence(style.aspect_ratio),
-        location.setting,
+        location,
         _time_sentence(phase),
         _sky_sentence(weather, phase),
         wind_sentence(weather),
@@ -1012,7 +974,6 @@ def build_image_prompt(
         _shed_sentence(load_shed_state(inverter, switches, load_warning_w, shed_w)),
         style.style,
         style.text,
-        location.lighting,
         style.lighting,
         style.camera,
     ]
@@ -1030,10 +991,9 @@ def estimate_prompt_tokens(prompt: str) -> int:
 
 @dataclass(frozen=True)
 class ImaginePrompt:
-    """A composed prompt plus the caption, style and location behind it."""
+    """A composed prompt plus the caption and style behind it."""
 
     prompt: str
     caption: str
     style: StyleConfig
-    location: LocationConfig
     time_of_day: str | None = None

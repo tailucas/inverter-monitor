@@ -11,7 +11,7 @@ retried once before the failure is reported.
 
 No Telegram imports and no asyncio: the bot thread calls these blocking
 helpers through an executor, and the image response format is taken from the
-selected scene configuration. Unit-tested in ``tests/test_gemini_image.py``.
+selected style configuration. Unit-tested in ``tests/test_gemini_image.py``.
 """
 
 import base64

@@ -41,7 +41,6 @@ from app.image_prompts import (
     DEFAULT_STYLES,
     MAX_PROMPT_TOKENS,
     ImaginePrompt,
-    LocationConfig,
     StyleConfig,
     build_image_prompt,
     estimate_prompt_tokens,
@@ -506,7 +505,13 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
             return ConversationHandler.END
 
-        resolved = resolve_imagine_args(context.args)
+        last_choices = bot.imagine_last_choices
+        resolved = resolve_imagine_args(
+            context.args,
+            avoid_style=last_choices["style"],
+            avoid_location=last_choices["location"],
+            avoid_material=last_choices["material"],
+        )
         if (
             resolved.error is not None
             or resolved.style is None
@@ -534,6 +539,13 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             return ConversationHandler.END
         style = resolved.style
         location = resolved.location
+        # the prompt header shows these choices even if the render fails, so
+        # record them synchronously and keep the next rotation varied
+        bot.remember_imagine_choices(
+            style=style.name,
+            location=location,
+            material=resolved.material,
+        )
 
         loop = asyncio.get_running_loop()
         request = await loop.run_in_executor(
@@ -547,7 +559,6 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 request.prompt,
                 prompt_tokens,
                 MAX_PROMPT_TOKENS,
-                location=location.name,
                 material=resolved.material,
                 time_of_day=request.time_of_day,
             ),
@@ -568,7 +579,6 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             extra={
                 "user_id": user.id,
                 "style": style.name,
-                "location": location.name,
                 "material": resolved.material,
                 "time_of_day": request.time_of_day,
                 "model": bot._image_client.model,
@@ -729,6 +739,13 @@ class TelegramBot(AppThread, Closable):
                 exc_info=True,
             )
         self._inverter_query = inverter_query
+        # the choices shown in the last picture, so the next /imagine
+        # rotation cannot repeat them
+        self._imagine_last_choices: dict[str, str | None] = {
+            "style": None,
+            "location": None,
+            "material": None,
+        }
         self._receiver_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._application: Application | None = None
@@ -949,10 +966,23 @@ class TelegramBot(AppThread, Closable):
 
     # -- /imagine helpers ------------------------------------------------------
 
+    @property
+    def imagine_last_choices(self) -> dict[str, str | None]:
+        """The style, location and material shown in the last picture."""
+        return dict(self._imagine_last_choices)
+
+    def remember_imagine_choices(
+        self, *, style: str, location: str, material: str | None
+    ) -> None:
+        """Record the choices shown to the user for the next rotation."""
+        self._imagine_last_choices["style"] = style
+        self._imagine_last_choices["location"] = location
+        self._imagine_last_choices["material"] = material
+
     def build_imagine(
         self,
         style: StyleConfig,
-        location: LocationConfig,
+        location: str,
         material: str | None = None,
         now: float | None = None,
     ) -> ImaginePrompt:
@@ -989,7 +1019,6 @@ class TelegramBot(AppThread, Closable):
             "Composed image prompt",
             extra={
                 "style": style.name,
-                "location": location.name,
                 "material": material,
                 "time_of_day": phase,
                 "prompt": prompt,
@@ -1001,7 +1030,6 @@ class TelegramBot(AppThread, Closable):
             prompt=prompt,
             caption=caption,
             style=style,
-            location=location,
             time_of_day=phase,
         )
 

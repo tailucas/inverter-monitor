@@ -1,13 +1,18 @@
 #!/usr/bin/env python
 """Unit tests for the /imagine wiring on TelegramBot (no network access)."""
 
+import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from telegram.ext import ConversationHandler
 
+import app.bot as bot_module
 from app.bot import TelegramBot
 from app.image_prompts import DEFAULT_LOCATIONS, DEFAULT_STYLES, ImaginePrompt
 from app.telegram_bot import BmsSummaryBuffer, SwitchStatsBuffer, WeatherBuffer
+from tests.test_bot_helpers import FakeConfig
 
 # a fixed 12-hour day for deterministic time-of-day checks
 _SUNRISE = 1_000_000.0
@@ -21,6 +26,8 @@ def _sun_times(**extra: Any) -> dict:
 
 class _RecordingImageClient:
     """Image client stub that records the requests it receives."""
+
+    model = "test-model"
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str]] = []
@@ -48,6 +55,7 @@ def _bot_stub(
     bot._switch_stats = SwitchStatsBuffer()
     bot._load_warning_w = 7000
     bot._load_shed_w = 7000
+    bot._imagine_last_choices = {"style": None, "location": None, "material": None}
     return bot
 
 
@@ -71,7 +79,7 @@ def test_build_imagine_uses_live_telemetry_and_buffers() -> None:
     assert "the sky is completely overcast" in request.prompt
     assert "load shedding active" in request.caption
     assert request.style == DEFAULT_STYLES[0]
-    assert request.location == DEFAULT_LOCATIONS[0]
+    assert DEFAULT_LOCATIONS[0] in request.prompt
 
 
 def test_build_imagine_survives_query_failure() -> None:
@@ -94,7 +102,6 @@ def test_render_imagine_uses_style_image_format() -> None:
         prompt="a prompt",
         caption="a caption",
         style=style,
-        location=DEFAULT_LOCATIONS[-1],
     )
     assert bot.render_imagine(request) == b"image-bytes"
     assert client.calls == [("a prompt", style.aspect_ratio, style.image_size)]
@@ -107,7 +114,6 @@ def test_render_imagine_requires_a_client() -> None:
         prompt="p",
         caption="c",
         style=DEFAULT_STYLES[0],
-        location=DEFAULT_LOCATIONS[0],
     )
     with pytest.raises(RuntimeError, match="not configured"):
         bot.render_imagine(request)
@@ -126,3 +132,95 @@ def test_build_imagine_threads_material_and_time_of_day() -> None:
     assert "made of reclaimed oak" in request.prompt
     assert "light southerly breeze" in request.prompt
     assert request.time_of_day == "dawn"
+
+
+class _FakeMessage:
+    """Message stand-in recording the replies the handler sends."""
+
+    def __init__(self, chat_id: int) -> None:
+        self.chat_id = chat_id
+        self.texts: list[str] = []
+        self.photos: list[bytes] = []
+
+    async def reply_text(self, text: str, **kwargs: Any) -> None:
+        self.texts.append(text)
+
+    async def reply_html(self, text: str, **kwargs: Any) -> None:
+        self.texts.append(text)
+
+    async def reply_photo(self, photo: bytes, caption: str) -> None:
+        self.photos.append(photo)
+
+
+class _FakeCallbackBot:
+    """Bot stand-in for the chat actions the handler sends."""
+
+    async def send_chat_action(self, chat_id: int, action: Any) -> None:
+        return None
+
+
+def _fake_imagine_call(
+    bot: TelegramBot, args: list[str] | None
+) -> tuple[Any, Any, _FakeMessage]:
+    """Minimal Update/Context stand-ins for the /imagine handler."""
+    message = _FakeMessage(chat_id=42)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(
+            id=111, is_bot=False, first_name="Tai", language_code="en"
+        ),
+        effective_chat=SimpleNamespace(id=42, type="private", title=None),
+        effective_message=message,
+    )
+    context = SimpleNamespace(
+        args=args or [],
+        bot=_FakeCallbackBot(),
+        application=SimpleNamespace(bot_data={"telegram_bot": bot}),
+    )
+    return update, context, message
+
+
+def test_imagine_choices_are_remembered_as_a_copy() -> None:
+    """The last choices round-trip and callers cannot mutate the record."""
+    bot = _bot_stub()
+    bot.remember_imagine_choices(
+        style="cartoon", location="farmyard_shed", material="copper"
+    )
+    choices = bot.imagine_last_choices
+    assert choices == {
+        "style": "cartoon",
+        "location": "farmyard_shed",
+        "material": "copper",
+    }
+    choices["style"] = "mutated"
+    assert bot.imagine_last_choices["style"] == "cartoon"
+
+
+def test_imagine_handler_rotates_away_from_the_previous_picture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consecutive /imagine calls never repeat the last shown choices."""
+    monkeypatch.setattr(bot_module, "app_config", FakeConfig())
+    bot = _bot_stub(image_client=_RecordingImageClient())
+
+    update, context, message = _fake_imagine_call(bot, None)
+    assert asyncio.run(bot_module.imagine(update, context)) == ConversationHandler.END
+    assert message.photos
+    first = bot.imagine_last_choices
+    assert first["style"] is not None
+    assert first["location"] is not None
+    assert first["material"] is not None
+
+    update, context, _ = _fake_imagine_call(bot, None)
+    asyncio.run(bot_module.imagine(update, context))
+    second = bot.imagine_last_choices
+    assert second["style"] != first["style"]
+    assert second["location"] != first["location"]
+    assert second["material"] != first["material"]
+
+    # a named material wins the draw, but the other rotations still vary
+    update, context, _ = _fake_imagine_call(bot, ["copper"])
+    asyncio.run(bot_module.imagine(update, context))
+    third = bot.imagine_last_choices
+    assert third["material"] == "copper"
+    assert third["style"] != second["style"]
+    assert third["location"] != second["location"]

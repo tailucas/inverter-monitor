@@ -479,7 +479,6 @@ def build_imagine_prompt_message(
     prompt: str,
     prompt_tokens: int,
     max_prompt_tokens: int,
-    location: str | None = None,
     material: str | None = None,
     time_of_day: str | None = None,
 ) -> str:
@@ -491,8 +490,6 @@ def build_imagine_prompt_message(
     render correctly).
     """
     details = [html.escape(style_name)]
-    if location:
-        details.append(f"location: {html.escape(location)}")
     if material:
         details.append(f"material: {html.escape(material)}")
     if time_of_day:
