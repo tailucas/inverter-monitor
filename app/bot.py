@@ -180,7 +180,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"/history [hours] -- power time-series chart\n"
                 f"/battery [hours] -- battery time-series chart\n"
                 f"/cell [hours] -- per-cell voltages and balancing advice\n"
-                f"/imagine [scene] -- picture of the inverter in its mood\n"
+                f"/imagine [material] [style] -- a picture of the inverter\n"
                 f"/help -- this message"
             ),
             disable_web_page_preview=True,
@@ -521,19 +521,21 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             if resolved.error == "too_many_args":
                 message = (
                     f"{emoji.emojize(':warning:')} Too many arguments. Use "
-                    f"/imagine [material] [style] -- styles: {available}. "
-                    f"Join material words with underscores."
+                    f"/imagine [material] [style] -- built-in styles: "
+                    f"{available}. Both arguments are snake_case; join "
+                    f"words with underscores."
                 )
-            elif resolved.error == "invalid_material":
+            elif resolved.error == "invalid_style":
                 message = (
-                    f"{emoji.emojize(':warning:')} Material must be a short "
-                    f"phrase of words or numbers joined by underscores. "
-                    f"Styles: {available}."
+                    f"{emoji.emojize(':warning:')} Style must be a snake_case "
+                    f"slug or a built-in style: {available}. Any other slug "
+                    f"is passed through as a custom style."
                 )
             else:
                 message = (
-                    f"{emoji.emojize(':warning:')} Unknown style. Available "
-                    f"styles: {available}. The location is always outdoors."
+                    f"{emoji.emojize(':warning:')} Material must be a "
+                    f"snake_case phrase of words or numbers joined by "
+                    f"underscores. Built-in styles: {available}."
                 )
             await update.effective_message.reply_text(text=message)
             return ConversationHandler.END
@@ -579,6 +581,7 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             extra={
                 "user_id": user.id,
                 "style": style.name,
+                "custom_style": style.name not in style_names(DEFAULT_STYLES),
                 "material": resolved.material,
                 "time_of_day": request.time_of_day,
                 "model": bot._image_client.model,

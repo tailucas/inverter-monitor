@@ -10,7 +10,13 @@ from telegram.ext import ConversationHandler
 
 import app.bot as bot_module
 from app.bot import TelegramBot
-from app.image_prompts import DEFAULT_LOCATIONS, DEFAULT_STYLES, ImaginePrompt
+from app.image_prompts import (
+    DEFAULT_ASPECT_RATIO,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_LOCATIONS,
+    DEFAULT_STYLES,
+    ImaginePrompt,
+)
 from app.telegram_bot import BmsSummaryBuffer, SwitchStatsBuffer, WeatherBuffer
 from tests.test_bot_helpers import FakeConfig
 
@@ -224,3 +230,26 @@ def test_imagine_handler_rotates_away_from_the_previous_picture(
     assert third["material"] == "copper"
     assert third["style"] != second["style"]
     assert third["location"] != second["location"]
+
+
+def test_imagine_handler_passes_a_custom_style_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A custom style slug reaches the prompt with the default API format."""
+    monkeypatch.setattr(bot_module, "app_config", FakeConfig())
+    client = _RecordingImageClient()
+    bot = _bot_stub(image_client=client)
+
+    update, context, message = _fake_imagine_call(bot, ["copper", "cyberpunk_neon"])
+    asyncio.run(bot_module.imagine(update, context))
+
+    assert message.photos
+    choices = bot.imagine_last_choices
+    assert choices["style"] == "cyberpunk_neon"
+    assert choices["material"] == "copper"
+    assert "cyberpunk_neon" in message.texts[0]
+    prompt, aspect_ratio, image_size = client.calls[0]
+    assert "rendered in a cyberpunk neon style" in prompt
+    assert "made of copper" in prompt
+    assert aspect_ratio == DEFAULT_ASPECT_RATIO
+    assert image_size == DEFAULT_IMAGE_SIZE

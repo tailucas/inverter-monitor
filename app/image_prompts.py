@@ -67,8 +67,8 @@ WIND_STEADY_MS = 8.0
 WIND_FRESH_MS = 13.9
 # a gust this much stronger than the mean speed is worth describing
 WIND_GUST_GAP_MS = 3.0
-# user-supplied materials stay short so they cannot blow the prompt budget
-MAX_MATERIAL_CHARS = 40
+# user-supplied arguments stay short so they cannot blow the prompt budget
+MAX_ARG_CHARS = 40
 
 
 def _subject_sentence(material: str | None, action: str) -> str:
@@ -152,16 +152,17 @@ class StyleConfig:
     """A rendering style preset: the /imagine style parameter's domain.
 
     ``style`` is the narrative medium sentence; camera, lens, palette and
-    the designed ``lighting`` complete the look, ``text`` carries any quoted
-    typography the guide's text-rendering rules ask for, and
+    the designed ``lighting`` complete the look (all optional, so a custom
+    user-supplied style carries only its sentence), ``text`` carries any
+    quoted typography the guide's text-rendering rules ask for, and
     ``aspect_ratio``/``image_size`` are forwarded to the API as the image
     response format. Locations always stay outdoors.
     """
 
     name: str
     style: str
-    camera: str
-    lens: str
+    camera: str | None = None
+    lens: str | None = None
     palette: str | None = None
     lighting: str | None = None
     text: str | None = None
@@ -388,9 +389,22 @@ def select_style(
     return chooser.choice(candidates)
 
 
+def custom_style(name: str) -> StyleConfig:
+    """Build a custom style configuration from a validated slug.
+
+    The slug's words become the style sentence, and the camera, lens,
+    palette and lighting stay unset so the prompt carries no preset framing;
+    the image response format falls back to the module defaults.
+    """
+    return StyleConfig(
+        name=name,
+        style=f"The picture is rendered in a {slug_words(name)} style.",
+    )
+
+
 # -- /imagine arguments --------------------------------------------------------
 
-_MATERIAL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 '\-]*")
+_ARG_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
 
 # default subjects: the guide's materiality rule asks for specific physical
 # makeup ("navy blue tweed", not "suit jacket"), so the rotation names the
@@ -427,21 +441,28 @@ def select_option(
     return chooser.choice(candidates)
 
 
-def sanitize_material(text: str | None) -> str | None:
-    """Normalise a user-supplied material into a short prompt-safe phrase.
+def sanitize_slug(text: str | None) -> str | None:
+    """Normalise a user-supplied argument into a snake_case slug.
 
-    Underscores join words (Telegram splits arguments on whitespace), runs of
-    whitespace collapse, and anything longer than ``MAX_MATERIAL_CHARS`` or
-    carrying other punctuation is rejected so the prompt budget stays safe.
+    Telegram splits arguments on whitespace, so underscores join words; a
+    slug is lowercase letters and numbers joined by single underscores, and
+    anything longer than ``MAX_ARG_CHARS`` or carrying other characters is
+    rejected so the prompt budget stays safe. Returns None when the text is
+    not a usable slug.
     """
     if not text:
         return None
-    cleaned = " ".join(text.replace("_", " ").split())
-    if not cleaned or len(cleaned) > MAX_MATERIAL_CHARS:
+    slug = text.strip()
+    if not slug or len(slug) > MAX_ARG_CHARS:
         return None
-    if _MATERIAL_PATTERN.fullmatch(cleaned) is None:
+    if _ARG_PATTERN.fullmatch(slug) is None:
         return None
-    return cleaned
+    return slug
+
+
+def slug_words(slug: str) -> str:
+    """Turn a validated slug back into words for the composed prompt."""
+    return slug.replace("_", " ")
 
 
 @dataclass(frozen=True)
@@ -466,16 +487,16 @@ def resolve_imagine_args(
 ) -> ImagineArgs:
     """Resolve the optional /imagine arguments into style and material.
 
-    One token names a style when it matches a configured style, and is
-    treated as the material otherwise; with two tokens the first is the
-    material and the second must name a style. The location is never chosen
+    Both optional arguments are strict snake_case and joined with
+    underscores. One token names a built-in style when it matches one, and
+    is treated as the material otherwise; with two tokens the first is the
+    material and the second is a built-in style name or any other slug,
+    which is passed through as a custom style. The location is never chosen
     by the user: the outdoor setting is picked at random, and one of the
     default materials is picked at random whenever the user does not name
-    one, so a location-like token simply becomes the material. The
-    ``avoid_*`` parameters name the choices shown in the previous picture,
-    so no randomised rotation repeats them. Materials join words with
-    underscores. Unusable arguments come back as error codes for the bot to
-    phrase.
+    one. The ``avoid_*`` parameters name the choices shown in the previous
+    picture, so no randomised rotation repeats them. Unusable arguments come
+    back as error codes for the bot to phrase.
     """
     tokens = [token for token in (args or []) if token.strip()]
     if not tokens:
@@ -487,31 +508,31 @@ def resolve_imagine_args(
     if len(tokens) > 2:
         return ImagineArgs(error="too_many_args")
     if len(tokens) == 2:
-        style = find_style(styles, tokens[1])
-        if style is None:
-            return ImagineArgs(error="unknown_style")
-        material = sanitize_material(tokens[0])
-        if material is None:
+        style_slug = sanitize_slug(tokens[1])
+        if style_slug is None:
+            return ImagineArgs(error="invalid_style")
+        material_slug = sanitize_slug(tokens[0])
+        if material_slug is None:
             return ImagineArgs(error="invalid_material")
         return ImagineArgs(
-            style=style,
+            style=find_style(styles, style_slug) or custom_style(style_slug),
             location=select_option(locations, rng, avoid=avoid_location),
-            material=material,
+            material=slug_words(material_slug),
         )
-    style = find_style(styles, tokens[0])
+    slug = sanitize_slug(tokens[0])
+    if slug is None:
+        return ImagineArgs(error="invalid_material")
+    style = find_style(styles, slug)
     if style is not None:
         return ImagineArgs(
             style=style,
             location=select_option(locations, rng, avoid=avoid_location),
             material=select_option(materials, rng, avoid=avoid_material),
         )
-    material = sanitize_material(tokens[0])
-    if material is None:
-        return ImagineArgs(error="invalid_material")
     return ImagineArgs(
         style=select_style(styles, rng, avoid=avoid_style),
         location=select_option(locations, rng, avoid=avoid_location),
-        material=material,
+        material=slug_words(slug),
     )
 
 

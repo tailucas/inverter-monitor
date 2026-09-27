@@ -11,18 +11,19 @@ from app.image_prompts import (
     DEFAULT_LOCATIONS,
     DEFAULT_MATERIALS,
     DEFAULT_STYLES,
-    MAX_MATERIAL_CHARS,
+    MAX_ARG_CHARS,
     MAX_PROMPT_CHARS,
     MAX_PROMPT_TOKENS,
     TIME_OF_DAY_PHASES,
     StyleConfig,
     build_image_prompt,
+    custom_style,
     estimate_prompt_tokens,
     find_style,
     load_shed_state,
     numeric_value,
     resolve_imagine_args,
-    sanitize_material,
+    sanitize_slug,
     select_option,
     select_style,
     style_names,
@@ -220,8 +221,8 @@ def test_prompt_includes_all_style_ingredients(style: StyleConfig) -> None:
     """Style, camera, lens and palette are woven in for every style."""
     prompt = build_image_prompt(inverter=_healthy_inverter(), style=style)
     assert style.style in prompt
-    assert style.camera in prompt
-    assert style.lens in prompt
+    assert style.camera is not None and style.camera in prompt
+    assert style.lens is not None and style.lens in prompt
     assert style.palette is not None and style.palette in prompt
     assert style.lighting is not None and style.lighting in prompt
     if style.text is not None:
@@ -579,25 +580,32 @@ def test_wind_sentence_requires_a_speed() -> None:
         (None, None),
         ("", None),
         ("   ", None),
-        ("brushed_aluminium", "brushed aluminium"),
-        ("  Brushed   Aluminium ", "Brushed Aluminium"),
-        ("7-gauge_steel", "7-gauge steel"),
+        ("copper", "copper"),
+        ("brushed_aluminium", "brushed_aluminium"),
+        ("7_gauge_steel", "7_gauge_steel"),
+        ("  copper  ", "copper"),
+        ("Brushed Aluminium", None),
+        ("COPPER", None),
+        ("brushed-aluminium", None),
         ("copper!", None),
-        ("x" * (MAX_MATERIAL_CHARS + 1), None),
-        ("x" * MAX_MATERIAL_CHARS, "x" * MAX_MATERIAL_CHARS),
+        ("double__underscore", None),
+        ("_leading", None),
+        ("trailing_", None),
+        ("x" * (MAX_ARG_CHARS + 1), None),
+        ("x" * MAX_ARG_CHARS, "x" * MAX_ARG_CHARS),
     ],
 )
-def test_sanitize_material(text: str | None, expected: str | None) -> None:
-    """Only short, plain material phrases survive sanitisation."""
-    assert sanitize_material(text) == expected
+def test_sanitize_slug(text: str | None, expected: str | None) -> None:
+    """Only short snake_case slugs survive sanitisation."""
+    assert sanitize_slug(text) == expected
 
 
 def test_default_materials_are_prompt_safe() -> None:
-    """Every default material survives sanitisation unchanged."""
+    """Every default material is a short lowercase prompt phrase."""
     assert DEFAULT_MATERIALS
     for material in DEFAULT_MATERIALS:
-        assert len(material) <= MAX_MATERIAL_CHARS
-        assert sanitize_material(material) == material
+        assert 0 < len(material) <= MAX_ARG_CHARS
+        assert material == material.lower()
 
 
 def test_unknown_avoid_keeps_the_full_rotation() -> None:
@@ -705,7 +713,7 @@ def test_unseeded_rotations_vary_between_calls() -> None:
 
 def test_resolve_imagine_args_single_token_naming_a_style() -> None:
     """A lone style name overrides the random style."""
-    resolved = resolve_imagine_args([" HYPERREALISTIC "])
+    resolved = resolve_imagine_args(["hyperrealistic"])
     assert resolved.style is not None
     assert resolved.style.name == "hyperrealistic"
     assert resolved.location in DEFAULT_LOCATIONS
@@ -731,6 +739,39 @@ def test_resolve_imagine_args_material_then_style() -> None:
     assert resolved.error is None
 
 
+def test_resolve_imagine_args_custom_style() -> None:
+    """An unknown snake_case style is passed through as a custom style."""
+    resolved = resolve_imagine_args(["copper", "cyberpunk_neon"])
+    assert resolved.style is not None
+    assert resolved.style.name == "cyberpunk_neon"
+    assert "cyberpunk neon" in resolved.style.style
+    assert resolved.style.camera is None
+    assert resolved.style.lens is None
+    assert resolved.style.aspect_ratio == DEFAULT_ASPECT_RATIO
+    assert resolved.style.image_size == DEFAULT_IMAGE_SIZE
+    assert resolved.material == "copper"
+    assert resolved.error is None
+
+
+def test_resolve_imagine_args_builtin_style_keeps_its_format() -> None:
+    """A built-in style still carries its preset response format."""
+    resolved = resolve_imagine_args(["copper", "cinematic_noir"])
+    assert resolved.style is not None
+    assert resolved.style.name == "cinematic_noir"
+    assert resolved.style.aspect_ratio == "21:9"
+    assert resolved.material == "copper"
+    assert resolved.error is None
+
+
+def test_custom_style_contributes_only_its_sentence() -> None:
+    """A custom style reaches the prompt without preset framing."""
+    style = custom_style("cyberpunk_neon")
+    prompt = build_image_prompt(inverter=_healthy_inverter(), style=style)
+    assert "rendered in a cyberpunk neon style" in prompt
+    assert style.aspect_ratio == DEFAULT_ASPECT_RATIO
+    assert style.image_size == DEFAULT_IMAGE_SIZE
+
+
 def test_resolve_imagine_args_treats_a_location_token_as_a_material() -> None:
     """The location is never user-selectable: a location-like token is material."""
     resolved = resolve_imagine_args(["sunny_rooftop"])
@@ -743,7 +784,7 @@ def test_resolve_imagine_args_treats_a_location_token_as_a_material() -> None:
 @pytest.mark.parametrize(
     ("args", "error"),
     [
-        (["copper", "moon_base"], "unknown_style"),
+        (["copper", "Style_With_Spaces!"], "invalid_style"),
         (["copper!", "cartoon"], "invalid_material"),
         (["copper", "cartoon", "extra"], "too_many_args"),
         (["~~"], "invalid_material"),

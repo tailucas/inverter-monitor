@@ -547,11 +547,16 @@ Current commands (registered as simple `CommandHandler`s in `app/bot.py`
   `app/image_prompts.py`; the location is never user-selectable — one
   outdoor setting is picked at random (not labelled in the header or logs),
   and the style is the second argument overriding the random pick.
-  Arguments are resolved by the pure `resolve_imagine_args`: one token is
-  the material unless it names a configured style, two tokens are material
-  then style, a location-like token is just a material, underscores join
-  material words, and unusable arguments come back as error codes the bot
-  phrases (an unknown style lists the options). A material from
+  Arguments are resolved by the pure `resolve_imagine_args`: both optional
+  arguments are strict lowercase snake_case (Telegram splits on whitespace,
+  so underscores join words); one token is the material unless it names a
+  built-in style, two tokens are material then style, and the second token
+  may be any other slug, which becomes a custom style whose words are
+  passed to the image model with the default 4:5/1K response format
+  (built-ins keep their own format). A location-like token is just a
+  material, and unusable arguments come back as error codes the bot
+  phrases (`too_many_args`, `invalid_material`, `invalid_style`). A
+  material from
   `DEFAULT_MATERIALS` is picked at random whenever the user names none, so
   every picture keeps specific physical makeup, and the previous picture's
   style, location and material are excluded from the next rotation so
