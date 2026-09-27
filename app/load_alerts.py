@@ -9,6 +9,13 @@ per inverter sample by the application threads and are fully unit-tested in
 from collections import deque
 from dataclasses import dataclass
 
+# manual switch-bank commands issued from the Telegram bot
+SWITCH_COMMAND_START_LOAD_SHED = "start_load_shed"
+SWITCH_COMMAND_END_LOAD_SHED = "end_load_shed"
+# switch-bank reasons reported for the manual commands
+REASON_MANUAL_LOAD_SHED = "manual_load_shed"
+REASON_MANUAL_RESTORE = "manual_restore"
+
 
 class CooldownLatch:
     """Latched trip condition with a self-extending cooldown.
@@ -51,6 +58,40 @@ class CooldownLatch:
             self._active = False
             self._last_trip = None
         return self._active
+
+    def force(self, now: float) -> None:
+        """Force the latched condition active and (re)start its cooldown."""
+        self._active = True
+        self._last_trip = now
+
+    def reset(self) -> None:
+        """Release the latch and clear its cooldown anchor."""
+        self._active = False
+        self._last_trip = None
+
+
+def manual_switch_decision(
+    command: str,
+    load_shed_latch: CooldownLatch,
+    overcast_latch: CooldownLatch,
+    now: float,
+) -> tuple[int, str]:
+    """Apply a manual switch command to the cooldown latches.
+
+    Returns the switch state and reason for the decision.  Force-starting a
+    load shed restarts the cooldown clock, so the shed holds through the
+    cooldown and is self-extended by any above-threshold sample.  Ending the
+    load shed clears the cooldown latches so the restore takes effect now;
+    a trip condition that is still live sheds again on the next sample.
+    """
+    if command == SWITCH_COMMAND_START_LOAD_SHED:
+        load_shed_latch.force(now)
+        return 0, REASON_MANUAL_LOAD_SHED
+    if command == SWITCH_COMMAND_END_LOAD_SHED:
+        load_shed_latch.reset()
+        overcast_latch.reset()
+        return 1, REASON_MANUAL_RESTORE
+    raise ValueError(f"Unknown switch command: {command}")
 
 
 class TimeWindowAverage:

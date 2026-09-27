@@ -48,6 +48,10 @@ from app.image_prompts import (
     style_names,
     time_of_day_phase,
 )
+from app.load_alerts import (
+    SWITCH_COMMAND_END_LOAD_SHED,
+    SWITCH_COMMAND_START_LOAD_SHED,
+)
 from app.metrics import (
     BATTERY_QUERIES,
     CELL_QUERIES,
@@ -181,6 +185,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"/battery [hours] -- battery time-series chart\n"
                 f"/cell [hours] -- per-cell voltages and balancing advice\n"
                 f"/imagine [material] [style] -- a picture of the inverter\n"
+                f"/startloadshed -- force load shedding now\n"
+                f"/endloadshed -- end load shedding and restore devices\n"
                 f"/help -- this message"
             ),
             disable_web_page_preview=True,
@@ -208,7 +214,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 f"/history [hours] \u2014 power time-series chart\n"
                 f"/battery [hours] \u2014 battery time-series chart\n"
                 f"/cell [hours] \u2014 per-cell voltages and balancing advice\n"
-                f"/imagine [material] [style] \u2014 picture of the inverter\n\n"
+                f"/imagine [material] [style] \u2014 picture of the inverter\n"
+                f"/startloadshed \u2014 force load shedding now\n"
+                f"/endloadshed \u2014 end load shedding and restore devices\n\n"
                 f"Examples:\n"
                 f"/history 12 \u2014 last 12 hours\n"
                 f"/history \u2014 default ({DEFAULT_HISTORY_HOURS} hours)\n"
@@ -601,6 +609,76 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# -- manual load-shed commands -------------------------------------------------
+
+
+async def _manual_switch_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    command: str,
+    success_message: str,
+    failure_message: str,
+) -> int:
+    """Shared implementation for the manual load-shed commands."""
+    if update.effective_message is None:
+        return ConversationHandler.END
+    user = await validate(command, update)
+    if user is None:
+        return ConversationHandler.END
+    try:
+        bot: TelegramBot = context.application.bot_data.get(  # type: ignore[assignment]
+            "telegram_bot"
+        )
+        if bot is None:
+            raise RuntimeError("TelegramBot not registered in bot_data")
+        if bot._switch_control is None:
+            raise RuntimeError("switch control is not available")
+        bot._switch_control(command)
+        message = success_message
+    except Exception as exc:
+        log.warning(
+            "Failed to send switch command",
+            exc_info=exc,
+            extra={"command": command, "user_id": user.id},
+        )
+        message = f"{emoji.emojize(':warning:')} {failure_message}: {exc}"
+    # plain text: the command name and error detail carry no markup
+    await update.effective_message.reply_text(
+        text=message,
+        disable_web_page_preview=True,
+    )
+    return ConversationHandler.END
+
+
+async def start_load_shed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /startloadshed -- force load shedding now."""
+    return await _manual_switch_command(
+        update,
+        context,
+        command=SWITCH_COMMAND_START_LOAD_SHED,
+        success_message=(
+            f"{emoji.emojize(':warning:')} Load shedding started: switch "
+            "banks and Sonoff devices are being switched off."
+        ),
+        failure_message="Could not start load shedding",
+    )
+
+
+async def end_load_shed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /endloadshed -- end load shedding and restore devices."""
+    return await _manual_switch_command(
+        update,
+        context,
+        command=SWITCH_COMMAND_END_LOAD_SHED,
+        success_message=(
+            f"{emoji.emojize(':check_mark:')} Load shed ended: switch banks "
+            "restored and restorable Sonoff devices enabled (shed-only "
+            "devices stay off)."
+        ),
+        failure_message="Could not end load shedding",
+    )
+
+
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Echo user-supplied text verbatim (no parse mode)."""
     if update.effective_message is None or update.effective_message.text is None:
@@ -715,6 +793,7 @@ class TelegramBot(AppThread, Closable):
         self,
         creds_obj: Any,
         inverter_query: Callable[[], dict | None] | None = None,
+        switch_control: Callable[[str], None] | None = None,
     ) -> None:
         AppThread.__init__(self, name=self.__class__.__name__)
         # Closable PULL binds to the Telegram ZMQ endpoint; EventProcessor's
@@ -742,6 +821,8 @@ class TelegramBot(AppThread, Closable):
                 exc_info=True,
             )
         self._inverter_query = inverter_query
+        # thread-safe hand-off to the MqttSubscriber decision loop
+        self._switch_control = switch_control
         # the choices shown in the last picture, so the next /imagine
         # rotation cannot repeat them
         self._imagine_last_choices: dict[str, str | None] = {
@@ -1075,6 +1156,8 @@ class TelegramBot(AppThread, Closable):
             CommandHandler("battery", battery),
             CommandHandler("cell", cell),
             CommandHandler("imagine", imagine),
+            CommandHandler("startloadshed", start_load_shed),
+            CommandHandler("endloadshed", end_load_shed),
         ]
         for handler in command_handlers:
             application.add_handler(handler)

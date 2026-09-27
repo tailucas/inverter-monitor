@@ -117,6 +117,13 @@ Rules:
   switch off). Commands are change-gated on the last *successfully commanded*
   state, so a failed command is retried by later decisions and the controller
   thread never blocks the inverter decision loop.
+- Manual override: `/startloadshed` and `/endloadshed` queue a command on the
+  `MqttSubscriber` (`request_switch_command`, drained every loop iteration)
+  that force or reset the cooldown latches through the pure
+  `manual_switch_decision` (`app/load_alerts.py`) and publish the same
+  switch-bank decision with the `manual_load_shed` / `manual_restore` reasons,
+  so the Sonoff `shed_only` semantics are preserved and a still-live trip
+  condition re-sheds on the next sample.
 - Overcast rationing: `switch_stats["overcast"]` trips while the latest
   weather sample reports 100 % cloudiness, with the same self-extending
   cooldown (`overcast_cooldown_seconds`, default 3600 s); the inverter-alert

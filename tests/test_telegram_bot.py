@@ -483,6 +483,18 @@ def test_format_switch_event_message_escapes_bank_name() -> None:
     assert "<b>evil</b>" not in msg
 
 
+def test_format_switch_event_message_manual_reasons() -> None:
+    """Manual load-shed commands render their own reason text."""
+    shed_msg = format_switch_event_message(
+        {"switch_banks": ["bank1"], "state": 0, "reason": "manual_load_shed"}
+    )
+    assert "manual load shed (/startloadshed)" in shed_msg
+    restore_msg = format_switch_event_message(
+        {"switch_banks": ["bank1"], "state": 1, "reason": "manual_restore"}
+    )
+    assert "manual restore (/endloadshed)" in restore_msg
+
+
 def test_format_load_warning_message() -> None:
     """Load warning formatter renders the load, threshold and details."""
     msg = format_load_warning_message(

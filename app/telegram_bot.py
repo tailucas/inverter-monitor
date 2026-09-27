@@ -209,6 +209,8 @@ _SWITCH_REASON_TEXT = {
     "battery_ration": "battery rationing",
     "alert_restore": "inverter alert",
     "all_clear": "conditions normal",
+    "manual_load_shed": "manual load shed (/startloadshed)",
+    "manual_restore": "manual restore (/endloadshed)",
 }
 
 

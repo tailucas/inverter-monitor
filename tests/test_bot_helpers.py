@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from tailucas_pylib import APP_NAME
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
+from telegram.ext import ConversationHandler
 
 import app.bot as bot_module
 from app.bot import TelegramBot, _is_permanent_recipient_error, _to_df
@@ -139,6 +140,39 @@ def _fake_validate_update(
         effective_user=SimpleNamespace(id=user_id, is_bot=False, language_code="en"),
         effective_chat=SimpleNamespace(id=chat_id, type=chat_type, title=chat_title),
         effective_message=None,
+    )
+
+
+class FakeMessage:
+    """Minimal Message stand-in that records replies."""
+
+    def __init__(self) -> None:
+        self.replies: list[tuple[str, dict[str, Any]]] = []
+
+    async def reply_text(self, text: str, **kwargs: Any) -> None:
+        self.replies.append((text, kwargs))
+
+
+def _fake_command_update(user_id: int = 111, chat_id: int = -100123) -> Any:
+    """Minimal Update stand-in carrying a recording message for handlers."""
+    update = _fake_validate_update(user_id=user_id, chat_id=chat_id)
+    update.effective_message = FakeMessage()
+    return update
+
+
+class FakeSwitchControlBot:
+    """TelegramBot stand-in exposing the manual switch-control callable."""
+
+    def __init__(self, switch_control: Any) -> None:
+        self._switch_control = switch_control
+
+
+def _fake_command_context(switch_control: Any) -> Any:
+    """Minimal Context stand-in with the bot registered in bot_data."""
+    return SimpleNamespace(
+        application=SimpleNamespace(
+            bot_data={"telegram_bot": FakeSwitchControlBot(switch_control)}
+        )
     )
 
 
@@ -392,3 +426,45 @@ def test_send_notification_retries_after_rate_limit(
     ]
     summary: Any = dispatched[0]
     assert summary.recipient_count == 2
+
+
+def test_start_load_shed_forwards_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The manual shed command is handed to the switch-control callable."""
+    monkeypatch.setattr(bot_module, "app_config", FakeConfig())
+    commands: list[str] = []
+    update = _fake_command_update()
+    result = asyncio.run(
+        bot_module.start_load_shed(update, _fake_command_context(commands.append))
+    )
+    assert result == ConversationHandler.END
+    assert commands == ["start_load_shed"]
+    reply, kwargs = update.effective_message.replies[0]
+    assert "Load shedding started" in reply
+    assert kwargs.get("disable_web_page_preview") is True
+    # plain text: the command name is never parsed as markup
+    assert "parse_mode" not in kwargs
+
+
+def test_end_load_shed_forwards_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The manual restore explains that shed-only devices stay off."""
+    monkeypatch.setattr(bot_module, "app_config", FakeConfig())
+    commands: list[str] = []
+    update = _fake_command_update()
+    result = asyncio.run(
+        bot_module.end_load_shed(update, _fake_command_context(commands.append))
+    )
+    assert result == ConversationHandler.END
+    assert commands == ["end_load_shed"]
+    reply, _ = update.effective_message.replies[0]
+    assert "Load shed ended" in reply
+    assert "shed-only" in reply
+
+
+def test_end_load_shed_reports_missing_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing switch-control callable replies with an error, not a crash."""
+    monkeypatch.setattr(bot_module, "app_config", FakeConfig())
+    update = _fake_command_update()
+    result = asyncio.run(bot_module.end_load_shed(update, _fake_command_context(None)))
+    assert result == ConversationHandler.END
+    reply, _ = update.effective_message.replies[0]
+    assert "Could not end load shedding" in reply

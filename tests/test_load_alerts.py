@@ -1,11 +1,18 @@
 #!/usr/bin/env python
 """Unit tests for the pure load-alert state machines."""
 
+import pytest
+
 from app.load_alerts import (
+    REASON_MANUAL_LOAD_SHED,
+    REASON_MANUAL_RESTORE,
+    SWITCH_COMMAND_END_LOAD_SHED,
+    SWITCH_COMMAND_START_LOAD_SHED,
     CooldownLatch,
     LoadAlertDecision,
     LoadAlertEvaluator,
     TimeWindowAverage,
+    manual_switch_decision,
 )
 
 WARNING_W = 7000.0
@@ -162,3 +169,75 @@ class TestLoadAlertEvaluator:
         assert evaluator.evaluate(load_w=CRITICAL_W - 1, now=122.0).pd_resolve is True
         evaluator.pd_resolve_failed()
         assert evaluator.evaluate(load_w=CRITICAL_W - 1, now=183.0).pd_resolve is True
+
+
+class TestManualSwitchDecision:
+    """Force/reset support for the manual load-shed bot commands."""
+
+    @staticmethod
+    def _latches() -> tuple[CooldownLatch, CooldownLatch]:
+        load_shed = CooldownLatch(threshold=WARNING_W, cooldown_secs=COOLDOWN_SECS)
+        overcast = CooldownLatch(threshold=100.0, cooldown_secs=3600.0, inclusive=True)
+        return load_shed, overcast
+
+    def test_force_holds_through_the_cooldown(self) -> None:
+        latch = CooldownLatch(threshold=WARNING_W, cooldown_secs=COOLDOWN_SECS)
+        latch.force(now=0.0)
+        assert latch.active is True
+        # a low sample keeps a forced latch through its cooldown
+        assert latch.update(value=WARNING_W - 1, now=COOLDOWN_SECS) is True
+        assert latch.update(value=WARNING_W - 1, now=COOLDOWN_SECS + 1) is False
+
+    def test_force_is_self_extended_by_high_samples(self) -> None:
+        latch = CooldownLatch(threshold=WARNING_W, cooldown_secs=COOLDOWN_SECS)
+        latch.force(now=0.0)
+        assert latch.update(value=WARNING_W + 1, now=COOLDOWN_SECS - 1) is True
+        assert latch.update(value=WARNING_W - 1, now=COOLDOWN_SECS + 1) is True
+        assert latch.update(value=WARNING_W - 1, now=2 * COOLDOWN_SECS + 1) is False
+
+    def test_reset_releases_now_and_stays_released(self) -> None:
+        latch = CooldownLatch(threshold=WARNING_W, cooldown_secs=COOLDOWN_SECS)
+        latch.update(value=WARNING_W + 1, now=0.0)
+        latch.reset()
+        assert latch.active is False
+        assert latch.update(value=WARNING_W - 1, now=1.0) is False
+        # a later tripping sample re-arms the latch
+        assert latch.update(value=WARNING_W + 1, now=2.0) is True
+
+    def test_start_load_shed_forces_the_load_shed_latch(self) -> None:
+        load_shed, overcast = self._latches()
+        decision = manual_switch_decision(
+            command=SWITCH_COMMAND_START_LOAD_SHED,
+            load_shed_latch=load_shed,
+            overcast_latch=overcast,
+            now=10.0,
+        )
+        assert decision == (0, REASON_MANUAL_LOAD_SHED)
+        assert load_shed.active is True
+        assert load_shed.update(value=WARNING_W - 1, now=10.0 + COOLDOWN_SECS) is True
+        # a forced load shed is not an overcast event
+        assert overcast.active is False
+
+    def test_end_load_shed_resets_both_cooldown_latches(self) -> None:
+        load_shed, overcast = self._latches()
+        load_shed.force(now=0.0)
+        overcast.force(now=0.0)
+        decision = manual_switch_decision(
+            command=SWITCH_COMMAND_END_LOAD_SHED,
+            load_shed_latch=load_shed,
+            overcast_latch=overcast,
+            now=5.0,
+        )
+        assert decision == (1, REASON_MANUAL_RESTORE)
+        assert load_shed.active is False
+        assert overcast.active is False
+
+    def test_unknown_command_raises(self) -> None:
+        load_shed, overcast = self._latches()
+        with pytest.raises(ValueError):
+            manual_switch_decision(
+                command="unknown",
+                load_shed_latch=load_shed,
+                overcast_latch=overcast,
+                now=0.0,
+            )

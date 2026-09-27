@@ -241,6 +241,7 @@ class SonoffController(AppThread):
         self._intent_lock = threading.Lock()
         self._intent: tuple[int, str] | None = None
         self._last_commanded: dict[str, int] = {}
+        self._failed_state: dict[str, int] = {}
         self._failures: dict[str, int] = {}
         self._retry_at: dict[str, float] = {}
         self._backoff_alerted: set[str] = set()
@@ -295,7 +296,14 @@ class SonoffController(AppThread):
         )
         for command in commands:
             retry_at = self._retry_at.get(command.device_id)
-            if retry_at is not None and now < retry_at:
+            if (
+                retry_at is not None
+                and now < retry_at
+                and self._failed_state.get(command.device_id) == command.state
+            ):
+                # only a retry of the same failed command waits out the
+                # backoff; a new decision (including a manual one) is
+                # attempted immediately
                 log.debug(
                     "Sonoff control message deferred by retry backoff",
                     extra={
@@ -338,6 +346,7 @@ class SonoffController(AppThread):
 
     def _record_success(self, command: SonoffCommand, reason: str) -> None:
         self._last_commanded[command.device_id] = command.state
+        self._failed_state.pop(command.device_id, None)
         self._failures.pop(command.device_id, None)
         self._retry_at.pop(command.device_id, None)
         self._backoff_alerted.discard(command.device_id)
@@ -361,6 +370,7 @@ class SonoffController(AppThread):
     ) -> None:
         failures = self._failures.get(command.device_id, 0) + 1
         self._failures[command.device_id] = failures
+        self._failed_state[command.device_id] = command.state
         backoff = min(
             SONOFF_RETRY_BACKOFF_SECONDS * (2 ** (failures - 1)),
             SONOFF_MAX_RETRY_BACKOFF_SECONDS,

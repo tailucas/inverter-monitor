@@ -28,7 +28,7 @@ A multi-threaded Python application that interfaces with Deye/Sunsynk hybrid inv
 | **Time-Series Storage** | Asynchronous writes to InfluxDB with per-field tagging for device, application, and BMS unit identification. |
 | **OpenTelemetry Metrics** | Exports all inverter, battery, and BMS metrics as OTEL synchronous gauges via OTLP to any OpenTelemetry backend. |
 | **MQTT Integration** | Publishes inverter state to MQTT topics and subscribes to control topics for remote switch management. |
-| **Smart Switching** | Evaluates battery state-of-charge, load draw, and grid status to make decisions about switching off non-essential consumers via MQTT-controlled switch banks and Sonoff BasicR2 devices driven directly on the LAN. |
+| **Smart Switching** | Evaluates battery state-of-charge, load draw, and grid status to make decisions about switching off non-essential consumers via MQTT-controlled switch banks and Sonoff BasicR2 devices driven directly on the LAN; `/startloadshed` and `/endloadshed` force or release a shed on demand. |
 | **Imagined Status** | The Telegram `/imagine [material] [style]` command turns live inverter, BMS, weather and switch-bank state into a narrative prompt of the inverter outdoors under an open sky (always naming the time of day and the wind), rendered by Gemini in the chosen style — a built-in style when omitted, the same for the outdoor setting and the subject material, or the user's own snake_case style slug passed through as a custom style; no rotation repeats the previous picture's pick; prompts stay inside a self-imposed token budget. |
 | **Alerting & Paging** | PagerDuty Events API v2 integration for critical alerts including BMS data loss and minimum BMS unit count violations. |
 | **Error Tracking** | Sentry SDK integration with threading and async support for production error monitoring. |
@@ -76,7 +76,7 @@ The application is built around a modular, event-driven architecture using ZeroM
 - **`WeatherReader`** — Periodically fetches current weather from OpenWeather API and calculates a theoretical sun production multiplier.
 - **`MqttSubscriber`** — Maintains state for MQTT-controlled switch devices, evaluates inverter conditions (battery SOC, power draw, grid mode) to make automated switching decisions, and publishes status updates. The same decision is handed to the `SonoffController` thread, which issues LAN-mode control messages to the configured Sonoff devices (a device with `shed_only` true is switched off when load shedding is needed but is never switched back on automatically).
 - **`EventProcessor`** — Central consumer that receives all telemetry events, writes to InfluxDB, updates OTEL synchronous gauges, performs debug metrics logging, and handles graceful shutdown.
-- **`TelegramBot`** — Runs the Telegram command bot (`/status`, `/history`, `/battery`, `/cell`, `/imagine`), caches BMS, weather and switch-bank summaries for on-demand replies, and dispatches bot-initiated notifications.
+- **`TelegramBot`** — Runs the Telegram command bot (`/status`, `/history`, `/battery`, `/cell`, `/imagine`, `/startloadshed`, `/endloadshed`), caches BMS, weather and switch-bank summaries for on-demand replies, and dispatches bot-initiated notifications.
 
 ### Project Structure
 

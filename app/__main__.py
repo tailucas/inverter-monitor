@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import binascii
 import os
+import queue
 import re
 import socket
 import threading
@@ -30,7 +31,14 @@ from tailucas_pylib.threads import bye, die, thread_nanny
 from tailucas_pylib.zmq import URL_WORKER_APP, Closable, try_close, zmq_socket, zmq_term
 from zmq.error import ContextTerminated, ZMQError
 
-from app.load_alerts import CooldownLatch, LoadAlertEvaluator, TimeWindowAverage
+from app.load_alerts import (
+    SWITCH_COMMAND_END_LOAD_SHED,
+    SWITCH_COMMAND_START_LOAD_SHED,
+    CooldownLatch,
+    LoadAlertEvaluator,
+    TimeWindowAverage,
+    manual_switch_decision,
+)
 from app.metrics import configure as metrics_configure
 from app.serial_reader import SerialPortReader
 from app.single_flight import SingleFlight
@@ -1200,6 +1208,24 @@ class MqttSubscriber(AppThread, Closable):
                 fallback=DEFAULT_LOAD_SHED_COOLDOWN_SECONDS,
             ),
         )
+        # manual load-shed/restore commands from the Telegram bot
+        self._manual_commands: queue.SimpleQueue[str] = queue.SimpleQueue()
+        # last full switch-stats payload, re-published after a manual command
+        self._last_switch_stats: dict = {}
+
+    def request_switch_command(self, command: str) -> None:
+        """Queue a manual switch command for the decision loop.
+
+        Called from the Telegram bot thread; never blocks and never touches
+        the MQTT client or the switch state.
+        """
+        if command not in (
+            SWITCH_COMMAND_START_LOAD_SHED,
+            SWITCH_COMMAND_END_LOAD_SHED,
+        ):
+            raise ValueError(f"Unknown switch command: {command}")
+        self._manual_commands.put(command)
+        log.info("Manual switch command requested", extra={"command": command})
 
     def close(self):
         Closable.close(self)
@@ -1334,6 +1360,63 @@ class MqttSubscriber(AppThread, Closable):
                 exc_info=True,
             )
 
+    def _apply_manual_switch_commands(self, app_socket: zmq.Socket) -> None:
+        """Apply every queued manual switch command, in order."""
+        while True:
+            try:
+                command = self._manual_commands.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._apply_manual_switch_command(
+                    app_socket=app_socket, command=command
+                )
+            except Exception:
+                # a manual command must never take the subscriber down
+                log.warning(
+                    "Failed to apply manual switch command",
+                    exc_info=True,
+                    extra={"command": command},
+                )
+
+    def _apply_manual_switch_command(
+        self, app_socket: zmq.Socket, command: str
+    ) -> None:
+        """Force or end load shedding now and publish the outcome."""
+        now = time.time()
+        switch_state, reason = manual_switch_decision(
+            command=command,
+            load_shed_latch=self._load_shed_latch,
+            overcast_latch=self._overcast_latch,
+            now=now,
+        )
+        changed_banks = self.set_switch_state(switch_state=switch_state, reason=reason)
+        self._notify_switch_change(
+            app_socket=app_socket,
+            changed_banks=changed_banks,
+            switch_state=switch_state,
+            reason=reason,
+            inverter_data={},
+            now=now,
+        )
+        log.info(
+            "Manual switch command applied",
+            extra={
+                "command": command,
+                "switch_state": switch_state,
+                "switch_banks": list(changed_banks),
+                "load_shed": int(self._load_shed_latch.active),
+                "overcast": int(self._overcast_latch.active),
+            },
+        )
+        if self._last_switch_stats:
+            # keep the gauges and the bot cache coherent with the latches
+            stats = dict(self._last_switch_stats)
+            stats["load_shed"] = int(self._load_shed_latch.active)
+            stats["overcast"] = int(self._overcast_latch.active)
+            stats["switch_state"] = switch_state
+            app_socket.send_pyobj({"switches": stats})
+
     def _notify_switch_change(
         self,
         app_socket,
@@ -1395,6 +1478,8 @@ class MqttSubscriber(AppThread, Closable):
                         f"{self._mqtt_server_address} "
                         f"(disconnected? {self._disconnected})"
                     )
+                # manual commands act immediately, even without a sample
+                self._apply_manual_switch_commands(app_socket=app_socket)
                 inverter_data = None
                 # check for messages to publish
                 try:
@@ -1494,6 +1579,7 @@ class MqttSubscriber(AppThread, Closable):
                         inverter_data=inverter_data,
                         now=now,
                     )
+                    self._last_switch_stats = dict(switch_stats)
                     app_socket.send_pyobj({"switches": switch_stats})
                     continue
                 # check 1: calculate surplus as a function of PV reported *usage*
@@ -1580,6 +1666,7 @@ class MqttSubscriber(AppThread, Closable):
                 )
                 # post stats
                 switch_stats["switch_state"] = switch_state
+                self._last_switch_stats = dict(switch_stats)
                 app_socket.send_pyobj({"switches": switch_stats})
                 # for other interested consumers
                 if self._mqtt_client is not None:
@@ -2093,6 +2180,7 @@ def main():
             inverter_query=logger_reader.query_now
             if logger_reader is not None
             else None,
+            switch_control=mqtt_subscriber.request_switch_command,
         )
     else:
         log.warning("Telegram bot is disabled.")

@@ -367,12 +367,36 @@ class TestSonoffController:
         controller = SonoffController(devices=[_device("shed1", shed_only=False)])
         controller._failures["shed1"] = 2
         controller._retry_at["shed1"] = 0.0
+        controller._failed_state["shed1"] = STATE_ON
         controller._backoff_alerted.add("shed1")
         controller._issue(intent=(STATE_OFF, "load_shed"))
         assert controller._failures == {}
         assert controller._retry_at == {}
+        assert controller._failed_state == {}
         assert controller._backoff_alerted == set()
         assert controller._last_commanded == {"shed1": STATE_OFF}
+
+    def test_new_state_is_not_deferred_by_a_previous_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fresh decision is attempted even while a device backs off."""
+        calls: list[int] = []
+
+        def flaky_post(self, url, data=None, timeout=None, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise requests.ConnectionError("no route to host")
+            return FakeResponse({"error": 0})
+
+        monkeypatch.setattr(requests.Session, "post", flaky_post)
+        controller = SonoffController(devices=[_device("shed1", shed_only=False)])
+        controller._issue(intent=(STATE_ON, "all_clear"))
+        assert controller._failures == {"shed1": 1}
+        # the opposite state must not wait out the retry backoff
+        controller._issue(intent=(STATE_OFF, "load_shed"))
+        assert len(calls) == 2
+        assert controller._last_commanded == {"shed1": STATE_OFF}
+        assert controller._failures == {}
 
     def test_device_error_response_is_treated_as_failure(
         self, monkeypatch: pytest.MonkeyPatch

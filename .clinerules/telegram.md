@@ -575,6 +575,21 @@ Current commands (registered as simple `CommandHandler`s in `app/bot.py`
   once (INFO `"Retrying Gemini image request after not-found error"`, after
   `IMAGE_REQUEST_RETRY_DELAY_SECONDS`); if that retry fails with any error,
   the failure is logged and relayed exactly like a first failure.
+- `/startloadshed` — force load shedding now: the load-shed latch is forced
+  active (restarting its cooldown clock) and the switch banks and Sonoff
+  devices are switched off immediately. The shed holds through the cooldown
+  and is self-extended by any above-threshold sample.
+- `/endloadshed` — end load shedding now: the load-shed and overcast cooldown
+  latches are reset, the switch banks are restored and Sonoff devices whose
+  `shed_only` credential is false are enabled (shed-only devices stay off).
+  A trip condition that is still live sheds again on the next sample, so the
+  safety logic stays authoritative.
+
+Both manual commands hand the request to the `MqttSubscriber` decision loop
+through the thread-safe `switch_control` callable
+(`MqttSubscriber.request_switch_command`, drained every loop iteration), so the
+reply is immediate and the switch-event broadcast follows as a normal
+notification.
 
 Conventions:
 
