@@ -28,7 +28,7 @@ A multi-threaded Python application that interfaces with Deye/Sunsynk hybrid inv
 | **Time-Series Storage** | Asynchronous writes to InfluxDB with per-field tagging for device, application, and BMS unit identification. |
 | **OpenTelemetry Metrics** | Exports all inverter, battery, and BMS metrics as OTEL synchronous gauges via OTLP to any OpenTelemetry backend. |
 | **MQTT Integration** | Publishes inverter state to MQTT topics and subscribes to control topics for remote switch management. |
-| **Smart Switching** | Evaluates battery state-of-charge, load draw, and grid status to make decisions about switching off non-essential consumers via MQTT-controlled switches. |
+| **Smart Switching** | Evaluates battery state-of-charge, load draw, and grid status to make decisions about switching off non-essential consumers via MQTT-controlled switch banks and Sonoff BasicR2 devices driven directly on the LAN. |
 | **Imagined Status** | The Telegram `/imagine [material] [style]` command turns live inverter, BMS, weather and switch-bank state into a narrative prompt of the inverter outdoors under an open sky (always naming the time of day and the wind), rendered by Gemini in the chosen style — a built-in style when omitted, the same for the outdoor setting and the subject material, or the user's own snake_case style slug passed through as a custom style; no rotation repeats the previous picture's pick; prompts stay inside a self-imposed token budget. |
 | **Alerting & Paging** | PagerDuty Events API v2 integration for critical alerts including BMS data loss and minimum BMS unit count violations. |
 | **Error Tracking** | Sentry SDK integration with threading and async support for production error monitoring. |
@@ -74,7 +74,7 @@ The application is built around a modular, event-driven architecture using ZeroM
 - **`LoggerReader`** — Connects to the Deye Wi-Fi logger via TCP (port 8899), constructs binary protocol frames, fetches two chunks of 54 registers each, parses responses with proper endianness and scaling, and publishes structured data to the internal ZMQ socket.
 - **`BmsReader`** — Drives the `SerialPortReader` which reads from `/dev/ttyUSB0` (9600 8N1), extracts and decodes BMS frames via the protocol decoder, assigns friendly names (BMS01, BMS02, etc.) per address, tracks per-unit health, and publishes battery metrics with cell-level granularity.
 - **`WeatherReader`** — Periodically fetches current weather from OpenWeather API and calculates a theoretical sun production multiplier.
-- **`MqttSubscriber`** — Maintains state for MQTT-controlled switch devices, evaluates inverter conditions (battery SOC, power draw, grid mode) to make automated switching decisions, and publishes status updates.
+- **`MqttSubscriber`** — Maintains state for MQTT-controlled switch devices, evaluates inverter conditions (battery SOC, power draw, grid mode) to make automated switching decisions, and publishes status updates. The same decision is handed to the `SonoffController` thread, which issues LAN-mode control messages to the configured Sonoff devices (a device with `shed_only` true is switched off when load shedding is needed but is never switched back on automatically).
 - **`EventProcessor`** — Central consumer that receives all telemetry events, writes to InfluxDB, updates OTEL synchronous gauges, performs debug metrics logging, and handles graceful shutdown.
 - **`TelegramBot`** — Runs the Telegram command bot (`/status`, `/history`, `/battery`, `/cell`, `/imagine`), caches BMS, weather and switch-bank summaries for on-demand replies, and dispatches bot-initiated notifications.
 
@@ -88,7 +88,8 @@ The application is built around a modular, event-driven architecture using ZeroM
 │   ├── bms_decoder.py          # HinaESS BMS RS485 protocol decoder
 │   ├── gemini_image.py         # Gemini text-to-image client (/imagine)
 │   ├── image_prompts.py        # Pure /imagine prompt builder & presets
-│   └── serial_reader.py        # Serial port reader & frame synchronizer
+│   ├── serial_reader.py        # Serial port reader & frame synchronizer
+│   └── sonoff.py               # Sonoff LAN-mode load-shed switch control
 ├── config/
 │   ├── app.conf                # Application configuration template
 │   └── field_mappings.txt      # Deye inverter register field definitions
@@ -125,6 +126,7 @@ The application is built around a modular, event-driven architecture using ZeroM
 - **Sentry** — Error tracking
 - **Healthchecks.io / Cronitor** — Uptime monitoring
 - **OpenWeather API** — Weather correlation
+- **PyCryptodome** — AES-128-CBC payloads for Sonoff LAN-mode switching
 - **pyserial** — RS485 serial communication
 - **libscrc** — CRC16-MODBUS checksums
 
@@ -166,6 +168,7 @@ Key configuration items (see `base.env` and `config/app.conf`):
 - `INVERTER_LOGGER_SN` — Serial number of the inverter
 - `BMS_SERIAL_PORT` — Serial device for BMS (e.g., `/dev/ttyUSB0`)
 - `MQTT_SERVER_ADDRESS` — MQTT broker hostname
+- `SONOFF_LOAD_SHED_DEVICE_ID_CSV` — Comma-separated Sonoff device IDs (a single id works too; empty disables Sonoff control). Each id names a section of the `Sonoff` 1Password item holding `name`, `apikey`, `address` and the optional boolean `shed_only` (default true: only ever switch off)
 - `WEATHER_COORD` — Latitude,longitude for weather data
 - `GEMINI_MODEL` — Optional `/imagine` text-to-image model override (defaults to `gemini-3.1-flash-lite-image`)
 - `INFLUXDB_BUCKET` — Target InfluxDB bucket name

@@ -17,6 +17,7 @@ dependencies = [
     "paho-mqtt>=2.1.0",
     "pandas>=3.0.3",
     "pillow>=12.3.0",
+    "pycryptodome>=3.23.0",
     "pyserial>=3.5",
     "python-telegram-bot>=22.7",
     "requests>=2.34.2",
@@ -79,6 +80,7 @@ ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = [
+    "Crypto.*",
     "matplotlib.*",
     "paho.mqtt.*",
     "pagerduty.*",

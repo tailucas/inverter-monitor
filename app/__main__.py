@@ -34,6 +34,11 @@ from app.load_alerts import CooldownLatch, LoadAlertEvaluator, TimeWindowAverage
 from app.metrics import configure as metrics_configure
 from app.serial_reader import SerialPortReader
 from app.single_flight import SingleFlight
+from app.sonoff import (
+    SonoffController,
+    load_sonoff_devices,
+    parse_device_ids,
+)
 from app.telegram_bot import URL_WORKER_TELEGRAM  # noqa: E402
 
 creds: Creds | None = None
@@ -1140,7 +1145,13 @@ class BmsReader(AppThread):
 
 
 class MqttSubscriber(AppThread, Closable):
-    def __init__(self, mqtt_server_address, mqtt_topic_prefix, mqtt_switch_devices):
+    def __init__(
+        self,
+        mqtt_server_address,
+        mqtt_topic_prefix,
+        mqtt_switch_devices,
+        sonoff_controller=None,
+    ):
         AppThread.__init__(self, name=self.__class__.__name__)
         Closable.__init__(self, connect_url=URL_WORKER_MQTT_PUBLISH)
 
@@ -1148,6 +1159,7 @@ class MqttSubscriber(AppThread, Closable):
         self._mqtt_server_address = mqtt_server_address
         self._mqtt_subscribe_topic_prefix = mqtt_topic_prefix
         self._mqtt_switch_devices = mqtt_switch_devices
+        self._sonoff_controller = sonoff_controller
 
         self._disconnected = False
 
@@ -1248,8 +1260,12 @@ class MqttSubscriber(AppThread, Closable):
             # state capture
             self._switch_state[switch_bank] = new_state
 
-    def set_switch_state(self, switch_state=1):
-        """Set every configured bank and return the banks that changed."""
+    def set_switch_state(self, switch_state=1, reason="unknown"):
+        """Set every configured bank and return the banks that changed.
+
+        The same decision drives the configured Sonoff devices, whose control
+        messages are issued by the SonoffController thread.
+        """
         changed_banks = []
         for switch_bank in self._switch_state.keys():
             if switch_bank not in self._mqtt_switch_devices:
@@ -1303,7 +1319,20 @@ class MqttSubscriber(AppThread, Closable):
                 _mqtt_publish_duration = time.time() - _mqtt_publish_start
                 MQTT_PUBLISH_DURATION.set(_mqtt_publish_duration)
             changed_banks.append(switch_bank)
+        self._apply_sonoff(switch_state=switch_state, reason=reason)
         return changed_banks
+
+    def _apply_sonoff(self, switch_state, reason):
+        """Hand a switch-bank decision to the Sonoff controller, if any."""
+        if self._sonoff_controller is None:
+            return
+        try:
+            self._sonoff_controller.apply(switch_state=switch_state, reason=reason)
+        except Exception:
+            log.warning(
+                "Failed to hand switch decision to Sonoff controller.",
+                exc_info=True,
+            )
 
     def _notify_switch_change(
         self,
@@ -1456,7 +1485,7 @@ class MqttSubscriber(AppThread, Closable):
                 ):
                     # do not load shed during an alert condition; a latched
                     # high-load condition takes priority over this guard
-                    changed_banks = self.set_switch_state()
+                    changed_banks = self.set_switch_state(reason="alert_restore")
                     self._notify_switch_change(
                         app_socket=app_socket,
                         changed_banks=changed_banks,
@@ -1538,7 +1567,9 @@ class MqttSubscriber(AppThread, Closable):
                 elif switch_stats["battery_ration"]:
                     reason = "battery_ration"
                 # update switches
-                changed_banks = self.set_switch_state(switch_state=switch_state)
+                changed_banks = self.set_switch_state(
+                    switch_state=switch_state, reason=reason
+                )
                 self._notify_switch_change(
                     app_socket=app_socket,
                     changed_banks=changed_banks,
@@ -2038,10 +2069,20 @@ def main():
             port=app_config.get("bms", "serial_port", fallback="/dev/ttyUSB1"),
         )
     weather_reader = WeatherReader()
+    sonoff_device_ids = parse_device_ids(
+        app_config.get("sonoff", "device_id_csv", fallback="")
+    )
+    sonoff_devices = load_sonoff_devices(creds, sonoff_device_ids)
+    sonoff_controller: SonoffController | None = None
+    if sonoff_devices:
+        sonoff_controller = SonoffController(devices=sonoff_devices)
+    else:
+        log.warning("Sonoff load-shed control is disabled.")
     mqtt_subscriber = MqttSubscriber(
         mqtt_server_address=app_config.get("mqtt", "server_address"),
         mqtt_topic_prefix=app_config.get("mqtt", "topic_prefix"),
         mqtt_switch_devices=app_config.get("mqtt", "switch_device_csv").split(","),
+        sonoff_controller=sonoff_controller,
     )
     telegram_bot: TelegramBot | None = None
     if telegram_enabled:
@@ -2072,6 +2113,8 @@ def main():
         else:
             log.warning("BMS reader is disabled.")
         weather_reader.start()
+        if sonoff_controller is not None:
+            sonoff_controller.start()
         mqtt_subscriber.start()
         if telegram_bot is not None:
             telegram_bot.start()

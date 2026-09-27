@@ -11,7 +11,7 @@ Multi-threaded energy monitoring application for Deye/Sunsynk hybrid inverters
 and HinaESS Hi-5 BMS units: collects inverter telemetry over the logger's
 proprietary TCP protocol, BMS telemetry over RS485 serial, correlates weather,
 publishes to InfluxDB/MQTT, exports OpenTelemetry metrics, and drives load-shed
-switch banks via MQTT.
+switch banks via MQTT and Sonoff devices over the LAN.
 
 ## 1. Posture
 
@@ -53,6 +53,9 @@ One `AppThread` per concern, wired over ZMQ inproc (`URL_WORKER_APP`,
   caches forwarded weather samples (overcast rationing); subscribes to
   `{topic_prefix}/state/#`, applies the rationing checks (high load,
   overcast, surplus, battery SoC, grid fallback) and controls switch banks.
+  Every decision is also handed to the `SonoffController` thread
+  (`app/sonoff.py`), which issues the LAN-mode control messages for the
+  configured Sonoff devices.
 - `LoadAlertMonitor`: consumes forwarded inverter samples; raises Telegram
   load warnings/recoveries and the `load_high` PagerDuty incident. Its
   load-shed state machine is pure logic in `app/load_alerts.py`.
@@ -81,6 +84,13 @@ Rules:
   (`tests/test_decoder.py`); keep it dependency-free and extend via tests.
 - Unknown-but-valid frames get logged with raw hex fields for reverse
   engineering, not dropped silently.
+- Sonoff LAN-mode control (`app/sonoff.py`) builds the documented
+  AES-128-CBC payload (MD5 of the device API key, random IV, compact JSON
+  switch command) and POSTs it to `http://{address}:8081/zeroconf/switch`
+  with a 3 s timeout — devices are addressed by their 1Password address, so
+  no mDNS discovery, cloud round-trip or event loop is involved. Failed
+  control messages log a WARNING and back off per device (5 s doubling to a
+  60 s cap, one ERROR when the cap is reached, re-armed by a success).
 
 ## 4. Alerting & Metrics
 
@@ -101,6 +111,12 @@ Rules:
   only after `load_shed_cooldown_seconds` with no above-threshold sample, and
   every above-threshold sample extends the cooldown; missing load data
   retains the latch.
+- Sonoff devices follow the same decision as the MQTT banks: every device is
+  switched off on a shed, and a restore only switches on devices whose
+  `Sonoff/{id}/shed_only` credential is false (default true: only ever
+  switch off). Commands are change-gated on the last *successfully commanded*
+  state, so a failed command is retried by later decisions and the controller
+  thread never blocks the inverter decision loop.
 - Overcast rationing: `switch_stats["overcast"]` trips while the latest
   weather sample reports 100 % cloudiness, with the same self-extending
   cooldown (`overcast_cooldown_seconds`, default 3600 s); the inverter-alert
@@ -118,8 +134,9 @@ Rules:
 ## 5. Configuration
 
 - All hardware endpoints/credentials come from `app.conf` sections
-  (`app`, `inverter`, `bms`, `weather`, `mqtt`, `telegram`, `metrics`,
-  `alert_thresholds`) interpolated from `config/` at container start.
+  (`app`, `inverter`, `bms`, `weather`, `mqtt`, `sonoff`, `telegram`,
+  `metrics`, `alert_thresholds`) interpolated from `config/` at container
+  start.
 - Thresholds may be optional: read them with
   `app_config.getint(..., fallback=...)` and add the `config/app.conf`
   placeholder (plus the deployment env var) only when a per-deployment
@@ -130,8 +147,10 @@ Rules:
 ## 6. Testing & Lint
 
 - `uv run pytest tests/` must pass. Decoder tests (`tests/test_decoder.py`)
-  are the safety net for protocol changes; alert state machines
-  (`tests/test_load_alerts.py`), message formatters
+  and the Sonoff LAN-mode payload vector (`tests/test_sonoff.py`) are the
+  safety net for protocol changes; alert state machines
+  (`tests/test_load_alerts.py`), Sonoff decision logic and controller
+  behaviour (`tests/test_sonoff.py`), message formatters
   (`tests/test_telegram_bot.py`), and Telegram data helpers
   (`tests/test_bot_helpers.py`) are the safety net for behavioural changes.
 - Ruff config selects F/E/W/B/I/UP without a custom line length; keep new
