@@ -7,7 +7,7 @@ per inverter sample by the application threads and are fully unit-tested in
 """
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # manual switch-bank commands issued from the Telegram bot
 SWITCH_COMMAND_START_LOAD_SHED = "start_load_shed"
@@ -116,6 +116,208 @@ class TimeWindowAverage:
         for _, sample in self._samples:
             total += sample
         return total / len(self._samples)
+
+
+# switch-rationing conditions; the values double as the switch-stats
+# reason keys reported to the consumers
+RATION_LOAD_SHED = "load_shed"
+RATION_OVERCAST = "overcast"
+RATION_SURPLUS = "surplus_ration"
+RATION_BATTERY = "battery_ration"
+RATIONING_CONDITIONS = (
+    RATION_LOAD_SHED,
+    RATION_OVERCAST,
+    RATION_SURPLUS,
+    RATION_BATTERY,
+)
+
+
+class WarnOnceTracker:
+    """Warn once per trip episode, re-armed when the condition clears.
+
+    Keyed per condition, so independent trips cannot mask each other and a
+    condition that recovers (and trips again later) warns again.
+    """
+
+    def __init__(self) -> None:
+        self._active: set[str] = set()
+
+    def should_warn(self, condition: str, tripped: bool) -> bool:
+        """Report whether this trip of ``condition`` still needs a warning."""
+        if not tripped:
+            self._active.discard(condition)
+            return False
+        if condition in self._active:
+            return False
+        self._active.add(condition)
+        return True
+
+
+@dataclass(frozen=True)
+class SwitchConditionConfig:
+    """Enablement and thresholds for the automatic switch conditions.
+
+    A condition with its ``*_enabled`` flag false is still evaluated and
+    reported as tripped (the switch stats stay truthful) but never changes
+    the switch state; the decision lists it under ``suppressed`` so the
+    caller can warn once per episode.
+    """
+
+    load_shed_enabled: bool = True
+    overcast_enabled: bool = True
+    surplus_ration_enabled: bool = True
+    battery_ration_enabled: bool = True
+    battery_low_pct: float = 45.0
+    battery_critical_pct: float = 40.0
+    battery_major_draw_w: float = 500.0
+    # assuming CFE drop-out at 30 %
+    grid_dropout_v: float = 90.0
+    overcast_cloudiness_pct: float = 100.0
+    # cloudiness older than this is treated as unknown
+    cloudiness_stale_seconds: float = 180.0
+
+    def enabled(self, condition: str) -> bool:
+        """Report whether a rationing condition may control the switches."""
+        return {
+            RATION_LOAD_SHED: self.load_shed_enabled,
+            RATION_OVERCAST: self.overcast_enabled,
+            RATION_SURPLUS: self.surplus_ration_enabled,
+            RATION_BATTERY: self.battery_ration_enabled,
+        }[condition]
+
+
+@dataclass(frozen=True)
+class SwitchConditionDecision:
+    """Outcome of one switch-rationing evaluation over an inverter sample."""
+
+    switch_state: int
+    reasons: dict[str, int]
+    suppressed: list[str]
+    alert_restore: bool
+    load_missing: bool = False
+    weather_stale: bool = False
+    supporting: dict[str, float] = field(default_factory=dict)
+
+
+def evaluate_switch_conditions(
+    inverter_data: dict,
+    now: float,
+    load_shed_latch: CooldownLatch,
+    overcast_latch: CooldownLatch,
+    generation_average: TimeWindowAverage,
+    cloudiness_pct: float | None,
+    cloudiness_age_secs: float | None,
+    config: SwitchConditionConfig,
+    manual_shed: bool = False,
+) -> SwitchConditionDecision:
+    """Evaluate the automatic switch conditions for one inverter sample.
+
+    Mirrors the thread's decision order: the overall-load latch has top
+    priority, overcast rationing is next, an inverter alert restores the
+    banks unless one of those latches is active, and the surplus/battery
+    rationing checks follow.  The latches and the generation average are
+    updated in place; ``reasons`` is the switch-stats mapping reported to
+    the consumers.  A disabled condition is still reported as tripped but
+    never forces ``switch_state`` to 0; it is listed in ``suppressed``
+    instead.  A manual load shed acts even when its condition is disabled.
+    """
+    reasons = {condition: 0 for condition in RATIONING_CONDITIONS}
+    # check 0 (top priority): overall load shedding with cooldown
+    load_field = inverter_data.get("total_load_power_w")
+    if isinstance(load_field, bool) or not isinstance(load_field, (int, float)):
+        load_missing = True
+        load_shed_active = load_shed_latch.active
+    else:
+        load_missing = False
+        load_shed_active = load_shed_latch.update(float(load_field), now)
+    if load_shed_active:
+        reasons[RATION_LOAD_SHED] = 1
+    # check 0b: overcast rationing; stale weather retains the latch
+    weather_stale = False
+    if (
+        cloudiness_pct is not None
+        and cloudiness_age_secs is not None
+        and cloudiness_age_secs <= config.cloudiness_stale_seconds
+    ):
+        overcast_active = overcast_latch.update(cloudiness_pct, now)
+    else:
+        overcast_active = overcast_latch.active
+        weather_stale = cloudiness_pct is not None
+    if overcast_active:
+        reasons[RATION_OVERCAST] = 1
+    if (
+        int(inverter_data["alert"]) == 1
+        and not load_shed_active
+        and not overcast_active
+    ):
+        # do not load shed during an alert condition; a latched high-load
+        # or overcast condition takes priority over this guard
+        return SwitchConditionDecision(
+            switch_state=1,
+            reasons=reasons,
+            suppressed=[],
+            alert_restore=True,
+            load_missing=load_missing,
+            weather_stale=weather_stale,
+        )
+    # check 1: disable switches if the battery is critically low without
+    # adequate surplus (i.e. not charging from solar)
+    pv1_power_w = float(inverter_data["pv1_power_w"])
+    pv2_power_w = float(inverter_data["pv2_power_w"])
+    battery_power_w = float(inverter_data["battery_power_w"])
+    power_generation_w_avg = generation_average.add(
+        pv1_power_w + pv2_power_w - battery_power_w, now
+    )
+    battery_soc_pct = float(inverter_data["battery_soc_pct"])
+    if battery_soc_pct < config.battery_critical_pct and power_generation_w_avg < 0:
+        reasons[RATION_SURPLUS] = 1
+    # check 2: more conservative rationing if no grid backup (draw assumes
+    # no surplus)
+    grid_voltage = max(
+        float(inverter_data["grid_voltage_l1_v"]),
+        float(inverter_data["grid_voltage_l2_v"]),
+    )
+    if (
+        battery_soc_pct < config.battery_low_pct
+        and grid_voltage < config.grid_dropout_v
+        and battery_power_w >= config.battery_major_draw_w
+    ):
+        reasons[RATION_BATTERY] = 1
+    # check 3: the inverter is no longer pulling from solar or battery
+    # (i.e. drawing from the grid)
+    inverter_power_w = float(inverter_data["inverter_l1_power_w"]) + float(
+        inverter_data["inverter_l2_power_w"]
+    )
+    if inverter_power_w < 0:
+        reasons[RATION_BATTERY] = 1
+    switch_state = 1
+    suppressed: list[str] = []
+    for condition in RATIONING_CONDITIONS:
+        if not reasons[condition]:
+            continue
+        if condition == RATION_LOAD_SHED and manual_shed:
+            switch_state = 0
+        elif config.enabled(condition):
+            switch_state = 0
+        else:
+            suppressed.append(condition)
+    return SwitchConditionDecision(
+        switch_state=switch_state,
+        reasons=reasons,
+        suppressed=suppressed,
+        alert_restore=False,
+        load_missing=load_missing,
+        weather_stale=weather_stale,
+        supporting={
+            "inverter_power_w": inverter_power_w,
+            "power_generation_w_avg": power_generation_w_avg,
+            "pv1_power_w": pv1_power_w,
+            "pv2_power_w": pv2_power_w,
+            "battery_power_w": battery_power_w,
+            "battery_soc_pct": battery_soc_pct,
+            "grid_voltage_v": grid_voltage,
+        },
+    )
 
 
 @dataclass

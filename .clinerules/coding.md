@@ -140,6 +140,17 @@ Rules:
   only after `load_shed_cooldown_seconds` with no above-threshold sample, and
   every above-threshold sample extends the cooldown; missing load data
   retains the latch.
+- Per-condition control (optional `[alert_thresholds]` booleans, all code
+  default enabled): `load_shed_enabled`, `overcast_enabled`,
+  `surplus_ration_enabled`, `battery_ration_enabled`. A disabled condition is
+  still evaluated and reported as tripped in `switch_stats` (the gauges and
+  the bot cache stay truthful) but never forces `switch_state` to 0; it logs
+  one WARNING per condition and episode (`"Switch rationing condition
+  suppressed by configuration"`, re-armed by recovery) with the supporting
+  data.  The decision itself is the pure `evaluate_switch_conditions`
+  (`app/load_alerts.py`); the manual `/startloadshed` override still sheds
+  when the load-shed condition is warn-only, and a warn-only condition never
+  restores a manual shed.
 - Sonoff devices follow the same decision as the MQTT banks: every device is
   switched off on a shed, and a restore only switches on devices whose
   `Sonoff/{id}/shed_only` credential is false (default true: only ever

@@ -26,7 +26,10 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
 - Notification-only points (`switch_event`, `load_alert`) are fanned out to
   consumers and never create gauges. The load-shed and overcast latches are
   visible as the `switches_load_shed` and `switches_overcast` gauges via the
-  switch stats point.
+  switch stats point. A warn-only (disabled) condition keeps those gauges
+  truthful while the switch state stays on (`switches_switch_state` at 1):
+  the condition gauge trips with no control publish and one WARNING per
+  episode.
 - **Timing gauges** are created at module scope using
   `OTEL_METER.create_gauge(...)` and named with `_duration_seconds` or
   `_seconds` suffixes. Each holds the latest measured duration value,

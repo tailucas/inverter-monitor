@@ -20,6 +20,8 @@ from typing import Any
 import pytest
 from tailucas_pylib import APP_NAME, app_config
 
+from app.load_alerts import SwitchConditionConfig
+
 if not app_config.has_section("metrics"):
     app_config.add_section("metrics")
 if not app_config.has_option("metrics", "debug_csv"):
@@ -424,3 +426,102 @@ class TestSwitchCommandRetryGate:
             payload["switch_event"]["switch_banks"] for payload in app_socket.sent
         ]
         assert event_banks == [[BANK], [BANK]]
+
+
+SUPPRESSED_MESSAGE = "Switch rationing condition suppressed by configuration"
+
+
+def _inverter_sample(**overrides: Any) -> dict[str, Any]:
+    """A plausible inverter sample for the decision loop."""
+    sample: dict[str, Any] = {
+        "alert": 0,
+        "total_load_power_w": 1000.0,
+        "battery_soc_pct": 80.0,
+        "battery_power_w": 0.0,
+        "pv1_power_w": 2000.0,
+        "pv2_power_w": 1500.0,
+        "grid_voltage_l1_v": 230.0,
+        "grid_voltage_l2_v": 230.0,
+        "inverter_l1_power_w": 500.0,
+        "inverter_l2_power_w": 0.0,
+    }
+    sample.update(overrides)
+    return sample
+
+
+class TestWarnOnlySwitchConditions:
+    """A disabled condition is reported but never sheds the banks."""
+
+    @staticmethod
+    def _subscriber(load_shed_enabled: bool = True) -> Any:
+        subscriber = _new_subscriber(banks=[BANK])
+        subscriber.on_message(None, None, _state_message(BANK, [1, 1]))
+        subscriber._switch_conditions = SwitchConditionConfig(
+            load_shed_enabled=load_shed_enabled
+        )
+        return subscriber
+
+    def test_enabled_load_shed_publishes_the_control_message(self) -> None:
+        subscriber = self._subscriber()
+        subscriber._process_inverter_sample(
+            app_socket=FakeAppSocket(),
+            inverter_data=_inverter_sample(total_load_power_w=8000.0),
+        )
+        assert [p["topic"] for p in subscriber._mqtt_client.published] == [
+            CONTROL_TOPIC,
+            "inverter/state",
+        ]
+
+    def test_warn_only_load_shed_does_not_publish_and_warns_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        subscriber = self._subscriber(load_shed_enabled=False)
+        app_socket = FakeAppSocket()
+        sample = _inverter_sample(total_load_power_w=8000.0)
+        with caplog.at_level(logging.WARNING, logger=APP_NAME):
+            subscriber._process_inverter_sample(
+                app_socket=app_socket, inverter_data=sample
+            )
+            subscriber._process_inverter_sample(
+                app_socket=app_socket, inverter_data=sample
+            )
+
+        topics = [p["topic"] for p in subscriber._mqtt_client.published]
+        assert CONTROL_TOPIC not in topics
+        records = [r for r in caplog.records if r.getMessage() == SUPPRESSED_MESSAGE]
+        assert len(records) == 1
+        record: Any = records[0]
+        assert record.levelno == logging.WARNING
+        assert record.condition == "load_shed"
+        assert record.switch_state == 1
+        assert record.load_w == 8000.0
+        stats = [p["switches"] for p in app_socket.sent if "switches" in p]
+        assert stats[-1]["load_shed"] == 1
+        assert stats[-1]["switch_state"] == 1
+
+    def test_warn_only_load_shed_does_not_restore_a_manual_shed(self) -> None:
+        subscriber = self._subscriber(load_shed_enabled=False)
+        app_socket = FakeAppSocket()
+        subscriber._apply_manual_switch_command(
+            app_socket=app_socket, command="start_load_shed"
+        )
+        assert subscriber._manual_shed is True
+        assert subscriber._mqtt_client.published[0]["topic"] == CONTROL_TOPIC
+        subscriber._mqtt_client.published.clear()
+        subscriber._process_inverter_sample(
+            app_socket=app_socket,
+            inverter_data=_inverter_sample(total_load_power_w=8000.0),
+        )
+        # the manual shed holds: only telemetry is published, no restore
+        topics = [p["topic"] for p in subscriber._mqtt_client.published]
+        assert CONTROL_TOPIC not in topics
+        assert topics == ["inverter/state"]
+        assert subscriber._manual_shed is True
+
+    def test_manual_commands_toggle_the_manual_shed_flag(self) -> None:
+        subscriber = self._subscriber()
+        app_socket = FakeAppSocket()
+        subscriber._apply_manual_switch_command(
+            app_socket=app_socket, command="end_load_shed"
+        )
+        assert subscriber._manual_shed is False

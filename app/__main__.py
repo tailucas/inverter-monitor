@@ -32,11 +32,19 @@ from tailucas_pylib.zmq import URL_WORKER_APP, Closable, try_close, zmq_socket, 
 from zmq.error import ContextTerminated, ZMQError
 
 from app.load_alerts import (
+    RATION_BATTERY,
+    RATION_LOAD_SHED,
+    RATION_OVERCAST,
+    RATION_SURPLUS,
+    RATIONING_CONDITIONS,
     SWITCH_COMMAND_END_LOAD_SHED,
     SWITCH_COMMAND_START_LOAD_SHED,
     CooldownLatch,
     LoadAlertEvaluator,
+    SwitchConditionConfig,
     TimeWindowAverage,
+    WarnOnceTracker,
+    evaluate_switch_conditions,
     manual_switch_decision,
 )
 from app.metrics import configure as metrics_configure
@@ -78,17 +86,10 @@ MAX_WEATHER_BACKOFF_SECONDS = 600
 WEATHER_REQUEST_TIMEOUT_SECONDS = 10
 # rolling window for the surplus generation average
 DEFAULT_GENERATION_AVERAGE_SECONDS = 300
-# overcast switch reason: 100 % cloud with a self-extending cooldown
-OVERCAST_CLOUDINESS_PCT = 100
+# overcast switch reason: 100 % cloud with a self-extending cooldown (the
+# condition thresholds live with the pure evaluator in app.load_alerts)
 DEFAULT_OVERCAST_COOLDOWN_SECONDS = 3600
-# cloudiness older than this is treated as unknown for overcast rationing
-CLOUDINESS_STALE_SECONDS = 180
 IMPLAUSIBLE_CHANGE_PERCENTAGE = 5
-BATTERY_LOW_PCT = 45
-# assuming CFE drop-out at 30%
-BATTERY_CRITICAL_PCT = 40
-# idle small home ~ 300W
-BATTERY_MAJOR_DRAW_W = 500
 # BMS serial data loss timeout
 BMS_DATA_LOSS_TIMEOUT = 600
 # overall-load alerting defaults (optional [alert_thresholds] overrides)
@@ -1202,18 +1203,37 @@ class MqttSubscriber(AppThread, Closable):
         self._generation_average = TimeWindowAverage(
             window_secs=generation_average_secs
         )
+        # per-condition automatic switch control (code default: all enabled);
+        # a disabled condition is evaluated and reported but only warns
+        self._switch_conditions = SwitchConditionConfig(
+            load_shed_enabled=app_config.getboolean(
+                "alert_thresholds", "load_shed_enabled", fallback=True
+            ),
+            overcast_enabled=app_config.getboolean(
+                "alert_thresholds", "overcast_enabled", fallback=True
+            ),
+            surplus_ration_enabled=app_config.getboolean(
+                "alert_thresholds", "surplus_ration_enabled", fallback=True
+            ),
+            battery_ration_enabled=app_config.getboolean(
+                "alert_thresholds", "battery_ration_enabled", fallback=True
+            ),
+        )
         overcast_cooldown_secs = app_config.getint(
             "alert_thresholds",
             "overcast_cooldown_seconds",
             fallback=DEFAULT_OVERCAST_COOLDOWN_SECONDS,
         )
         self._overcast_latch = CooldownLatch(
-            threshold=OVERCAST_CLOUDINESS_PCT,
+            threshold=self._switch_conditions.overcast_cloudiness_pct,
             cooldown_secs=overcast_cooldown_secs,
             inclusive=True,
         )
         self._cloudiness_pct: float | None = None
         self._cloudiness_set_at: float | None = None
+        # warn-only diagnostics and the manual shed override latch
+        self._suppressed_warnings = WarnOnceTracker()
+        self._manual_shed = False
 
         load_warning_w = app_config.getint(
             "alert_thresholds", "load_warning_w", fallback=DEFAULT_LOAD_WARNING_W
@@ -1233,6 +1253,21 @@ class MqttSubscriber(AppThread, Closable):
         self._manual_commands: queue.SimpleQueue[str] = queue.SimpleQueue()
         # last full switch-stats payload, re-published after a manual command
         self._last_switch_stats: dict = {}
+        log.info(
+            "Switch rationing conditions resolved",
+            extra={
+                "enabled_conditions": [
+                    condition
+                    for condition in RATIONING_CONDITIONS
+                    if self._switch_conditions.enabled(condition)
+                ],
+                "warn_only_conditions": [
+                    condition
+                    for condition in RATIONING_CONDITIONS
+                    if not self._switch_conditions.enabled(condition)
+                ],
+            },
+        )
 
     def request_switch_command(self, command: str) -> None:
         """Queue a manual switch command for the decision loop.
@@ -1572,6 +1607,11 @@ class MqttSubscriber(AppThread, Closable):
             overcast_latch=self._overcast_latch,
             now=now,
         )
+        if command == SWITCH_COMMAND_START_LOAD_SHED:
+            # a manual shed acts even when the condition is warn-only
+            self._manual_shed = True
+        elif command == SWITCH_COMMAND_END_LOAD_SHED:
+            self._manual_shed = False
         changed_banks = self.set_switch_state(
             switch_state=switch_state, reason=reason, force=True
         )
@@ -1647,8 +1687,158 @@ class MqttSubscriber(AppThread, Closable):
             },
         )
 
-    def get_power_generation_avg(self, value, now):
-        return self._generation_average.add(value, now)
+    def _process_inverter_sample(
+        self, app_socket: zmq.Socket, inverter_data: dict
+    ) -> None:
+        """Evaluate one inverter sample and drive the switch banks.
+
+        The condition state machine is the pure `evaluate_switch_conditions`
+        (``app.load_alerts``); this method owns the logging, the
+        switch-bank/MQTT publishes and the consumer fan-out.  A warn-only
+        condition is reported as tripped (the gauges and bot cache stay
+        truthful) but never sheds; one WARNING per condition and episode
+        tells the operator that a shed was suppressed.
+        """
+        now = time.time()
+        cloudiness_age_secs = None
+        if self._cloudiness_set_at is not None:
+            cloudiness_age_secs = now - self._cloudiness_set_at
+        decision = evaluate_switch_conditions(
+            inverter_data=inverter_data,
+            now=now,
+            load_shed_latch=self._load_shed_latch,
+            overcast_latch=self._overcast_latch,
+            generation_average=self._generation_average,
+            cloudiness_pct=self._cloudiness_pct,
+            cloudiness_age_secs=cloudiness_age_secs,
+            config=self._switch_conditions,
+            manual_shed=self._manual_shed,
+        )
+        # a manual shed ends when its forced latch releases
+        if not decision.reasons[RATION_LOAD_SHED]:
+            self._manual_shed = False
+        switch_stats = dict(decision.reasons)
+        if decision.load_missing:
+            log.debug(
+                "Load value missing; retaining load-shed state",
+                extra={
+                    "load_value": repr(inverter_data.get("total_load_power_w")),
+                    "load_shed": switch_stats[RATION_LOAD_SHED],
+                },
+            )
+        if decision.weather_stale:
+            log.debug(
+                "Ignoring stale weather; retaining overcast state",
+                extra={
+                    "cloudiness_pct": self._cloudiness_pct,
+                    "cloudiness_age_secs": round(cloudiness_age_secs or 0.0, 1),
+                    "overcast": switch_stats[RATION_OVERCAST],
+                },
+            )
+        for condition in RATIONING_CONDITIONS:
+            if not self._suppressed_warnings.should_warn(
+                condition=condition, tripped=condition in decision.suppressed
+            ):
+                continue
+            log.warning(
+                "Switch rationing condition suppressed by configuration",
+                extra={
+                    "condition": condition,
+                    "switch_state": decision.switch_state,
+                    "reason": condition,
+                    "load_w": numeric_field(inverter_data.get("total_load_power_w")),
+                    **{
+                        key: numeric_field(value)
+                        for key, value in decision.supporting.items()
+                    },
+                },
+            )
+        if decision.alert_restore:
+            # do not load shed during an alert condition; a latched
+            # high-load or overcast condition takes priority over this guard
+            changed_banks = self.set_switch_state(reason="alert_restore")
+            self._notify_switch_change(
+                app_socket=app_socket,
+                changed_banks=changed_banks,
+                switch_state=1,
+                reason="alert_restore",
+                inverter_data=inverter_data,
+                now=now,
+            )
+            self._last_switch_stats = dict(switch_stats)
+            app_socket.send_pyobj({"switches": switch_stats})
+            return
+        switch_state = decision.switch_state
+        reason = "all_clear"
+        if switch_stats[RATION_LOAD_SHED]:
+            reason = RATION_LOAD_SHED
+        elif switch_stats[RATION_OVERCAST]:
+            reason = RATION_OVERCAST
+        elif switch_stats[RATION_SURPLUS]:
+            reason = RATION_SURPLUS
+        elif switch_stats[RATION_BATTERY]:
+            reason = RATION_BATTERY
+        # log the supporting data
+        log.debug(
+            "Inverter is delivering power to consumers from backup (solar/battery)",
+            extra={
+                "inverter_power_w": decision.supporting["inverter_power_w"],
+                "power_generation_w_avg": numeric_field(
+                    decision.supporting["power_generation_w_avg"]
+                ),
+                "pv1_power_w": numeric_field(decision.supporting["pv1_power_w"]),
+                "pv2_power_w": numeric_field(decision.supporting["pv2_power_w"]),
+                "battery_power_w": numeric_field(
+                    decision.supporting["battery_power_w"]
+                ),
+                "battery_soc_pct": decision.supporting["battery_soc_pct"],
+                "grid_voltage_v": decision.supporting["grid_voltage_v"],
+                "load_w": numeric_field(inverter_data.get("total_load_power_w")),
+                "load_shed": switch_stats[RATION_LOAD_SHED],
+                "cloudiness_pct": self._cloudiness_pct,
+                "overcast": switch_stats[RATION_OVERCAST],
+                "switch_state": switch_state,
+            },
+        )
+        # update switches
+        changed_banks = self.set_switch_state(switch_state=switch_state, reason=reason)
+        self._notify_switch_change(
+            app_socket=app_socket,
+            changed_banks=changed_banks,
+            switch_state=switch_state,
+            reason=reason,
+            inverter_data=inverter_data,
+            now=now,
+        )
+        # post stats
+        switch_stats["switch_state"] = switch_state
+        self._last_switch_stats = dict(switch_stats)
+        app_socket.send_pyobj({"switches": switch_stats})
+        # for other interested consumers
+        if self._mqtt_client is not None:
+            _mqtt_publish_start = time.time()
+            with OTEL_TRACER.start_as_current_span(
+                "mqtt.publish", kind=SpanKind.PRODUCER
+            ) as span:
+                span.set_attribute("messaging.system", "mqtt")
+                span.set_attribute("messaging.destination.name", "inverter/state")
+                span.set_attribute("messaging.destination_kind", "topic")
+                tp = format_traceparent(span)
+                span.set_attribute("traceparent", tp)
+                inverter_data["traceparent"] = tp
+                payload = json.dumps(inverter_data)
+                span.set_attribute("messaging.message.body.size", len(payload))
+                self._mqtt_client.publish(topic="inverter/state", payload=payload)
+                log.debug(
+                    "MQTT message dispatched",
+                    extra={
+                        "topic": "inverter/state",
+                        "traceparent": tp,
+                        "message_bytes": len(payload),
+                    },
+                )
+                _mqtt_publish_duration = time.time() - _mqtt_publish_start
+                MQTT_PUBLISH_DURATION.set(_mqtt_publish_duration)
 
     # noinspection PyBroadException
     def run(self):
@@ -1668,7 +1858,6 @@ class MqttSubscriber(AppThread, Closable):
             connect_url=URL_WORKER_APP, and_raise=False, shutdown_on_error=True
         ) as app_socket:
             while not threads.shutting_down:
-                switch_stats = dict()
                 rc = self._mqtt_client.loop()
                 if rc == MQTT_ERR_NO_CONN or self._disconnected:
                     raise ResourceWarning(
@@ -1709,192 +1898,9 @@ class MqttSubscriber(AppThread, Closable):
                     ]
                 ):
                     continue
-                switch_state = 1
-                switch_stats["load_shed"] = 0
-                switch_stats["overcast"] = 0
-                switch_stats["surplus_ration"] = 0
-                switch_stats["battery_ration"] = 0
-                now = time.time()
-                load_field = inverter_data.get("total_load_power_w")
-                if isinstance(load_field, bool) or not isinstance(
-                    load_field, (int, float)
-                ):
-                    load_shed_active = self._load_shed_latch.active
-                    log.debug(
-                        "Load value missing; retaining load-shed state",
-                        extra={
-                            "load_value": repr(load_field),
-                            "load_shed": int(load_shed_active),
-                        },
-                    )
-                else:
-                    load_shed_active = self._load_shed_latch.update(
-                        float(load_field), now
-                    )
-                # check 0 (top priority): overall load shedding with cooldown
-                if load_shed_active:
-                    switch_state = 0
-                    switch_stats["load_shed"] = 1
-                # check 0b: overcast rationing (100 % cloudiness)
-                cloudiness_age = None
-                if self._cloudiness_set_at is not None:
-                    cloudiness_age = now - self._cloudiness_set_at
-                if (
-                    self._cloudiness_pct is not None
-                    and cloudiness_age is not None
-                    and cloudiness_age <= CLOUDINESS_STALE_SECONDS
-                ):
-                    overcast_active = self._overcast_latch.update(
-                        self._cloudiness_pct, now
-                    )
-                else:
-                    overcast_active = self._overcast_latch.active
-                    if self._cloudiness_pct is not None:
-                        log.debug(
-                            "Ignoring stale weather; retaining overcast state",
-                            extra={
-                                "cloudiness_pct": self._cloudiness_pct,
-                                "cloudiness_age_secs": round(cloudiness_age or 0.0, 1),
-                                "overcast": int(overcast_active),
-                            },
-                        )
-                if overcast_active:
-                    switch_state = 0
-                    switch_stats["overcast"] = 1
-                if (
-                    int(inverter_data["alert"]) == 1
-                    and not load_shed_active
-                    and not overcast_active
-                ):
-                    # do not load shed during an alert condition; a latched
-                    # high-load condition takes priority over this guard
-                    changed_banks = self.set_switch_state(reason="alert_restore")
-                    self._notify_switch_change(
-                        app_socket=app_socket,
-                        changed_banks=changed_banks,
-                        switch_state=1,
-                        reason="alert_restore",
-                        inverter_data=inverter_data,
-                        now=now,
-                    )
-                    self._last_switch_stats = dict(switch_stats)
-                    app_socket.send_pyobj({"switches": switch_stats})
-                    continue
-                # check 1: calculate surplus as a function of PV reported *usage*
-                # and how much the batteries are supplying
-                pv1_power_w = float(inverter_data["pv1_power_w"])
-                pv2_power_w = float(inverter_data["pv2_power_w"])
-                battery_power_w = float(inverter_data["battery_power_w"])
-                power_generation_w_avg = self.get_power_generation_avg(
-                    value=pv1_power_w + pv2_power_w - battery_power_w,
-                    now=now,
+                self._process_inverter_sample(
+                    app_socket=app_socket, inverter_data=inverter_data
                 )
-                # disable switch if battery is critically low without
-                # adequate surplus (i.e. not charging from solar)
-                battery_soc_pct = inverter_data["battery_soc_pct"]
-                if (
-                    battery_soc_pct < BATTERY_CRITICAL_PCT
-                    and power_generation_w_avg < 0
-                ):
-                    switch_state = 0
-                    switch_stats["surplus_ration"] = 1
-                # check 2: determine battery state of charge and
-                # whether there is any grid fallback
-                grid_voltage_l1_v = float(inverter_data["grid_voltage_l1_v"])
-                grid_voltage_l2_v = float(inverter_data["grid_voltage_l2_v"])
-                grid_voltage = max(grid_voltage_l1_v, grid_voltage_l2_v)
-                # more conservative rationing if no grid backup
-                # (draw assumes no surplus)
-                if (
-                    battery_soc_pct < BATTERY_LOW_PCT
-                    and grid_voltage < 90
-                    and battery_power_w >= BATTERY_MAJOR_DRAW_W
-                ):
-                    switch_state = 0
-                    switch_stats["battery_ration"] = 1
-                # check 3: determine whether the inverter is no longer
-                # pulling from solar or battery (i.e. from grid)
-                inverter_l1_power_w = float(inverter_data["inverter_l1_power_w"])
-                inverter_l2_power_w = float(inverter_data["inverter_l2_power_w"])
-                # can't use min/max because l2 is normally 0
-                inverter_power_w = inverter_l1_power_w + inverter_l2_power_w
-                if inverter_power_w < 0:
-                    switch_state = 0
-                    switch_stats["battery_ration"] = 1
-                # log the supporting data
-                log_msg = (
-                    "Inverter is delivering power to consumers from backup "
-                    "(solar/battery)"
-                )
-                log_fields = {
-                    "inverter_power_w": inverter_power_w,
-                    "power_generation_w_avg": round(power_generation_w_avg, 2),
-                    "pv1_power_w": round(pv1_power_w, 2),
-                    "pv2_power_w": round(pv2_power_w, 2),
-                    "battery_power_w": round(battery_power_w, 2),
-                    "battery_soc_pct": battery_soc_pct,
-                    "grid_voltage_v": grid_voltage,
-                    "load_w": numeric_field(load_field),
-                    "load_shed": switch_stats["load_shed"],
-                    "cloudiness_pct": self._cloudiness_pct,
-                    "overcast": switch_stats["overcast"],
-                    "switch_state": switch_state,
-                }
-                log.debug(log_msg, extra=log_fields)
-                reason = "all_clear"
-                if switch_stats["load_shed"]:
-                    reason = "load_shed"
-                elif switch_stats["overcast"]:
-                    reason = "overcast"
-                elif switch_stats["surplus_ration"]:
-                    reason = "surplus_ration"
-                elif switch_stats["battery_ration"]:
-                    reason = "battery_ration"
-                # update switches
-                changed_banks = self.set_switch_state(
-                    switch_state=switch_state, reason=reason
-                )
-                self._notify_switch_change(
-                    app_socket=app_socket,
-                    changed_banks=changed_banks,
-                    switch_state=switch_state,
-                    reason=reason,
-                    inverter_data=inverter_data,
-                    now=now,
-                )
-                # post stats
-                switch_stats["switch_state"] = switch_state
-                self._last_switch_stats = dict(switch_stats)
-                app_socket.send_pyobj({"switches": switch_stats})
-                # for other interested consumers
-                if self._mqtt_client is not None:
-                    _mqtt_publish_start = time.time()
-                    with OTEL_TRACER.start_as_current_span(
-                        "mqtt.publish", kind=SpanKind.PRODUCER
-                    ) as span:
-                        span.set_attribute("messaging.system", "mqtt")
-                        span.set_attribute(
-                            "messaging.destination.name", "inverter/state"
-                        )
-                        span.set_attribute("messaging.destination_kind", "topic")
-                        tp = format_traceparent(span)
-                        span.set_attribute("traceparent", tp)
-                        inverter_data["traceparent"] = tp
-                        payload = json.dumps(inverter_data)
-                        span.set_attribute("messaging.message.body.size", len(payload))
-                        self._mqtt_client.publish(
-                            topic="inverter/state", payload=payload
-                        )
-                        log.debug(
-                            "MQTT message dispatched",
-                            extra={
-                                "topic": "inverter/state",
-                                "traceparent": tp,
-                                "message_bytes": len(payload),
-                            },
-                        )
-                        _mqtt_publish_duration = time.time() - _mqtt_publish_start
-                        MQTT_PUBLISH_DURATION.set(_mqtt_publish_duration)
         self.close()
 
 
