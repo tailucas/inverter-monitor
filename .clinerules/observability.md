@@ -101,6 +101,10 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
   after the load has held at or below it for `load_critical_resolve_seconds`.
   It is seeded stale-pending at startup so a previously-open incident
   auto-resolves, while a high sample at startup still raises the incident.
+  The event is sent with payload severity `critical`: Events API v2 has no
+  urgency field, so PagerDuty derives urgency from severity and maps
+  `critical`/`error` to high urgency (`warning`/`info` are low). The BMS
+  incident classes stay at `warning`.
 - Alert state is **seeded at startup** so any previously-open incidents
   auto-resolve on first data.
 - Trigger and resolve calls log the `dedup_key` as a structured field.

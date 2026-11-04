@@ -102,6 +102,10 @@ DEFAULT_LOAD_SHED_COOLDOWN_SECONDS = 600
 DEFAULT_SWITCH_RETRY_SECONDS = 60
 # PagerDuty dedup key for the high-load incident class
 PD_LOAD_DEDUP_KEY = "load_high"
+# High load is a high-urgency page. Events API v2 has no urgency field; the
+# incident urgency is derived from the event's payload severity, where
+# "critical"/"error" map to high urgency and "warning"/"info" map to low.
+PD_LOAD_SEVERITY = "critical"
 
 # OpenTelemetry meter and tracer (module-level, shared across all threads)
 OTEL_METER = metrics.get_meter(APP_NAME)
@@ -1975,7 +1979,7 @@ class LoadAlertMonitor(AppThread, Closable):
                     f"{self._load_critical_w} W"
                 ),
                 source=str(DEVICE_NAME_BASE),
-                severity="warning",
+                severity=PD_LOAD_SEVERITY,
                 custom_details={
                     "load_w": round(load_w, 2),
                     "threshold_w": self._load_critical_w,
@@ -1991,6 +1995,7 @@ class LoadAlertMonitor(AppThread, Closable):
                 "PagerDuty alert triggered for high load",
                 extra={
                     "dedup_key": self.pd_dedup_key,
+                    "severity": PD_LOAD_SEVERITY,
                     "load_w": round(load_w, 2),
                     "threshold_w": self._load_critical_w,
                 },
