@@ -187,6 +187,9 @@ uv sync
 # Run tests
 uv run pytest
 
+# Upgrade Python dependencies (lockfile + virtual environment)
+make update
+
 # Run linting
 make lint
 ```

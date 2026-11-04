@@ -9,7 +9,7 @@ DOCKER_COMPOSE_URL := https://docs.docker.com/compose/install
 DEVCLI_URL := https://code.visualstudio.com/docs/devcontainers/devcontainer-cli
 CHECK_USER := vscode
 
-.PHONY: help check dev dev-build dev-up datadir python configure build push run rund test lint
+.PHONY: help check dev dev-build dev-up datadir python update configure build push run rund test lint
 
 # ---------- Dev container (host only) ----------
 
@@ -49,6 +49,12 @@ datadir: data/ ## Set up ./data/ (alias)
 	@touch .venv
 
 python: .venv ## Set up the Python virtual environment (alias)
+
+update: ## Upgrade all Python dependencies (lockfile + virtual environment)
+	@uv -V
+	uv lock --upgrade
+	uv sync
+	@touch .venv
 
 .env: base.env docker-compose.yml ## Generate .env from base.env and the cred store
 	@docker -v
