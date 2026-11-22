@@ -3,9 +3,12 @@ import binascii
 import os
 import queue
 import re
+import secrets
 import socket
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import libscrc
@@ -141,13 +144,63 @@ EVENT_PROCESS_DURATION = OTEL_METER.create_gauge(
 )
 
 
-def format_traceparent(span: trace.Span) -> str:
-    """Build a W3C traceparent string from the current span's context."""
-    ctx = span.get_span_context()
+def traceparent_from_context(ctx: trace.SpanContext) -> str:
+    """Format a W3C traceparent string from a span context."""
     return (
         f"00-{trace.format_trace_id(ctx.trace_id)}"
         f"-{trace.format_span_id(ctx.span_id)}-{ctx.trace_flags:02x}"
     )
+
+
+def format_traceparent(span: trace.Span) -> str:
+    """Build a W3C traceparent string from the current span's context."""
+    return traceparent_from_context(span.get_span_context())
+
+
+def heartbeat_span() -> trace.Span:
+    """A non-recording span context for a cadence (heartbeat) publish.
+
+    The per-sample telemetry publish runs at the inverter poll cadence, so an
+    exported span per sample only inflates trace volume: the span explains
+    nothing about an outcome. The stand-in keeps a valid traceparent for
+    downstream trace continuation, but flags the trace *unsampled* so a
+    parent-based sampler drops the heartbeat trace instead of recording it.
+    """
+    ctx = trace.SpanContext(
+        trace_id=secrets.randbits(128) or 1,
+        span_id=secrets.randbits(64) or 1,
+        is_remote=False,
+        trace_flags=trace.TraceFlags(0),
+    )
+    return trace.NonRecordingSpan(ctx)
+
+
+def _set_mqtt_span_attributes(span: trace.Span, topic: str) -> None:
+    """Apply the messaging semantic conventions to an MQTT publish span."""
+    span.set_attribute("messaging.system", "mqtt")
+    span.set_attribute("messaging.destination.name", topic)
+    span.set_attribute("messaging.destination_kind", "topic")
+
+
+@contextmanager
+def mqtt_publish_span(topic: str, *, traced: bool = True) -> Iterator[trace.Span]:
+    """Yield the span for one MQTT publish.
+
+    Legitimate events (switch-bank control messages) get a real, exported
+    ``mqtt.publish`` PRODUCER span. A cadence telemetry publish passes
+    ``traced=False`` and gets a non-recording ``heartbeat_span`` instead: the
+    payload still carries a traceparent, but no span is exported per sample.
+    """
+    if not traced:
+        span = heartbeat_span()
+        _set_mqtt_span_attributes(span, topic)
+        yield span
+        return
+    with OTEL_TRACER.start_as_current_span(
+        "mqtt.publish", kind=SpanKind.PRODUCER
+    ) as span:
+        _set_mqtt_span_attributes(span, topic)
+        yield span
 
 
 def twos_complement_hex(hexval):
@@ -1194,6 +1247,12 @@ class MqttSubscriber(AppThread, Closable):
         self._switch_retry_seconds = app_config.getint(
             "mqtt", "switch_retry_seconds", fallback=DEFAULT_SWITCH_RETRY_SECONDS
         )
+        # trace policy for the cadence `inverter/state` publish: it is a
+        # heartbeat, so it only exports a span when an operator opts in
+        # (optional [mqtt] trace_telemetry_publishes override, default false)
+        self._trace_telemetry_publishes = app_config.getboolean(
+            "mqtt", "trace_telemetry_publishes", fallback=False
+        )
         self._last_commanded: dict[str, int] = {}
         self._last_reported: dict[str, list] = {}
         self._last_command_at: dict[str, float] = {}
@@ -1270,6 +1329,13 @@ class MqttSubscriber(AppThread, Closable):
                     for condition in RATIONING_CONDITIONS
                     if not self._switch_conditions.enabled(condition)
                 ],
+            },
+        )
+        log.info(
+            "Telemetry publish trace policy resolved",
+            extra={
+                "topic": "inverter/state",
+                "exported_span": self._trace_telemetry_publishes,
             },
         )
 
@@ -1439,12 +1505,8 @@ class MqttSubscriber(AppThread, Closable):
             mqtt_update = [switch_state for _ in reported_state]
             message_data = json.dumps({"state": mqtt_update})
             _mqtt_publish_start = time.time()
-            with OTEL_TRACER.start_as_current_span(
-                "mqtt.publish", kind=SpanKind.PRODUCER
-            ) as span:
-                span.set_attribute("messaging.system", "mqtt")
-                span.set_attribute("messaging.destination.name", mqtt_pub_topic)
-                span.set_attribute("messaging.destination_kind", "topic")
+            # a commanded state change is an event: it always gets a real span
+            with mqtt_publish_span(mqtt_pub_topic) as span:
                 span.set_attribute("messaging.message.body.size", len(message_data))
                 tp = format_traceparent(span)
                 span.set_attribute("traceparent", tp)
@@ -1821,12 +1883,12 @@ class MqttSubscriber(AppThread, Closable):
         # for other interested consumers
         if self._mqtt_client is not None:
             _mqtt_publish_start = time.time()
-            with OTEL_TRACER.start_as_current_span(
-                "mqtt.publish", kind=SpanKind.PRODUCER
+            # the per-sample telemetry publish is a heartbeat: it carries a
+            # traceparent for downstream continuation, but no span is exported
+            # unless the optional [mqtt] trace_telemetry_publishes is enabled
+            with mqtt_publish_span(
+                "inverter/state", traced=self._trace_telemetry_publishes
             ) as span:
-                span.set_attribute("messaging.system", "mqtt")
-                span.set_attribute("messaging.destination.name", "inverter/state")
-                span.set_attribute("messaging.destination_kind", "topic")
                 tp = format_traceparent(span)
                 span.set_attribute("traceparent", tp)
                 inverter_data["traceparent"] = tp

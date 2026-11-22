@@ -3,7 +3,10 @@
 
 Covers the structured INFO record emitted for every switch-bank control
 message (the MQTT publish that drives load shedding) and the change gating
-that keeps an unchanged decision from re-publishing.
+that keeps an unchanged decision from re-publishing. Also pins the trace
+policy: a control publish exports a real `mqtt.publish` span, while the
+cadence `inverter/state` telemetry publish is a heartbeat that only
+propagates an unsampled traceparent.
 
 Importing ``app.__main__`` reads ``[metrics] debug_csv`` at module scope
 without a fallback, so the configuration section is seeded before the
@@ -13,11 +16,15 @@ import.
 import importlib
 import json
 import logging
+import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from opentelemetry.trace import SpanContext, TraceFlags
 from tailucas_pylib import APP_NAME, app_config
 
 from app.load_alerts import SwitchConditionConfig
@@ -35,6 +42,9 @@ BANK = "bank1"
 CONTROL_TOPIC = f"{TOPIC_PREFIX}/control/{BANK}"
 # emitted once per bank and episode for a bank that never reported state
 MISSING_STATE_MESSAGE = "Switch banks without reported state were not controlled"
+# `00-<32 hex trace id>-<16 hex span id>-<flags>`; the heartbeat publish is
+# flagged unsampled (`00`), a real event span is sampled (`01`)
+TRACEPARENT_PATTERN = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
 
 
 class FakeMqttClient:
@@ -55,6 +65,48 @@ class FakeAppSocket:
 
     def send_pyobj(self, payload: Any) -> None:
         self.sent.append(payload)
+
+
+class FakeSpan:
+    """Span stand-in recording attributes for the publish helper."""
+
+    def __init__(self) -> None:
+        self.attributes: dict[str, Any] = {}
+        self._context = SpanContext(
+            trace_id=0x4BF92F3577B34DA6A3CE929D0E0E4736,
+            span_id=0x00F067AA0BA902B7,
+            is_remote=False,
+            trace_flags=TraceFlags.SAMPLED,
+        )
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
+
+    def get_span_context(self) -> SpanContext:
+        return self._context
+
+
+class FakeTracer:
+    """Tracer stand-in recording every span it is asked to start."""
+
+    def __init__(self) -> None:
+        self.started: list[dict[str, Any]] = []
+
+    @contextmanager
+    def start_as_current_span(
+        self, name: str, kind: Any = None, **kwargs: Any
+    ) -> Iterator[FakeSpan]:
+        span = FakeSpan()
+        self.started.append({"name": name, "kind": kind, "span": span})
+        yield span
+
+
+@pytest.fixture
+def tracer(monkeypatch: pytest.MonkeyPatch) -> FakeTracer:
+    """A recording tracer installed over the module-level OTEL tracer."""
+    fake_tracer = FakeTracer()
+    monkeypatch.setattr(app_module, "OTEL_TRACER", fake_tracer)
+    return fake_tracer
 
 
 def _state_message(bank: str, switches: list[int]) -> Any:
@@ -525,3 +577,66 @@ class TestWarnOnlySwitchConditions:
             app_socket=app_socket, command="end_load_shed"
         )
         assert subscriber._manual_shed is False
+
+
+class TestPublishTracePolicy:
+    """Only a legitimate event exports an `mqtt.publish` span."""
+
+    def test_control_publish_exports_a_sampled_producer_span(
+        self, tracer: FakeTracer
+    ) -> None:
+        subscriber = _new_subscriber(banks=[BANK])
+        subscriber.on_message(None, None, _state_message(BANK, [1, 1]))
+
+        subscriber.set_switch_state(switch_state=0, reason="load_shed")
+
+        assert [started["name"] for started in tracer.started] == ["mqtt.publish"]
+        started = tracer.started[0]
+        assert started["kind"] == app_module.SpanKind.PRODUCER
+        attributes = started["span"].attributes
+        assert attributes["messaging.system"] == "mqtt"
+        assert attributes["messaging.destination.name"] == CONTROL_TOPIC
+        published = json.loads(subscriber._mqtt_client.published[0]["payload"])
+        traceparent = TRACEPARENT_PATTERN.match(published["traceparent"])
+        assert traceparent is not None
+        assert traceparent.group(3) == "01"
+
+    def test_heartbeat_publish_exports_no_span(self, tracer: FakeTracer) -> None:
+        subscriber = _new_subscriber(banks=[])
+        app_socket = FakeAppSocket()
+
+        subscriber._process_inverter_sample(
+            app_socket=app_socket, inverter_data=_inverter_sample()
+        )
+
+        assert tracer.started == []
+        assert [p["topic"] for p in subscriber._mqtt_client.published] == [
+            "inverter/state"
+        ]
+        payload = json.loads(subscriber._mqtt_client.published[0]["payload"])
+        traceparent = TRACEPARENT_PATTERN.match(payload["traceparent"])
+        assert traceparent is not None
+        # unsampled: a parent-based sampler downstream drops the heartbeat
+        assert traceparent.group(3) == "00"
+        # the consumers still get the switch stats
+        assert [sent for sent in app_socket.sent if "switches" in sent]
+
+    def test_heartbeat_publish_is_traced_when_opted_in(
+        self, tracer: FakeTracer
+    ) -> None:
+        subscriber = _new_subscriber(banks=[])
+        subscriber._trace_telemetry_publishes = True
+
+        subscriber._process_inverter_sample(
+            app_socket=FakeAppSocket(), inverter_data=_inverter_sample()
+        )
+
+        assert [started["name"] for started in tracer.started] == ["mqtt.publish"]
+        started = tracer.started[0]
+        assert started["kind"] == app_module.SpanKind.PRODUCER
+        attributes = started["span"].attributes
+        assert attributes["messaging.destination.name"] == "inverter/state"
+        published = json.loads(subscriber._mqtt_client.published[0]["payload"])
+        traceparent = TRACEPARENT_PATTERN.match(published["traceparent"])
+        assert traceparent is not None
+        assert traceparent.group(3) == "01"

@@ -77,10 +77,18 @@ log.info(message.format("RabbitMQ control"))                    # .format()
 6. **Hot loops:** sample chatty per-sample debug logs, and gate expensive
    field construction (e.g. `inverter_supporting_fields`) on
    `log.level == logging.DEBUG`.
-7. **MQTT traceparent injection:** Every MQTT publish is wrapped in an OTEL
-   span (`mqtt.publish`, `SpanKind.PRODUCER`). The generated traceparent is
-   injected into the JSON payload (`"traceparent": "00-..."`) and logged as
-   a structured field. Switch-bank control publishes are change-gated on the
+7. **MQTT traceparent injection:** Every MQTT publish goes through
+   `mqtt_publish_span(topic, traced=...)` (`app/__main__.py`), which yields
+   the OTEL span carrying the `messaging.*` semantic conventions. A
+   legitimate event (the change-gated switch-bank control publish) gets a
+   real `mqtt.publish`/`SpanKind.PRODUCER` span. The cadence
+   `inverter/state` telemetry publish is a **heartbeat**, so it yields a
+   non-recording span by default: the payload still gets a traceparent, but
+   no span is exported per sample. The generated traceparent is injected into
+   the JSON payload (`"traceparent": "00-..."`) and logged as a structured
+   field; a heartbeat traceparent is flagged **unsampled** (`-00`) so a
+   parent-based sampler downstream drops it, while an event span propagates
+   `-01`. Switch-bank control publishes are change-gated on the
    commanded and reported states: an effective change logs at INFO with the
    topic, the published payload and `reported_state`, while a retry of a
    command the bank has not followed logs at DEBUG (`"Retrying switch bank
@@ -88,9 +96,8 @@ log.info(message.format("RabbitMQ control"))                    # .format()
    retry interval has not yet elapsed):
 
    ```python
-   with OTEL_TRACER.start_as_current_span("mqtt.publish", kind=SpanKind.PRODUCER) as span:
-       span.set_attribute("messaging.system", "mqtt")
-       span.set_attribute("messaging.destination.name", topic)
+   with mqtt_publish_span(topic) as span:
+       span.set_attribute("messaging.message.body.size", len(payload))
        tp = format_traceparent(span)
        span.set_attribute("traceparent", tp)
        payload_obj["traceparent"] = tp
@@ -104,7 +111,11 @@ log.info(message.format("RabbitMQ control"))                    # .format()
 
    The per-sample telemetry publish (`inverter/state`) stays at DEBUG with
    `topic`, `message_bytes` and `traceparent`; its payload is the whole
-   inverter sample and it runs at poll cadence.
+   inverter sample and it runs at poll cadence, so it calls
+   `mqtt_publish_span("inverter/state", traced=False)`. The optional
+   `[mqtt] trace_telemetry_publishes` (code default false) opts back into an
+   exported span per sample; the resolved policy logs once at startup
+   (`"Telemetry publish trace policy resolved"`).
 
 8. **Tests** must assert on structured fields (`caplog.records` attributes) or
    static message text, never interpolated content.

@@ -56,19 +56,36 @@ configured at import time via environment variables (`OTEL_SDK_DISABLED`,
 
 - A module-level tracer (`OTEL_TRACER = trace.get_tracer(APP_NAME)`) is
   available for creating spans around high-value operations.
-- **Only MQTT publishes** are wrapped in a
-  `tracer.start_as_current_span("mqtt.publish", kind=SpanKind.PRODUCER)` with
+- **Only MQTT publishes** are traced, and they go through the
+  `mqtt_publish_span(topic, *, traced=True)` helper, which applies the
   `messaging.*` semantic-convention attributes:
   - `messaging.system = "mqtt"`
   - `messaging.destination.name = <topic>`
   - `messaging.destination_kind = "topic"`
   - `messaging.message.body.size = <payload_bytes>`
   - `traceparent = <generated_traceparent_value>`
+- **Event publishes** (the switch-bank control message) get a real,
+  exported `tracer.start_as_current_span("mqtt.publish",
+  kind=SpanKind.PRODUCER)`.
+- The **cadence telemetry publish** (`inverter/state`) is a heartbeat, not an
+  event: at the 600 ms poll cadence an exported span per sample is pure
+  volume (the span explains no outcome). It calls
+  `mqtt_publish_span("inverter/state", traced=False)`, which yields a
+  non-recording span (`trace.NonRecordingSpan` over a generated
+  `SpanContext`): no span is exported, no span data is recorded, and the
+  `mqtt_publish_duration_seconds` gauge still tracks the publish. The
+  optional `[mqtt] trace_telemetry_publishes` (code default false) restores
+  an exported span per sample for debugging; the resolved policy is logged
+  once at startup (`"Telemetry publish trace policy resolved"`, with
+  `topic` and `exported_span`).
 - The generated **traceparent** string (`00-{trace_id}-{span_id}-{flags}`) is
   **injected into the MQTT JSON payload** so downstream consumers can continue
-  the trace across the messaging boundary.
-- A helper `format_traceparent(span)` constructs the string from the span's
-  `SpanContext`.
+  the trace across the messaging boundary. A heartbeat traceparent carries
+  the **unsampled** flag (`-00`), so a downstream parent-based sampler drops
+  the heartbeat trace instead of recording it; an event span propagates
+  `-01`.
+- A helper `format_traceparent(span)` (and `traceparent_from_context(ctx)`)
+  constructs the string from the span's `SpanContext`.
 - MQTT *control* publishes are change-gated on the commanded and reported
   states: an unchanged switch state produces no publish, no span and no
   `traceparent`. A bank that keeps reporting a state the command never
