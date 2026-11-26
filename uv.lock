@@ -619,8 +619,8 @@ name = "httpcore2"
 version = "2.16.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "h11" },
-    { name = "truststore" },
+    { name = "h11", marker = "sys_platform != 'emscripten'" },
+    { name = "truststore", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c0/61/afa9d6b7452f9eca73f73d45324eb0bb52f098fd5e6049bf6b8263be9b4e/httpcore2-2.16.0.tar.gz", hash = "sha256:c72cd0413563b17e1cd8354677dff887466f8ec2551679759e93126534428643", size = 69886, upload-time = "2026-10-21T07:09:45.31Z" }
 wheels = [
@@ -1745,7 +1745,7 @@ wheels = [
 
 [[package]]
 name = "tailucas-pylib"
-version = "0.8.5"
+version = "0.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "python-dateutil" },
@@ -1754,9 +1754,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "sentry-sdk" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8a/6e/5539165543abc84ae4a0c80eed94447153fd111e226bdc60764843d9a024/tailucas_pylib-0.8.5.tar.gz", hash = "sha256:3d2f8379cb728158cbc79364cb1d1762811f3f3bbce14763cfcd7ed791acdbda", size = 25930, upload-time = "2026-11-01T06:40:15.885Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/63/62/7ac1a198a934cd7b125ca0bf2283948ec6d26a8a81827d739ff65e7ad391/tailucas_pylib-0.9.0.tar.gz", hash = "sha256:141e682a958f7499fe95009c4570cae623cfe35f58f4c7d3c5d9d91fdb8cb666", size = 29622, upload-time = "2026-11-26T12:20:42.702Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ae/83/3c34cba8fd7f4165450a1abeb93261e27e919b83b0434f0de8371ad221cc/tailucas_pylib-0.8.5-py3-none-any.whl", hash = "sha256:006d9f2cb04562ef628248d299988b2fe67cc545bc5fc0b22d0bf4be9cd01d3e", size = 30278, upload-time = "2026-11-01T06:40:14.245Z" },
+    { url = "https://files.pythonhosted.org/packages/4c/5b/d754c7983011f782377fe901ebc6673ceac3ae937b2a192487079cc5b6c2/tailucas_pylib-0.9.0-py3-none-any.whl", hash = "sha256:49929cca2bd26b16c7a1999e148b7bf27ab1a681e5c86b8e2f2543fcb82eb482", size = 34146, upload-time = "2026-11-26T12:20:43.836Z" },
 ]
 
 [package.optional-dependencies]
