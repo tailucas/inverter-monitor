@@ -15,7 +15,7 @@ CHECK_USER := vscode
 # the uv tool cache: no image build, no container and no application source are
 # involved. Pinned because this is the only step that reads the credential
 # store; bump it here and in the other projects together.
-PYLIB_SPEC ?= tailucas-pylib[creds]==0.10.0
+PYLIB_SPEC ?= tailucas-pylib[creds]==0.10.1
 DOT_ENV = uvx --from "$(PYLIB_SPEC)" dot_env
 PROJECT := $(shell sed -n 's/^PROJECT_NAME="\(.*\)"$$/\1/p' base.env)
 DOT_ENV_ARGS = --item "ENV.$(PROJECT)" --base base.env --require CONTAINER_NAME,PROJECT_NAME
