@@ -1,12 +1,16 @@
+# Runtime contract for this stack. It carries no credentials: the app resolves
+# them at runtime via tailucas_pylib.creds, which needs OP_CONNECT_HOST,
+# OP_CONNECT_TOKEN and OP_VAULT in `.env` (mode 0600).
+#
+# Compose `secrets:` is deliberately NOT used. It resolves OP_* from the
+# exporting shell, so `docker compose up` only worked for a human with the
+# tokens in their environment -- an unattended deploy runner has none.
+#
+# Verify by whether the app answers / logs, never by `ss -ltn`: docker-proxy
+# accepts every published port whether or not anything sits behind it.
 services:
   app:
     env_file: ".env"
-    environment:
-      - OP_CONNECT_HOST=${OP_CONNECT_HOST:-http://host.docker.internal:8080}
-    secrets:
-      - op_service_account_token
-      - op_connect_token
-      - op_vault
     image: "${CONTAINER_NAME}"
     restart: unless-stopped
     stop_grace_period: 45s
@@ -31,10 +35,3 @@ services:
       - /dev/ttyUSB0:/dev/ttyUSB0
     extra_hosts:
         - "host.docker.internal:host-gateway"
-secrets:
-    op_service_account_token:
-        environment: OP_SERVICE_ACCOUNT_TOKEN
-    op_connect_token:
-        environment: OP_CONNECT_TOKEN
-    op_vault:
-        environment: OP_VAULT

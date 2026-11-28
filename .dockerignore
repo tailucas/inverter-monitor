@@ -1,0 +1,16 @@
+# Keep the build context small. data/ holds the per-inverter SQLite databases
+# and must never be uploaded to a CI runner.
+.git
+.github
+.clinerules
+.devcontainer
+.venv
+data
+__pycache__
+*.py[cod]
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.vscode
+# never ship local credentials into a build context
+.env
