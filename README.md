@@ -102,7 +102,6 @@ The application is built around a modular, event-driven architecture using ZeroM
 ├── Makefile                    # Build & run tasks, dev container management (GNU Make)
 ├── pyproject.toml              # Python project metadata & tooling config
 ├── base.env                    # Base environment configuration
-├── dot_env_setup.sh            # Credential-based .env generator
 └── .devcontainer/              # VS Code dev container configuration
 ```
 
